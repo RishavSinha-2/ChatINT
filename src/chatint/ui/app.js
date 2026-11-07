@@ -624,19 +624,22 @@
         <div class="pane-header-left">
           ${
             showTabSwitcher
-              ? `<div class="pane-tab-select-wrapper" title="Switch Tab in this Split Pane">
-                  <i data-lucide="app-window" style="width: 12px; height: 12px; color: var(--text-muted);"></i>
+              ? `<div class="pane-tab-select-wrapper" id="pane-tab-wrapper-${tab.id}" title="Switch Tab in this Split Pane">
+                  <i data-lucide="app-window" style="width: 12px; height: 12px; color: var(--text-muted); flex-shrink: 0;"></i>
+                  <span class="pane-tab-label" id="pane-tab-label-${tab.id}"></span>
                   <select class="pane-tab-dropdown" id="pane-tab-dropdown-${tab.id}">${tabOptionsHtml}</select>
                 </div>`
               : ""
           }
-          <div class="model-select-wrapper" title="Switch Model">
-            <i data-lucide="cpu" style="width: 13px; height: 13px; color: var(--accent-color);"></i>
+          <div class="model-select-wrapper" id="model-wrapper-${tab.id}" title="Switch Model">
+            <i data-lucide="cpu" style="width: 13px; height: 13px; color: var(--accent-color); flex-shrink: 0;"></i>
+            <span class="model-select-label" id="model-label-${tab.id}"></span>
             <select class="model-dropdown" id="model-dropdown-${tab.id}"></select>
           </div>
 
           <div class="thinking-select-wrapper" id="thinking-wrapper-${tab.id}" style="display: none;" title="Thinking Strength">
-            <i data-lucide="brain" style="width: 13px; height: 13px;"></i>
+            <i data-lucide="brain" style="width: 13px; height: 13px; flex-shrink: 0;"></i>
+            <span class="thinking-select-label" id="thinking-label-${tab.id}"></span>
             <select class="thinking-dropdown" id="thinking-dropdown-${tab.id}">
               <option value="low">Thinking: Low</option>
               <option value="medium">Thinking: Medium</option>
@@ -701,7 +704,12 @@
     if (closeBtn) closeBtn.onclick = () => removeSplitPane(tab.id);
 
     const paneTabSelect = pane.querySelector(`#pane-tab-dropdown-${tab.id}`);
+    const paneTabLabel = pane.querySelector(`#pane-tab-label-${tab.id}`);
     if (paneTabSelect) {
+      if (paneTabLabel) {
+        const selOpt = paneTabSelect.options[paneTabSelect.selectedIndex];
+        paneTabLabel.textContent = selOpt ? selOpt.textContent : "";
+      }
       paneTabSelect.onchange = () => {
         const selectedTabId = paneTabSelect.value;
         if (selectedTabId && selectedTabId !== tab.id) {
@@ -710,15 +718,47 @@
       };
     }
 
+    // Observe pane width so when the pane or window shrinks (e.g. 5 split tabs or narrow window),
+    // the model selector collapses cleanly to just the processor icon without overflowing into adjacent buttons.
+    if (typeof ResizeObserver !== "undefined") {
+      const ro = new ResizeObserver((entries) => {
+        for (const entry of entries) {
+          const w = entry.contentRect.width;
+          pane.classList.toggle("compact-pane", w > 0 && w < 390);
+          pane.classList.toggle("icon-only-model", w > 0 && w < 310);
+        }
+      });
+      ro.observe(pane);
+    }
+
     return pane;
   }
 
   // Update Model Dropdown & Thinking Visibility for a Pane
   function updatePaneModelDropdown(pane, tab) {
+    const modelWrapper = pane.querySelector(`#model-wrapper-${tab.id}`);
     const modelDropdown = pane.querySelector(`#model-dropdown-${tab.id}`);
+    const modelLabel = pane.querySelector(`#model-label-${tab.id}`);
     const thinkingWrapper = pane.querySelector(`#thinking-wrapper-${tab.id}`);
     const thinkingDropdown = pane.querySelector(`#thinking-dropdown-${tab.id}`);
+    const thinkingLabel = pane.querySelector(`#thinking-label-${tab.id}`);
     if (!modelDropdown) return;
+
+    const syncLabels = () => {
+      if (modelLabel) {
+        const selOpt = modelDropdown.options[modelDropdown.selectedIndex];
+        const txt = selOpt ? selOpt.textContent : "";
+        modelLabel.textContent = txt;
+        if (modelWrapper) {
+          modelWrapper.title = txt ? `Model: ${txt}` : "Switch Model";
+          modelWrapper.classList.toggle("empty-model", !txt);
+        }
+      }
+      if (thinkingLabel && thinkingDropdown) {
+        const selThink = thinkingDropdown.options[thinkingDropdown.selectedIndex];
+        thinkingLabel.textContent = selThink ? selThink.textContent : "";
+      }
+    };
 
     modelDropdown.innerHTML = "";
     const activeProviders = getDropdownProviders();
@@ -728,6 +768,7 @@
       tab.modelId = "";
       tab.thinkingLevel = "none";
       thinkingWrapper.style.display = "none";
+      syncLabels();
       return;
     } else {
       let matched = false;
@@ -776,6 +817,7 @@
       thinkingWrapper.style.display = "none";
       tab.thinkingLevel = "none";
     }
+    syncLabels();
 
     modelDropdown.onchange = () => {
       const val = modelDropdown.value;
@@ -793,11 +835,13 @@
         thinkingWrapper.style.display = "none";
         tab.thinkingLevel = "none";
       }
+      syncLabels();
       persistTabsState();
     };
 
     thinkingDropdown.onchange = () => {
       tab.thinkingLevel = thinkingDropdown.value;
+      syncLabels();
       persistTabsState();
     };
   }
@@ -2203,16 +2247,48 @@
 
   async function downloadExport(format) {
     if (!state.activeExportConvId) return;
-    const res = await callApi("export_conversation", state.activeExportConvId, format);
-    if (res && res.content) {
+    const convId = state.activeExportConvId;
+    el.exportModal.classList.remove("open");
+
+    const res = await callApi("export_conversation", convId, format);
+    if (!res) return;
+    if (res.cancelled) return;
+    if (res.error) {
+      alert(res.error);
+      return;
+    }
+    if (res.saved) {
+      return;
+    }
+    if (res.content) {
+      const ext = format === "json" ? "json" : "md";
+      const defaultName = res.filename || `conversation_${convId.slice(0, 8)}.${ext}`;
+      if (window.showSaveFilePicker) {
+        try {
+          const handle = await window.showSaveFilePicker({
+            suggestedName: defaultName,
+            types: [
+              {
+                description: format === "json" ? "JSON File" : "Markdown File",
+                accept: format === "json" ? { "application/json": [".json"] } : { "text/markdown": [".md"] },
+              },
+            ],
+          });
+          const writable = await handle.createWritable();
+          await writable.write(res.content);
+          await writable.close();
+          return;
+        } catch (err) {
+          if (err && err.name === "AbortError") return;
+        }
+      }
       const blob = new Blob([res.content], { type: format === "json" ? "application/json" : "text/markdown" });
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
-      a.download = `conversation_${state.activeExportConvId.slice(0, 8)}.${format === "json" ? "json" : "md"}`;
+      a.download = defaultName;
       a.click();
       URL.revokeObjectURL(url);
-      el.exportModal.classList.remove("open");
     }
   }
 

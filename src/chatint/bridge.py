@@ -1,7 +1,9 @@
 import collections
 import json
+import re
 import threading
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 import webview
 from chatint.client_manager import ClientManager
@@ -196,21 +198,61 @@ class DesktopBridge:
             return {"error": "Conversation not found."}
 
         if format_type == "json":
-            return {"content": json.dumps(conv, indent=2), "format": "json"}
+            content = json.dumps(conv, indent=2)
+            ext = "json"
+            file_types = ("JSON Files (*.json)", "All files (*.*)")
+        else:
+            # Markdown format
+            lines = [f"# {conv['title']}\n"]
+            if conv.get("system_prompt"):
+                lines.append(f"> **System Prompt:** {conv['system_prompt']}\n")
 
-        # Markdown format
-        lines = [f"# {conv['title']}\n"]
-        if conv.get("system_prompt"):
-            lines.append(f"> **System Prompt:** {conv['system_prompt']}\n")
+            for msg in conv.get("messages", []):
+                role_title = "User" if msg["role"] == "user" else f"Assistant ({msg.get('model_id', 'Model')})"
+                lines.append(f"### {role_title}\n")
+                if msg.get("thinking_content"):
+                    lines.append(f"<details><summary>Thought Process</summary>\n\n{msg['thinking_content']}\n\n</details>\n")
+                lines.append(f"{msg['content']}\n")
 
-        for msg in conv.get("messages", []):
-            role_title = "User" if msg["role"] == "user" else f"Assistant ({msg.get('model_id', 'Model')})"
-            lines.append(f"### {role_title}\n")
-            if msg.get("thinking_content"):
-                lines.append(f"<details><summary>Thought Process</summary>\n\n{msg['thinking_content']}\n\n</details>\n")
-            lines.append(f"{msg['content']}\n")
+            content = "\n".join(lines)
+            ext = "md"
+            file_types = ("Markdown Files (*.md)", "All files (*.*)")
 
-        return {"content": "\n".join(lines), "format": "markdown"}
+        safe_title = re.sub(r'[\\/*?:"<>|]+', "", (conv.get("title") or "conversation")).strip()
+        safe_title = re.sub(r"\s+", "_", safe_title)[:48] or f"conversation_{conv_id[:8]}"
+        default_filename = f"{safe_title}.{ext}"
+
+        if webview.windows:
+            try:
+                win = webview.windows[0]
+                dialog_type = getattr(webview, "FileDialog", None)
+                save_mode = dialog_type.SAVE if dialog_type and hasattr(dialog_type, "SAVE") else webview.SAVE_DIALOG
+                save_path = win.create_file_dialog(
+                    save_mode,
+                    save_filename=default_filename,
+                    file_types=file_types,
+                )
+                if not save_path:
+                    return {"cancelled": True}
+                if isinstance(save_path, (list, tuple)):
+                    if len(save_path) == 0:
+                        return {"cancelled": True}
+                    save_path = save_path[0]
+
+                target_path = Path(str(save_path))
+                if not target_path.suffix:
+                    target_path = target_path.with_suffix(f".{ext}")
+
+                target_path.write_text(content, encoding="utf-8")
+                return {
+                    "saved": True,
+                    "path": str(target_path),
+                    "format": format_type,
+                }
+            except Exception as e:
+                return {"error": f"Failed to save file: {str(e)}"}
+
+        return {"content": content, "format": format_type, "filename": default_filename}
 
     def save_tabs_state(self, tabs_state: Dict[str, Any]) -> Dict[str, Any]:
         save_tabs_state(tabs_state)
