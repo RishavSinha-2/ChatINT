@@ -151,7 +151,11 @@ class DesktopBridge:
 
     def fetch_provider_models(self, provider_id: str) -> Dict[str, Any]:
         models, err, is_net = ClientManager.fetch_remote_models(provider_id, timeout=60.0)
-        return {"models": models, "error": err}
+        return {
+            "models": models,
+            "fetched_model_ids": [m["id"] for m in models],
+            "error": err,
+        }
 
     def create_conversation(
         self, title: str = "New Chat", system_prompt: str = "", max_context: int = 30

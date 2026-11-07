@@ -77,8 +77,8 @@ def init_db():
     # Clean up legacy 'custom' provider if present from earlier runs
     cursor.execute("DELETE FROM providers WHERE id = 'custom'")
 
-    # Reset any unverified models for remote providers that have no API key
-    cursor.execute("UPDATE providers SET models_json = '[]' WHERE (api_key = '' OR api_key IS NULL) AND base_url NOT LIKE '%localhost%' AND base_url NOT LIKE '%127.0.0.1%'")
+    # Reset any unverified models for providers that have no API key
+    cursor.execute("UPDATE providers SET models_json = '[]' WHERE (api_key = '' OR api_key IS NULL)")
 
     # Seed default providers if none exist
     cursor.execute("SELECT COUNT(*) FROM providers")
@@ -119,6 +119,8 @@ def init_db():
 
 
 def get_providers() -> List[Dict[str, Any]]:
+    from chatint.client_manager import BackgroundModelSyncer
+
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT id, name, base_url, api_key, is_enabled, models_json FROM providers")
@@ -127,20 +129,23 @@ def get_providers() -> List[Dict[str, Any]]:
 
     providers = []
     for r in rows:
+        pid = r["id"]
         models = json.loads(r["models_json"])
-        base_url = (r["base_url"] or "").strip()
         api_key = (r["api_key"] or "").strip()
-        is_local = "localhost" in base_url or "127.0.0.1" in base_url
-        has_credentials = bool(api_key) or is_local
+        has_api_key = bool(api_key)
         is_enabled = bool(r["is_enabled"])
+        is_verified = BackgroundModelSyncer.is_provider_verified(pid) if has_api_key else False
+        verified_ids = BackgroundModelSyncer.get_verified_model_ids(pid) if is_verified else set()
+        effective_models = [m for m in models if m.get("id") in verified_ids] if is_verified else []
         providers.append({
-            "id": r["id"],
+            "id": pid,
             "name": r["name"],
             "base_url": r["base_url"],
             "api_key": r["api_key"],
             "is_enabled": is_enabled,
-            "models": models,
-            "is_accessible": bool(is_enabled and has_credentials and len(models) > 0),
+            "models": effective_models,
+            "fetched_model_ids": sorted(list(verified_ids)),
+            "is_accessible": bool(is_enabled and has_api_key and is_verified and len(effective_models) > 0),
         })
     return providers
 

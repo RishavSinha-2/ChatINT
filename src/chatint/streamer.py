@@ -154,35 +154,39 @@ def stream_chat_completion(
             if abort_event.is_set():
                 break
 
-            # Trigger naming check on first streaming chunk
+            # Trigger naming check on first streaming chunk (runs asynchronously so stream never stalls)
             if not has_named_chat:
                 has_named_chat = True
-                try:
-                    conv = get_conversation(conversation_id)
-                    current_title = (conv.get("title") or "").strip() if conv else ""
-                    # Check if previous assistant responses exist in this chat
-                    assistant_count = sum(1 for m in conv.get("messages", []) if m.get("role") == "assistant") if conv else 0
-                    is_default = current_title.lower() in ["new chat", ""]
+                def _run_naming():
+                    try:
+                        conv = get_conversation(conversation_id)
+                        current_title = (conv.get("title") or "").strip() if conv else ""
+                        assistant_count = sum(1 for m in conv.get("messages", []) if m.get("role") == "assistant") if conv else 0
+                        is_default = current_title.lower() in ["new chat", ""]
 
-                    # If the name of the chat has NOT been changed from its default "New Chat",
-                    # only change its name after the first turn using the naming script.
-                    if is_default and assistant_count == 0:
-                        final_title = generate_chat_title(user_question)
-                        update_conversation(conversation_id, title=final_title)
-                    else:
-                        final_title = current_title or "New Chat"
+                        if is_default and assistant_count == 0:
+                            final_title = generate_chat_title(
+                                user_question,
+                                provider_id=provider_id,
+                                model_id=model_id,
+                            )
+                            update_conversation(conversation_id, title=final_title)
+                        else:
+                            final_title = current_title or "New Chat"
 
-                    _safe_dispatch(
-                        bridge,
-                        {
-                            "type": "chat_named",
-                            "tab_id": tab_id,
-                            "conversation_id": conversation_id,
-                            "title": final_title,
-                        },
-                    )
-                except Exception as ex:
-                    print(f"[Naming Error] {ex}")
+                        _safe_dispatch(
+                            bridge,
+                            {
+                                "type": "chat_named",
+                                "tab_id": tab_id,
+                                "conversation_id": conversation_id,
+                                "title": final_title,
+                            },
+                        )
+                    except Exception as ex:
+                        print(f"[Naming Error] {ex}")
+
+                threading.Thread(target=_run_naming, daemon=True).start()
 
             if hasattr(chunk, "usage") and chunk.usage:
                 u = chunk.usage

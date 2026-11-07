@@ -186,8 +186,15 @@
           }));
           const validTabIds = new Set(state.tabs.map((t) => t.id));
           state.activeTabId = validTabIds.has(savedTabs.activeTabId) ? savedTabs.activeTabId : state.tabs[0].id;
+          const seenSplitIds = new Set();
           const validSplitIds = Array.isArray(savedTabs.splitTabIds)
-            ? savedTabs.splitTabIds.filter((id) => validTabIds.has(id)).slice(0, 5)
+            ? savedTabs.splitTabIds
+                .filter((id) => {
+                  if (!validTabIds.has(id) || seenSplitIds.has(id)) return false;
+                  seenSplitIds.add(id);
+                  return true;
+                })
+                .slice(0, 5)
             : [];
           state.splitTabIds = validSplitIds.length > 0 ? validSplitIds : [state.activeTabId];
         } else {
@@ -268,15 +275,17 @@
     callApi("save_tabs_state", serialized);
   }
 
-  // Get accessible/configured providers for dropdown (Strict: ONLY if enabled, has credentials, and models available)
+  // Get accessible/configured providers for dropdown (Strict: ONLY if enabled, has API key, and models successfully fetched)
   function getDropdownProviders() {
     return state.providers.filter((p) => {
       if (!p.is_enabled) return false;
-      const baseUrl = (p.base_url || "").trim();
       const apiKey = (p.api_key || "").trim();
-      const isLocal = baseUrl.includes("localhost") || baseUrl.includes("127.0.0.1");
-      if (!apiKey && !isLocal) return false;
-      return p.is_accessible === true && Array.isArray(p.models) && p.models.length > 0;
+      if (!apiKey) return false;
+      const fetchedIds = Array.isArray(p.fetched_model_ids) ? new Set(p.fetched_model_ids) : null;
+      const validModels = Array.isArray(p.models)
+        ? p.models.filter((m) => !fetchedIds || fetchedIds.has(m.id))
+        : [];
+      return p.is_accessible === true && validModels.length > 0;
     });
   }
 
@@ -391,25 +400,84 @@
     lucide.createIcons();
   }
 
-  function switchActiveTab(tabId) {
+  // Ensure splitTabIds has no duplicates and never exceeds 5 panes
+  function sanitizeSplitTabIds() {
+    const validTabIds = new Set(state.tabs.map((t) => t.id));
+    const seen = new Set();
+    const clean = [];
+    for (const id of state.splitTabIds) {
+      if (validTabIds.has(id) && !seen.has(id)) {
+        seen.add(id);
+        clean.push(id);
+      }
+      if (clean.length >= 5) break;
+    }
+    if (clean.length === 0 && state.tabs.length > 0) {
+      const fallback = validTabIds.has(state.activeTabId) ? state.activeTabId : state.tabs[0].id;
+      clean.push(fallback);
+    }
+    state.splitTabIds = clean;
+  }
+
+  // Open or switch to a tab inside a specific split pane slot (with automatic exchange if already open in another pane)
+  function assignTabToPaneSlot(slotIndex, targetTabId) {
+    sanitizeSplitTabIds();
+    if (slotIndex < 0 || slotIndex >= state.splitTabIds.length) {
+      slotIndex = Math.max(0, state.splitTabIds.length - 1);
+    }
+    const currentTabIdInSlot = state.splitTabIds[slotIndex];
+    const existingPaneIdx = state.splitTabIds.indexOf(targetTabId);
+
+    if (existingPaneIdx !== -1 && existingPaneIdx !== slotIndex) {
+      // Exchange the two split panes so no two split panes ever have the same tab open
+      state.splitTabIds[existingPaneIdx] = currentTabIdInSlot;
+      state.splitTabIds[slotIndex] = targetTabId;
+    } else if (existingPaneIdx === -1) {
+      state.splitTabIds[slotIndex] = targetTabId;
+    }
+
+    state.activeTabId = targetTabId;
+    sanitizeSplitTabIds();
+    persistTabsState();
+    renderTabs();
+    renderConversationsList();
+    renderActivePanes();
+    lucide.createIcons();
+  }
+
+  function switchActiveTab(tabId, targetSlotIndex = null) {
+    sanitizeSplitTabIds();
     const prevActiveTabId = state.activeTabId;
-    state.activeTabId = tabId;
-    if (!state.splitTabIds.includes(tabId)) {
+    const activeSlotIdx =
+      targetSlotIndex !== null && targetSlotIndex >= 0 && targetSlotIndex < state.splitTabIds.length
+        ? targetSlotIndex
+        : state.splitTabIds.indexOf(prevActiveTabId);
+
+    if (targetSlotIndex !== null) {
+      assignTabToPaneSlot(activeSlotIdx !== -1 ? activeSlotIdx : 0, tabId);
+      return;
+    }
+
+    const existingIdx = state.splitTabIds.indexOf(tabId);
+    if (existingIdx === -1) {
       if (state.splitTabIds.length <= 1) {
         state.splitTabIds = [tabId];
       } else {
-        const activeSlotIdx = state.splitTabIds.indexOf(prevActiveTabId);
-        if (activeSlotIdx !== -1) {
-          state.splitTabIds[activeSlotIdx] = tabId;
-        } else {
-          state.splitTabIds[state.splitTabIds.length - 1] = tabId;
-        }
+        const slotIdx = activeSlotIdx !== -1 ? activeSlotIdx : state.splitTabIds.length - 1;
+        state.splitTabIds[slotIdx] = tabId;
       }
+      state.activeTabId = tabId;
+      sanitizeSplitTabIds();
       persistTabsState();
       renderTabs();
       renderConversationsList();
       renderActivePanes();
+      lucide.createIcons();
+    } else if (state.splitTabIds.length > 1 && activeSlotIdx !== -1 && existingIdx !== activeSlotIdx) {
+      // If user selects a tab that is already open in another split pane, exchange the tabs!
+      assignTabToPaneSlot(activeSlotIdx, tabId);
     } else {
+      state.activeTabId = tabId;
       persistTabsState();
       renderTabs();
       renderConversationsList();
@@ -516,11 +584,7 @@
   // Render Active Panes (1 to 5 Equal Sized Columns)
   function renderActivePanes() {
     el.panesContainer.innerHTML = "";
-
-    // Ensure valid splitTabIds
-    if (state.splitTabIds.length === 0 && state.tabs.length > 0) {
-      state.splitTabIds = [state.tabs[0].id];
-    }
+    sanitizeSplitTabIds();
 
     state.splitTabIds.forEach((tabId, index) => {
       const tab = state.tabs.find((t) => t.id === tabId);
@@ -546,10 +610,26 @@
     const isFirst = index === 0;
     const isLast = index === totalPanes - 1;
     const showClose = totalPanes > 1;
+    const showTabSwitcher = state.tabs.length > 1 && totalPanes > 1;
+    const tabOptionsHtml = state.tabs
+      .map((t) => {
+        const c = state.conversations.find((item) => item.id === t.conversationId);
+        const tTitle = c ? c.title : t.title || "New Chat";
+        return `<option value="${escapeHtml(t.id)}" ${t.id === tab.id ? "selected" : ""}>${escapeHtml(tTitle)}</option>`;
+      })
+      .join("");
 
     pane.innerHTML = `
       <header class="pane-header">
         <div class="pane-header-left">
+          ${
+            showTabSwitcher
+              ? `<div class="pane-tab-select-wrapper" title="Switch Tab in this Split Pane">
+                  <i data-lucide="app-window" style="width: 12px; height: 12px; color: var(--text-muted);"></i>
+                  <select class="pane-tab-dropdown" id="pane-tab-dropdown-${tab.id}">${tabOptionsHtml}</select>
+                </div>`
+              : ""
+          }
           <div class="model-select-wrapper" title="Switch Model">
             <i data-lucide="cpu" style="width: 13px; height: 13px; color: var(--accent-color);"></i>
             <select class="model-dropdown" id="model-dropdown-${tab.id}"></select>
@@ -620,6 +700,16 @@
     const closeBtn = pane.querySelector(".pane-close-btn");
     if (closeBtn) closeBtn.onclick = () => removeSplitPane(tab.id);
 
+    const paneTabSelect = pane.querySelector(`#pane-tab-dropdown-${tab.id}`);
+    if (paneTabSelect) {
+      paneTabSelect.onchange = () => {
+        const selectedTabId = paneTabSelect.value;
+        if (selectedTabId && selectedTabId !== tab.id) {
+          assignTabToPaneSlot(index, selectedTabId);
+        }
+      };
+    }
+
     return pane;
   }
 
@@ -634,20 +724,21 @@
     const activeProviders = getDropdownProviders();
 
     if (activeProviders.length === 0) {
-      const opt = document.createElement("option");
-      opt.value = "";
-      opt.textContent = "No models fetched yet (Ctrl+,)";
-      opt.disabled = true;
-      opt.selected = true;
-      modelDropdown.appendChild(opt);
+      tab.providerId = "";
+      tab.modelId = "";
+      tab.thinkingLevel = "none";
       thinkingWrapper.style.display = "none";
       return;
     } else {
       let matched = false;
       activeProviders.forEach((prov) => {
+        const fetchedIds = Array.isArray(prov.fetched_model_ids) ? new Set(prov.fetched_model_ids) : null;
+        const verifiedModels = (prov.models || []).filter((m) => !fetchedIds || fetchedIds.has(m.id)).slice(0, 5);
+        if (verifiedModels.length === 0) return;
+
         const optgroup = document.createElement("optgroup");
         optgroup.label = prov.name;
-        (prov.models || []).slice(0, 5).forEach((m) => {
+        verifiedModels.forEach((m) => {
           const opt = document.createElement("option");
           opt.value = `${prov.id}::${m.id}`;
           opt.textContent = m.name || m.id;
@@ -662,11 +753,16 @@
 
       if (!matched) {
         const fallbackProv = activeProviders.find((p) => p.id === state.settings.default_provider) || activeProviders[0];
-        const fallbackModel = fallbackProv?.models?.find((m) => m.id === state.settings.default_model) || fallbackProv?.models?.[0];
+        const fetchedIds = Array.isArray(fallbackProv?.fetched_model_ids) ? new Set(fallbackProv.fetched_model_ids) : null;
+        const verifiedModels = (fallbackProv?.models || []).filter((m) => !fetchedIds || fetchedIds.has(m.id)).slice(0, 5);
+        const fallbackModel = verifiedModels.find((m) => m.id === state.settings.default_model) || verifiedModels[0];
         if (fallbackProv && fallbackModel) {
           tab.providerId = fallbackProv.id;
           tab.modelId = fallbackModel.id;
           modelDropdown.value = `${tab.providerId}::${tab.modelId}`;
+        } else {
+          tab.providerId = "";
+          tab.modelId = "";
         }
       }
     }
@@ -1546,21 +1642,33 @@
             renderActivePanes();
           }
         } else {
-          // Open in currently focused active tab
-          const activeTab = state.tabs.find((t) => t.id === state.activeTabId);
-          if (activeTab) {
-            if (activeTab.isStreaming && activeTab.conversationId !== conv.id) {
-              callApi("stop_streaming", activeTab.id);
-              activeTab.isStreaming = false;
+          // Open conversation in currently focused active split pane (or exchange if already open in another tab/pane)
+          sanitizeSplitTabIds();
+          const activeSlotIdx = state.splitTabIds.indexOf(state.activeTabId);
+          const existingTabWithConv = state.tabs.find((t) => t.conversationId === conv.id);
+
+          if (existingTabWithConv) {
+            if (activeSlotIdx !== -1 && state.splitTabIds.length > 1) {
+              assignTabToPaneSlot(activeSlotIdx, existingTabWithConv.id);
+            } else {
+              switchActiveTab(existingTabWithConv.id);
             }
-            activeTab.conversationId = conv.id;
-            activeTab.title = conv.title;
-            activeTab.systemPrompt = conv.system_prompt || "";
-            activeTab.maxContextMessages = conv.max_context_messages || 30;
-            persistTabsState();
-            renderConversationsList();
-            renderTabs();
-            renderActivePanes();
+          } else {
+            const activeTab = state.tabs.find((t) => t.id === state.activeTabId);
+            if (activeTab) {
+              if (activeTab.isStreaming && activeTab.conversationId !== conv.id) {
+                callApi("stop_streaming", activeTab.id);
+                activeTab.isStreaming = false;
+              }
+              activeTab.conversationId = conv.id;
+              activeTab.title = conv.title;
+              activeTab.systemPrompt = conv.system_prompt || "";
+              activeTab.maxContextMessages = conv.max_context_messages || 30;
+              persistTabsState();
+              renderConversationsList();
+              renderTabs();
+              renderActivePanes();
+            }
           }
         }
       };
@@ -1607,11 +1715,18 @@
 
   function refreshProviderAccessibility(prov) {
     if (!prov) return;
-    const baseUrl = (prov.base_url || "").trim();
     const apiKey = (prov.api_key || "").trim();
-    const isLocal = baseUrl.includes("localhost") || baseUrl.includes("127.0.0.1");
-    const hasCredentials = Boolean(apiKey) || isLocal;
-    prov.is_accessible = Boolean(prov.is_enabled && hasCredentials && Array.isArray(prov.models) && prov.models.length > 0);
+    const hasCredentials = Boolean(apiKey);
+    const fetchedIds = Array.isArray(prov.fetched_model_ids) ? new Set(prov.fetched_model_ids) : new Set();
+    const verifiedModels = Array.isArray(prov.models) ? prov.models.filter((m) => fetchedIds.has(m.id)) : [];
+    if (!hasCredentials) {
+      prov.models = [];
+      prov.fetched_model_ids = [];
+      prov.is_accessible = false;
+      return;
+    }
+    prov.models = verifiedModels;
+    prov.is_accessible = Boolean(prov.is_enabled && hasCredentials && verifiedModels.length > 0);
   }
 
   function renderSettingsContent() {
@@ -1795,7 +1910,7 @@
         };
       }
 
-      // Add Model
+      // Add Model (Only allow models that have been successfully fetched from the endpoint)
       const addMBtn = document.getElementById("add-model-btn");
       const newMInput = document.getElementById("new-model-id-input");
       if (addMBtn && newMInput && activeProv) {
@@ -1803,6 +1918,15 @@
           saveActiveProviderInputs();
           const mid = newMInput.value.trim();
           if (!mid) return;
+          const fetchedIds = Array.isArray(activeProv.fetched_model_ids) ? new Set(activeProv.fetched_model_ids) : new Set();
+          if (!fetchedIds.has(mid)) {
+            alert(
+              fetchedIds.size === 0
+                ? "Please fetch models from the endpoint first (requires a valid API key)."
+                : `Model "${mid}" was not found in the models fetched from ${activeProv.name}. Only successfully fetched models can be added.`
+            );
+            return;
+          }
           if (!activeProv.models) activeProv.models = [];
           if (activeProv.models.some((m) => m.id === mid)) {
             newMInput.value = "";
@@ -1910,6 +2034,7 @@
             }
 
             activeProv.models = retained.slice(0, 5);
+            activeProv.fetched_model_ids = Array.from(fetchedIds);
             activeProv.is_accessible = true;
             await callApi("save_settings", state.providers, state.settings);
             if (state.settingsSnapshot) {
@@ -1925,6 +2050,18 @@
             });
             alert(`Synced ${activeProv.models.length} models for ${activeProv.name}!`);
           } else {
+            activeProv.models = [];
+            activeProv.fetched_model_ids = [];
+            activeProv.is_accessible = false;
+            await callApi("save_settings", state.providers, state.settings);
+            renderSettingsContent();
+            el.panesContainer.querySelectorAll(".chat-pane").forEach((paneEl) => {
+              const tabId = paneEl.dataset.tabId;
+              const targetTab = state.tabs.find((t) => t.id === tabId);
+              if (targetTab) {
+                updatePaneModelDropdown(paneEl, targetTab);
+              }
+            });
             alert(`Could not fetch models: ${res?.error || "Endpoint unreachable or invalid API key"}`);
           }
         };

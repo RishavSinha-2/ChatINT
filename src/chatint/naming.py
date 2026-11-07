@@ -1,9 +1,54 @@
 import re
+from typing import Optional
+from chatint.client_manager import ClientManager
 
 
-def generate_chat_title(prompt: str) -> str:
+def generate_chat_title(
+    prompt: str,
+    provider_id: Optional[str] = None,
+    model_id: Optional[str] = None,
+) -> str:
     """
-    Derives a clean, concise, human-readable title from the initial user prompt.
+    Generates a concise, human-readable title from the initial user prompt.
+    Uses the active chat model if available and falls back to offline heuristic extraction.
+    """
+    if not prompt or not prompt.strip():
+        return "New Chat"
+
+    if provider_id and model_id:
+        try:
+            client, err = ClientManager.get_client(provider_id, timeout=10.0)
+            if client and not err:
+                resp = client.chat.completions.create(
+                    model=model_id,
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": "Generate a concise 2 to 5 word title for this conversation based on the user's message. Output ONLY the title text, with no quotes or trailing punctuation.",
+                        },
+                        {"role": "user", "content": prompt.strip()[:500]},
+                    ],
+                    max_tokens=20,
+                    stream=False,
+                )
+                if resp and resp.choices and resp.choices[0].message:
+                    raw_title = (resp.choices[0].message.content or "").strip()
+                    # Strip any <think>...</think> blocks if a reasoning model included them
+                    raw_title = re.sub(r"<think>[\s\S]*?</think>", "", raw_title).strip()
+                    raw_title = raw_title.split("\n")[0].strip().strip('"\'`.?!:;,-')
+                    if raw_title and len(raw_title) >= 2:
+                        if len(raw_title) > 42:
+                            raw_title = raw_title[:39].rsplit(" ", 1)[0]
+                        return raw_title
+        except Exception:
+            pass
+
+    return _offline_heuristic_title(prompt)
+
+
+def _offline_heuristic_title(prompt: str) -> str:
+    """
+    Offline fallback that derives a clean, concise, human-readable title from the initial user prompt.
     """
     if not prompt:
         return "New Chat"

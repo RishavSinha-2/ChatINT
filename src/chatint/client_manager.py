@@ -1,8 +1,10 @@
+import concurrent.futures
 import json
 import socket
 import threading
 import time
 from typing import Any, Dict, List, Optional, Set
+import httpx
 import openai
 from chatint.db import get_providers, save_providers
 
@@ -49,25 +51,18 @@ class ClientManager:
 
         base_url = (provider.get("base_url") or "").strip()
         api_key = (provider.get("api_key") or "").strip()
-        is_local = "localhost" in base_url or "127.0.0.1" in base_url
 
         if not api_key:
-            if is_local:
-                api_key = "local-no-key-required"
-            else:
-                return None, f"API key for {provider['name']} is missing. Please set it in Settings (Ctrl+,)."
+            return None, f"API key for {provider['name']} is missing. Please set it in Settings (Ctrl+,)."
 
         if not base_url:
             base_url = "https://api.openai.com/v1"
 
-        # Local endpoints fail fast (3s), remote endpoints use specified timeout (60s)
-        actual_timeout = 3.0 if is_local else timeout
-
         client = openai.OpenAI(
             base_url=base_url,
             api_key=api_key,
-            timeout=actual_timeout,
-            max_retries=0 if is_local else 1,
+            timeout=httpx.Timeout(timeout, connect=min(15.0, timeout)),
+            max_retries=0,
         )
         return client, None
 
@@ -76,15 +71,21 @@ class ClientManager:
         cls, provider_id: str, timeout: float = 60.0
     ) -> tuple[List[Dict[str, Any]], Optional[str], bool]:
         """
-        Fetches models.
+        Fetches models with a strict wall-clock TTL (default 60s).
         Returns (models_list, error_message, is_network_error).
         """
         client, err = cls.get_client(provider_id, timeout=timeout)
         if err or not client:
             return [], err, False
 
+        def _do_fetch():
+            return client.models.list()
+
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        future = executor.submit(_do_fetch)
         try:
-            model_list = client.models.list()
+            model_list = future.result(timeout=timeout)
+            executor.shutdown(wait=False)
             models = []
             for m in model_list.data:
                 mid = m.id
@@ -103,14 +104,28 @@ class ClientManager:
                     "supports_thinking": supports_thinking,
                 })
             models.sort(key=lambda x: x["name"])
+            if models:
+                BackgroundModelSyncer.mark_provider_verified(provider_id, {m["id"] for m in models})
+            else:
+                BackgroundModelSyncer.clear_provider_verified(provider_id)
             return models, None, False
+        except concurrent.futures.TimeoutError:
+            executor.shutdown(wait=False, cancel_futures=True)
+            BackgroundModelSyncer.clear_provider_verified(provider_id)
+            return [], f"Request timed out after {int(timeout)}s", True
         except openai.APIConnectionError as conn_err:
+            executor.shutdown(wait=False)
+            BackgroundModelSyncer.clear_provider_verified(provider_id)
             return [], str(conn_err), True
-        except openai.APITimeoutError as time_err:
-            return [], "Request timed out after 60s", True
+        except openai.APITimeoutError:
+            executor.shutdown(wait=False)
+            BackgroundModelSyncer.clear_provider_verified(provider_id)
+            return [], f"Request timed out after {int(timeout)}s", True
         except Exception as e:
+            executor.shutdown(wait=False)
+            BackgroundModelSyncer.clear_provider_verified(provider_id)
             err_str = str(e).lower()
-            is_net = any(k in err_str for k in ["connect", "dns", "no such host", "network", "timeout"])
+            is_net = any(k in err_str for k in ["connect", "dns", "no such host", "network", "timeout", "unreachable", "refused", "reset"])
             return [], str(e), is_net
 
 
@@ -118,7 +133,33 @@ class BackgroundModelSyncer:
     _lock = threading.Lock()
     _bridge: Optional[Any] = None
     _pending_network_retries: Set[str] = set()
+    _in_flight: Set[str] = set()
+    _verified_providers: Set[str] = set()
+    _verified_model_ids: Dict[str, Set[str]] = {}
     _watcher_thread: Optional[threading.Thread] = None
+
+    @classmethod
+    def is_provider_verified(cls, provider_id: str) -> bool:
+        with cls._lock:
+            return provider_id in cls._verified_providers
+
+    @classmethod
+    def get_verified_model_ids(cls, provider_id: str) -> Set[str]:
+        with cls._lock:
+            return set(cls._verified_model_ids.get(provider_id, set()))
+
+    @classmethod
+    def mark_provider_verified(cls, provider_id: str, model_ids: Optional[Set[str]] = None):
+        with cls._lock:
+            cls._verified_providers.add(provider_id)
+            if model_ids is not None:
+                cls._verified_model_ids[provider_id] = set(model_ids)
+
+    @classmethod
+    def clear_provider_verified(cls, provider_id: str):
+        with cls._lock:
+            cls._verified_providers.discard(provider_id)
+            cls._verified_model_ids.pop(provider_id, None)
 
     @classmethod
     def set_bridge(cls, bridge: Any):
@@ -128,7 +169,7 @@ class BackgroundModelSyncer:
     def start_background_sync(cls, bridge: Optional[Any] = None):
         """
         Launches background fetch without blocking UI startup.
-        Each endpoint is fetched asynchronously with a 60s timeout.
+        Each endpoint with an API key is fetched asynchronously with a 60s TTL.
         """
         if bridge:
             cls._bridge = bridge
@@ -144,74 +185,108 @@ class BackgroundModelSyncer:
 
     @classmethod
     def _sync_single_provider(cls, provider_id: str):
-        provider = ClientManager.get_provider(provider_id)
-        if not provider:
-            return
-
-        base_url = (provider.get("base_url") or "").strip()
-        api_key = (provider.get("api_key") or "").strip()
-        is_enabled = bool(provider.get("is_enabled", True))
-        is_local = "localhost" in base_url or "127.0.0.1" in base_url
-
-        has_key = bool(api_key) or is_local
-        if not is_enabled or not has_key:
-            return
-
-        # Fetch with 60s TTL (or 3s for local)
-        fetched, err, is_network_error = ClientManager.fetch_remote_models(provider_id, timeout=60.0)
-
-        if err or not fetched:
-            if is_network_error and not is_local:
-                with cls._lock:
-                    cls._pending_network_retries.add(provider_id)
-            return
-
-        # Success: remove from pending retries
         with cls._lock:
-            cls._pending_network_retries.discard(provider_id)
+            if provider_id in cls._in_flight:
+                return
+            cls._in_flight.add(provider_id)
 
-        # Re-read latest provider state from DB after network call to avoid overwriting concurrent user edits
-        latest_provider = ClientManager.get_provider(provider_id)
-        if not latest_provider:
-            return
+        try:
+            provider = ClientManager.get_provider(provider_id)
+            if not provider:
+                return
 
-        # Sync models: retain existing models present in fetch; if none configured/retained yet, auto-fill up to 5
-        fetched_ids = {m["id"] for m in fetched}
-        current_models = latest_provider.get("models", [])
+            api_key = (provider.get("api_key") or "").strip()
+            is_enabled = bool(provider.get("is_enabled", True))
 
-        retained = [m for m in current_models if m["id"] in fetched_ids]
-        retained_ids = {m["id"] for m in retained}
+            # Strictly only fetch from endpoints that are enabled and have an API key associated with them
+            if not is_enabled or not api_key:
+                cls.clear_provider_verified(provider_id)
+                provider["models"] = []
+                provider["is_accessible"] = False
+                save_providers([provider])
+                if cls._bridge:
+                    cls._bridge.push_event({
+                        "type": "provider_models_updated",
+                        "provider": provider,
+                    })
+                return
 
-        if len(retained) == 0:
-            for fm in fetched:
-                if len(retained) >= 5:
-                    break
-                if fm["id"] not in retained_ids:
-                    retained.append(fm)
-                    retained_ids.add(fm["id"])
+            # Fetch with strict 60s TTL
+            fetched, err, is_network_error = ClientManager.fetch_remote_models(provider_id, timeout=60.0)
 
-        synced_models = retained[:5]
-        latest_provider["models"] = synced_models
-        latest_provider["is_accessible"] = len(synced_models) > 0
+            if err or not fetched:
+                cls.clear_provider_verified(provider_id)
+                latest_failed = ClientManager.get_provider(provider_id)
+                if latest_failed:
+                    latest_failed["models"] = []
+                    latest_failed["is_accessible"] = False
+                    save_providers([latest_failed])
+                    if cls._bridge:
+                        cls._bridge.push_event({
+                            "type": "provider_models_updated",
+                            "provider": latest_failed,
+                        })
+                if is_network_error:
+                    with cls._lock:
+                        cls._pending_network_retries.add(provider_id)
+                return
 
-        # Save updated provider to database atomically
-        save_providers([latest_provider])
+            # Success: remove from pending retries and mark verified
+            fetched_ids = {m["id"] for m in fetched}
+            with cls._lock:
+                cls._pending_network_retries.discard(provider_id)
+                cls._verified_providers.add(provider_id)
+                cls._verified_model_ids[provider_id] = set(fetched_ids)
 
-        # Push event to bridge memory queue
-        if cls._bridge:
-            cls._bridge.push_event({
-                "type": "provider_models_updated",
-                "provider": latest_provider,
-            })
+            # Re-read latest provider state from DB after network call to avoid overwriting concurrent user edits
+            from chatint.db import get_connection
+            conn = get_connection()
+            row = conn.execute("SELECT models_json FROM providers WHERE id = ?", (provider_id,)).fetchone()
+            conn.close()
+            stored_models = json.loads(row["models_json"]) if row and row["models_json"] else []
+
+            latest_provider = ClientManager.get_provider(provider_id)
+            if not latest_provider:
+                return
+
+            # Sync models: retain existing configured models present in fetch; if none retained, auto-fill up to 5 from fetched
+            retained = [m for m in stored_models if m.get("id") in fetched_ids]
+            retained_ids = {m["id"] for m in retained}
+
+            if len(retained) == 0:
+                for fm in fetched:
+                    if len(retained) >= 5:
+                        break
+                    if fm["id"] not in retained_ids:
+                        retained.append(fm)
+                        retained_ids.add(fm["id"])
+
+            synced_models = retained[:5]
+            latest_provider["models"] = synced_models
+            latest_provider["fetched_model_ids"] = sorted(list(fetched_ids))
+            latest_provider["is_accessible"] = len(synced_models) > 0
+
+            # Save updated provider to database atomically
+            save_providers([latest_provider])
+
+            # Push event to bridge memory queue so dropdown updates in real-time
+            if cls._bridge:
+                cls._bridge.push_event({
+                    "type": "provider_models_updated",
+                    "provider": latest_provider,
+                })
+        finally:
+            with cls._lock:
+                cls._in_flight.discard(provider_id)
 
     @classmethod
     def _network_watcher_loop(cls):
         """
-        Periodically checks connectivity and retries pending network failures.
+        Periodically checks connectivity and retries pending network failures with 60s TTL.
         """
         while True:
             try:
-                time.sleep(15.0)
+                time.sleep(5.0)
                 with cls._lock:
                     pending = list(cls._pending_network_retries)
 
