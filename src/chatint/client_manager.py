@@ -12,6 +12,7 @@ import anthropic
 from google import genai
 from google.genai import types as genai_types
 import httpx
+import httpx2
 import openai
 from chatint.db import get_api_key_from_env, get_providers, sanitize_provider_name, save_providers
 
@@ -72,7 +73,7 @@ class ClientManager:
 
         client = anthropic.Anthropic(
             api_key=api_key,
-            timeout=httpx.Timeout(timeout, connect=min(15.0, timeout)),
+            timeout=httpx2.Timeout(timeout, connect=min(15.0, timeout)),
             max_retries=0,
         )
         return client, None

@@ -1,6 +1,6 @@
 [project]
 name = "chatint"
-version = "0.2.0"
+version = "0.2.1"
 description = "Add your description here"
 readme = "README.md"
 authors = [
@@ -11,6 +11,7 @@ dependencies = [
     "anthropic>=2.6.0",
     "google-genai>=3.0.0",
     "httpx>=0.28.1",
+    "httpx2>=2.16.0",
     "openai>=3.46.0",
     "pywebview>=6.2.1",
 ]

@@ -5,7 +5,7 @@ datas = [('src/chatint/ui', 'chatint/ui')]
 binaries = []
 hiddenimports = []
 
-for pkg in ('webview', 'anthropic', 'openai', 'google.genai', 'google.auth'):
+for pkg in ('webview', 'anthropic', 'openai', 'google.genai', 'google.auth', 'httpx2'):
     try:
         tmp_ret = collect_all(pkg)
         datas += tmp_ret[0]
@@ -14,7 +14,7 @@ for pkg in ('webview', 'anthropic', 'openai', 'google.genai', 'google.auth'):
     except Exception:
         hiddenimports += collect_submodules(pkg)
 
-for dist_name in ('anthropic', 'google-genai', 'google-auth', 'openai', 'httpx', 'pydantic'):
+for dist_name in ('anthropic', 'google-genai', 'google-auth', 'openai', 'httpx', 'httpx2', 'pydantic'):
     try:
         datas += copy_metadata(dist_name)
     except Exception:
