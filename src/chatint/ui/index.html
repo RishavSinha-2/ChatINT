@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ChatInt</title>
+  <link rel="stylesheet" href="assets/github-dark.min.css" id="hljs-theme">
+  <link rel="stylesheet" href="assets/katex.min.css">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="app-container">
+    <!-- Sidebar: Chat History -->
+    <aside id="sidebar">
+      <div class="sidebar-header">
+        <div class="sidebar-brand">
+          <i data-lucide="sparkles" style="width: 18px; height: 18px;"></i>
+          <span>ChatInt</span>
+        </div>
+        <button id="sidebar-collapse-btn" class="icon-btn" title="Close Sidebar">
+          <i data-lucide="panel-left-close" style="width: 16px; height: 16px;"></i>
+        </button>
+      </div>
+
+      <button id="new-chat-btn" class="new-chat-btn">
+        <i data-lucide="plus" style="width: 16px; height: 16px;"></i>
+        <span>New Chat</span>
+      </button>
+
+      <div class="sidebar-search">
+        <div class="search-input-box">
+          <i data-lucide="search" style="width: 14px; height: 14px; opacity: 0.7;"></i>
+          <input type="text" id="conv-search-input" placeholder="Search chats...">
+        </div>
+      </div>
+
+      <div class="conversations-list" id="conversations-list">
+        <!-- Rendered dynamically (only chats with at least 1 Q&A) -->
+      </div>
+
+      <div class="sidebar-footer">
+        <div style="display: flex; gap: 4px;">
+          <button id="theme-toggle-btn" class="icon-btn" title="Toggle Dark/Light Theme">
+            <i data-lucide="moon" id="theme-icon" style="width: 16px; height: 16px;"></i>
+          </button>
+          <button id="global-settings-btn" class="icon-btn" title="Settings (Ctrl+,)">
+            <i data-lucide="settings" style="width: 16px; height: 16px;"></i>
+          </button>
+        </div>
+      </div>
+    </aside>
+
+    <!-- Main Workspace -->
+    <main id="main-workspace">
+      <!-- Top Tab Bar -->
+      <nav id="tab-bar">
+        <button id="sidebar-expand-btn" class="icon-btn sidebar-toggle-btn" title="Toggle Sidebar" style="display: none;">
+          <i data-lucide="panel-left-open" style="width: 16px; height: 16px;"></i>
+        </button>
+
+        <div class="tabs-scroll-area" id="tabs-scroll-area">
+          <!-- Rendered dynamically -->
+        </div>
+
+        <div class="tab-bar-actions">
+          <button id="new-tab-btn" class="icon-btn" title="New Tab (Ctrl+T)">
+            <i data-lucide="plus" style="width: 15px; height: 15px;"></i>
+          </button>
+          <button id="split-view-btn" class="icon-btn split-toggle-btn" title="Add / Toggle Split View (up to 5 panes, Ctrl+\)">
+            <i data-lucide="columns-2" style="width: 15px; height: 15px;"></i>
+          </button>
+        </div>
+      </nav>
+
+      <!-- Panes Container (Supports 1 up to 5 equal side-by-side panes) -->
+      <div id="panes-container">
+        <!-- Rendered dynamically by app.js -->
+      </div>
+    </main>
+  </div>
+
+  <!-- Settings Modal (Ctrl+,) -->
+  <div class="modal-overlay" id="settings-modal">
+    <div class="modal-card">
+      <div class="modal-header">
+        <div style="display: flex; align-items: center; gap: 8px;">
+          <i data-lucide="settings" style="width: 18px; height: 18px; color: var(--accent-color);"></i>
+          <span class="modal-title">Settings</span>
+        </div>
+        <button class="icon-btn close-modal-btn">
+          <i data-lucide="x" style="width: 16px; height: 16px;"></i>
+        </button>
+      </div>
+
+      <div class="modal-body">
+        <!-- Exactly Two Master Tabs: General & Providers -->
+        <div class="master-settings-tabs">
+          <button class="master-tab-btn active" id="master-tab-general">General</button>
+          <button class="master-tab-btn" id="master-tab-providers">Providers</button>
+        </div>
+
+        <div id="settings-tab-content">
+          <!-- Rendered dynamically based on active master tab -->
+        </div>
+      </div>
+
+      <div class="modal-footer">
+        <button class="btn-secondary close-modal-btn">Cancel</button>
+        <button class="btn-primary" id="save-settings-btn">Save Changes</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Conversation Context & Settings Modal -->
+  <div class="modal-overlay" id="conv-settings-modal">
+    <div class="modal-card" style="width: 500px;">
+      <div class="modal-header">
+        <span class="modal-title">Conversation Settings</span>
+        <button class="icon-btn close-conv-settings-btn">
+          <i data-lucide="x" style="width: 16px; height: 16px;"></i>
+        </button>
+      </div>
+      <div class="modal-body">
+        <div class="settings-group">
+          <label class="settings-label">Conversation Title</label>
+          <input type="text" class="settings-input" id="conv-title-input">
+        </div>
+
+        <div class="settings-group">
+          <label class="settings-label">Custom System Prompt (Per-Chat Override)</label>
+          <textarea class="settings-input" id="conv-system-prompt-input" rows="4" placeholder="Leave empty to use global system prompt..."></textarea>
+        </div>
+
+        <div class="settings-group">
+          <div style="display: flex; justify-content: space-between;">
+            <label class="settings-label">Max Context Messages Window</label>
+            <span id="conv-context-limit-val" style="font-size: 12.5px; font-weight: 600; color: var(--accent-color);">30</span>
+          </div>
+          <input type="range" id="conv-context-slider" min="2" max="100" step="2" value="30" style="width: 100%;">
+          <span style="font-size: 11.5px; color: var(--text-muted);">Limits how many recent messages are sent to the model to balance context and token usage.</span>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn-secondary close-conv-settings-btn">Cancel</button>
+        <button class="btn-primary" id="save-conv-settings-btn">Save</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Export Modal -->
+  <div class="modal-overlay" id="export-modal">
+    <div class="modal-card" style="width: 480px;">
+      <div class="modal-header">
+        <span class="modal-title">Export Conversation</span>
+        <button class="icon-btn close-export-modal-btn">
+          <i data-lucide="x" style="width: 16px; height: 16px;"></i>
+        </button>
+      </div>
+      <div class="modal-body">
+        <p style="font-size: 13.5px; color: var(--text-secondary); margin-bottom: 14px;">
+          Choose an export format for your conversation history:
+        </p>
+        <div style="display: flex; gap: 12px;">
+          <button class="btn-secondary" id="export-markdown-btn" style="flex: 1; padding: 16px; display: flex; flex-direction: column; align-items: center; gap: 8px;">
+            <i data-lucide="file-text" style="width: 24px; height: 24px; color: var(--accent-color);"></i>
+            <span style="font-weight: 600;">Markdown (.md)</span>
+            <span style="font-size: 11px; color: var(--text-muted);">Formatted with headers & thought tags</span>
+          </button>
+          <button class="btn-secondary" id="export-json-btn" style="flex: 1; padding: 16px; display: flex; flex-direction: column; align-items: center; gap: 8px;">
+            <i data-lucide="code" style="width: 24px; height: 24px; color: #34a853;"></i>
+            <span style="font-weight: 600;">JSON (.json)</span>
+            <span style="font-size: 11px; color: var(--text-muted);">Full raw data with token metadata</span>
+          </button>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn-secondary close-export-modal-btn">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Vendor Scripts -->
+  <script src="assets/marked.min.js"></script>
+  <script src="assets/highlight.min.js"></script>
+  <script src="assets/katex.min.js"></script>
+  <script src="assets/lucide.min.js"></script>
+  <!-- Main Application Script -->
+  <script src="app.js"></script>
+</body>
+</html>
