@@ -8,6 +8,7 @@ DATA_DIR = PROJECT_ROOT / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 DB_PATH = DATA_DIR / "chatint.db"
+ENV_PATH = PROJECT_ROOT / ".env"
 
 BASE_DIR = Path(__file__).resolve().parent
 UI_DIR = BASE_DIR / "ui"
@@ -39,7 +40,7 @@ DEFAULT_PROVIDERS = [
     },
     {
         "id": "ollama",
-        "name": "Ollama (Local)",
+        "name": "Ollama",
         "base_url": "http://localhost:11434/v1",
         "api_key": "",
         "is_enabled": 1,

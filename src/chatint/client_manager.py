@@ -6,7 +6,7 @@ import time
 from typing import Any, Dict, List, Optional, Set
 import httpx
 import openai
-from chatint.db import get_providers, save_providers
+from chatint.db import get_api_key_from_env, get_providers, save_providers
 
 
 def _is_network_available() -> bool:
@@ -50,10 +50,10 @@ class ClientManager:
             return None, f"Provider '{provider['name']}' is currently disabled in Settings."
 
         base_url = (provider.get("base_url") or "").strip()
-        api_key = (provider.get("api_key") or "").strip()
+        api_key = get_api_key_from_env(provider.get("name", ""))
 
         if not api_key:
-            return None, f"API key for {provider['name']} is missing. Please set it in Settings (Ctrl+,)."
+            return None, f"API key for {provider['name']} is missing in .env. Please set it in Settings (Ctrl+,)."
 
         if not base_url:
             base_url = "https://api.openai.com/v1"
@@ -89,19 +89,13 @@ class ClientManager:
             models = []
             for m in model_list.data:
                 mid = m.id
-                m_lower = mid.lower()
-                supports_thinking = (
-                    1
-                    if any(
-                        k in m_lower
-                        for k in ["o1", "o3", "o4", "r1", "qwq", "reasoner", "thinking"]
-                    )
-                    else 0
-                )
                 models.append({
                     "id": mid,
                     "name": mid,
-                    "supports_thinking": supports_thinking,
+                    "supports_thinking": 0,
+                    "input_price": 0.0,
+                    "cached_input_price": 0.0,
+                    "output_price": 0.0,
                 })
             models.sort(key=lambda x: x["name"])
             if models:
@@ -195,13 +189,14 @@ class BackgroundModelSyncer:
             if not provider:
                 return
 
-            api_key = (provider.get("api_key") or "").strip()
+            api_key = get_api_key_from_env(provider.get("name", ""))
             is_enabled = bool(provider.get("is_enabled", True))
 
             # Strictly only fetch from endpoints that are enabled and have an API key associated with them
             if not is_enabled or not api_key:
                 cls.clear_provider_verified(provider_id)
                 provider["models"] = []
+                provider["has_api_key"] = bool(api_key)
                 provider["is_accessible"] = False
                 save_providers([provider])
                 if cls._bridge:

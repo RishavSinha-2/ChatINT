@@ -59,7 +59,106 @@
     exportModal: document.getElementById("export-modal"),
     exportMarkdownBtn: document.getElementById("export-markdown-btn"),
     exportJsonBtn: document.getElementById("export-json-btn"),
+    allTabsDropdownWrapper: document.getElementById("all-tabs-dropdown-wrapper"),
+    allTabsMenuBtn: document.getElementById("all-tabs-menu-btn"),
+    allTabsPopover: document.getElementById("all-tabs-popover"),
+    modelConfigModal: document.getElementById("model-config-modal"),
+    modelConfigTitle: document.getElementById("model-config-title"),
+    modelInputPrice: document.getElementById("model-input-price"),
+    modelCachedPrice: document.getElementById("model-cached-price"),
+    modelOutputPrice: document.getElementById("model-output-price"),
+    modelSupportsThinkingCheck: document.getElementById("model-supports-thinking-check"),
+    cancelModelConfigBtn: document.getElementById("cancel-model-config-btn"),
+    saveModelConfigBtn: document.getElementById("save-model-config-btn"),
+    appDialogModal: document.getElementById("app-dialog-modal"),
+    appDialogMessage: document.getElementById("app-dialog-message"),
+    appDialogInput: document.getElementById("app-dialog-input"),
+    appDialogCancelBtn: document.getElementById("app-dialog-cancel-btn"),
+    appDialogOkBtn: document.getElementById("app-dialog-ok-btn"),
   };
+
+  // Single-Space Dark/Light Theme Aware Custom Dialogs (replaces browser alert/confirm/prompt)
+  let activeDialogResolve = null;
+
+  function closeAppDialog(result) {
+    if (!el.appDialogModal) return;
+    el.appDialogModal.classList.remove("open");
+    if (activeDialogResolve) {
+      const resolve = activeDialogResolve;
+      activeDialogResolve = null;
+      resolve(result);
+    }
+  }
+
+  function showNoticeDialog(message) {
+    return new Promise((resolve) => {
+      activeDialogResolve = resolve;
+      el.appDialogMessage.textContent = message;
+      el.appDialogInput.style.display = "none";
+      el.appDialogCancelBtn.style.display = "none";
+      el.appDialogOkBtn.textContent = "OK";
+      el.appDialogOkBtn.className = "btn-primary";
+      el.appDialogModal.classList.add("open");
+      setTimeout(() => el.appDialogOkBtn.focus(), 20);
+
+      el.appDialogOkBtn.onclick = () => closeAppDialog(true);
+    });
+  }
+
+  function showConfirmDialog(message, confirmLabel = "Delete", isDanger = true) {
+    return new Promise((resolve) => {
+      activeDialogResolve = resolve;
+      el.appDialogMessage.textContent = message;
+      el.appDialogInput.style.display = "none";
+      el.appDialogCancelBtn.style.display = "inline-flex";
+      el.appDialogCancelBtn.textContent = "Cancel";
+      el.appDialogOkBtn.textContent = confirmLabel;
+      el.appDialogOkBtn.className = isDanger ? "btn-danger" : "btn-primary";
+      el.appDialogModal.classList.add("open");
+      setTimeout(() => el.appDialogOkBtn.focus(), 20);
+
+      el.appDialogCancelBtn.onclick = () => closeAppDialog(false);
+      el.appDialogOkBtn.onclick = () => closeAppDialog(true);
+    });
+  }
+
+  function showPromptDialog(message, defaultValue = "", placeholder = "") {
+    return new Promise((resolve) => {
+      activeDialogResolve = resolve;
+      el.appDialogMessage.textContent = message;
+      el.appDialogInput.style.display = "block";
+      el.appDialogInput.value = defaultValue || "";
+      el.appDialogInput.placeholder = placeholder || "";
+      el.appDialogCancelBtn.style.display = "inline-flex";
+      el.appDialogCancelBtn.textContent = "Cancel";
+      el.appDialogOkBtn.textContent = "OK";
+      el.appDialogOkBtn.className = "btn-primary";
+      el.appDialogModal.classList.add("open");
+      setTimeout(() => {
+        el.appDialogInput.focus();
+        el.appDialogInput.select();
+      }, 20);
+
+      const submitPrompt = () => closeAppDialog(el.appDialogInput.value);
+      el.appDialogCancelBtn.onclick = () => closeAppDialog(null);
+      el.appDialogOkBtn.onclick = submitPrompt;
+      el.appDialogInput.onkeydown = (e) => {
+        if (e.key === "Enter") {
+          e.preventDefault();
+          submitPrompt();
+        }
+      };
+    });
+  }
+
+  // Format currency cost
+  function formatCost(cost) {
+    const val = Number(cost) || 0;
+    if (val === 0) return "$0.00";
+    if (val < 0.0001) return "$" + val.toFixed(6);
+    if (val < 0.01) return "$" + val.toFixed(4);
+    return "$" + val.toFixed(2);
+  }
 
   // Safe wrapper for backend pywebview API calls
   async function callApi(method, ...args) {
@@ -275,12 +374,12 @@
     callApi("save_tabs_state", serialized);
   }
 
-  // Get accessible/configured providers for dropdown (Strict: ONLY if enabled, has API key, and models successfully fetched)
+  // Get accessible/configured providers for dropdown (Strict: ONLY if enabled, has API key in .env, and models successfully fetched)
   function getDropdownProviders() {
     return state.providers.filter((p) => {
       if (!p.is_enabled) return false;
-      const apiKey = (p.api_key || "").trim();
-      if (!apiKey) return false;
+      const hasKey = Boolean(p.has_api_key || (p.api_key && p.api_key.trim()));
+      if (!hasKey) return false;
       const fetchedIds = Array.isArray(p.fetched_model_ids) ? new Set(p.fetched_model_ids) : null;
       const validModels = Array.isArray(p.models)
         ? p.models.filter((m) => !fetchedIds || fetchedIds.has(m.id))
@@ -490,7 +589,7 @@
   // Split View Management (Up to 5 panes)
   function addSplitPane() {
     if (state.splitTabIds.length >= 5) {
-      alert("Maximum 5 side-by-side tabs reached.");
+      showNoticeDialog("Maximum 5 side-by-side tabs reached.");
       return;
     }
 
@@ -536,9 +635,48 @@
     renderActivePanes();
   }
 
+  // Render All-Tabs Scrollable Popover List
+  function renderAllTabsPopover() {
+    if (!el.allTabsPopover) return;
+    el.allTabsPopover.innerHTML = "";
+
+    state.tabs.forEach((tab, idx) => {
+      const conv = state.conversations.find((c) => c.id === tab.conversationId);
+      const title = conv ? conv.title : (tab.title || "New Chat");
+      const isInSplit = state.splitTabIds.includes(tab.id);
+      const isActive = tab.id === state.activeTabId;
+
+      const row = document.createElement("div");
+      row.className = "all-tabs-popover-item" + (isActive ? " active" : "") + (isInSplit && state.splitTabIds.length > 1 ? " in-split" : "");
+      row.innerHTML = `
+        <span class="all-tabs-idx">${idx + 1}.</span>
+        <span class="all-tabs-title">${escapeHtml(title)}</span>
+        <button class="all-tabs-close-btn" title="Close Tab">
+          <i data-lucide="x" style="width: 12px; height: 12px;"></i>
+        </button>
+      `;
+
+      row.onclick = (e) => {
+        if (e.target.closest(".all-tabs-close-btn")) {
+          e.stopPropagation();
+          closeTab(tab.id);
+          renderAllTabsPopover();
+          return;
+        }
+        el.allTabsPopover.classList.remove("open");
+        switchActiveTab(tab.id);
+      };
+
+      el.allTabsPopover.appendChild(row);
+    });
+
+    lucide.createIcons();
+  }
+
   // Render Top Tab Bar
   function renderTabs() {
     el.tabsScrollArea.innerHTML = "";
+    let activeTabElement = null;
 
     state.tabs.forEach((tab) => {
       const conv = state.conversations.find((c) => c.id === tab.conversationId);
@@ -567,8 +705,17 @@
         }
       });
 
+      if (isActive) activeTabElement = tabEl;
       el.tabsScrollArea.appendChild(tabEl);
     });
+
+    if (activeTabElement && typeof activeTabElement.scrollIntoView === "function") {
+      activeTabElement.scrollIntoView({ behavior: "smooth", block: "nearest", inline: "nearest" });
+    }
+
+    if (el.allTabsPopover && el.allTabsPopover.classList.contains("open")) {
+      renderAllTabsPopover();
+    }
 
     if (state.splitTabIds.length > 1) {
       el.splitViewBtn.classList.add("active");
@@ -641,9 +788,13 @@
             <i data-lucide="brain" style="width: 13px; height: 13px; flex-shrink: 0;"></i>
             <span class="thinking-select-label" id="thinking-label-${tab.id}"></span>
             <select class="thinking-dropdown" id="thinking-dropdown-${tab.id}">
+              <option value="none">Thinking: None</option>
+              <option value="minimal">Thinking: Minimal</option>
               <option value="low">Thinking: Low</option>
               <option value="medium">Thinking: Medium</option>
               <option value="high">Thinking: High</option>
+              <option value="xhigh">Thinking: XHigh</option>
+              <option value="max">Thinking: Max</option>
             </select>
           </div>
         </div>
@@ -810,9 +961,11 @@
 
     const prov = state.providers.find((p) => p.id === tab.providerId);
     const mod = prov?.models?.find((m) => m.id === tab.modelId);
+    const validEfforts = new Set(["none", "minimal", "low", "medium", "high", "xhigh", "max"]);
     if (mod && mod.supports_thinking) {
       thinkingWrapper.style.display = "flex";
-      thinkingDropdown.value = tab.thinkingLevel && tab.thinkingLevel !== "none" ? tab.thinkingLevel : "medium";
+      thinkingDropdown.value = validEfforts.has(tab.thinkingLevel) ? tab.thinkingLevel : "medium";
+      tab.thinkingLevel = thinkingDropdown.value;
     } else {
       thinkingWrapper.style.display = "none";
       tab.thinkingLevel = "none";
@@ -830,7 +983,8 @@
       const m = p?.models?.find((item) => item.id === tab.modelId);
       if (m && m.supports_thinking) {
         thinkingWrapper.style.display = "flex";
-        thinkingDropdown.value = tab.thinkingLevel && tab.thinkingLevel !== "none" ? tab.thinkingLevel : "medium";
+        thinkingDropdown.value = validEfforts.has(tab.thinkingLevel) ? tab.thinkingLevel : "medium";
+        tab.thinkingLevel = thinkingDropdown.value;
       } else {
         thinkingWrapper.style.display = "none";
         tab.thinkingLevel = "none";
@@ -908,7 +1062,7 @@
 
     exportBtn.onclick = () => {
       if (tab.conversationId) openExportModal(tab.conversationId);
-      else alert("Send a message first to export this conversation.");
+      else showNoticeDialog("Send a message first to export this conversation.");
     };
 
     const renderWelcomePlaceholder = () => {
@@ -1068,7 +1222,7 @@
       row.querySelector(".regen-msg-btn").onclick = async () => {
         if (tab.isStreaming) return;
         if (!tab.modelId || !tab.providerId) {
-          alert("No model is available. Please configure an API key in Settings (Ctrl+,) first.");
+          showNoticeDialog("No model is available. Please configure an API key in Settings (Ctrl+,) first.");
           return;
         }
         // Remove all subsequent messages and this assistant message from DOM
@@ -1233,7 +1387,7 @@
       const newText = txt.value.trim();
       if (!newText) return;
       if (!tab.modelId || !tab.providerId) {
-        alert("No model is available. Please configure an API key in Settings (Ctrl+,) first.");
+        showNoticeDialog("No model is available. Please configure an API key in Settings (Ctrl+,) first.");
         return;
       }
 
@@ -1273,7 +1427,7 @@
     if (tab.isStreaming) return;
 
     if (!tab.modelId || !tab.providerId) {
-      alert("No model is available. Please configure an API key in Settings (Ctrl+,) to fetch models before sending.");
+      showNoticeDialog("No model is available. Please configure an API key in Settings (Ctrl+,) to fetch models before sending.");
       return;
     }
 
@@ -1330,7 +1484,7 @@
     }
   }
 
-  // Token Stats Rendering
+  // Token Stats & Cost Rendering
   function renderTokenStats(pane, tabId, stats) {
     const chipsEl = pane.querySelector(`#token-chips-${tabId}`);
     const grandTotalEl = pane.querySelector(`#token-grand-${tabId}`);
@@ -1339,8 +1493,8 @@
     const summaryEl = pane.querySelector(`#token-summary-${tabId}`);
 
     if (!stats || !stats.per_model || stats.per_model.length === 0) {
-      chipsEl.innerHTML = '<span style="color: var(--text-muted);">Tokens: 0 in · 0 out</span>';
-      grandTotalEl.textContent = "0 total";
+      chipsEl.innerHTML = '<span style="color: var(--text-muted);">Tokens: 0 in · 0 out · $0.00</span>';
+      grandTotalEl.textContent = "0 total · Est. $0.00";
       detailsEl.innerHTML = '<span style="color: var(--text-muted);">No tokens recorded yet for this chat.</span>';
       return;
     }
@@ -1350,16 +1504,18 @@
       const chip = document.createElement("div");
       chip.className = "token-chip";
       const cacheText = m.cached_tokens > 0 ? `<span class="token-chip-cache">· ${formatTokens(m.cached_tokens)} cache (${m.cache_hit_rate}%)</span>` : "";
+      const costText = `<span class="token-chip-cost">· ${formatCost(m.cost)}</span>`;
       chip.innerHTML = `
         <span class="token-chip-model">${escapeHtml(m.model_id)}:</span>
         <span>${formatTokens(m.prompt_tokens)} in / ${formatTokens(m.completion_tokens)} out</span>
         ${cacheText}
+        ${costText}
       `;
       chipsEl.appendChild(chip);
     });
 
     const gt = stats.grand_total;
-    grandTotalEl.textContent = `${formatTokens(gt.total_tokens)} total`;
+    grandTotalEl.textContent = `${formatTokens(gt.total_tokens)} total · Est. ${formatCost(gt.total_cost)}`;
 
     let tableRows = stats.per_model
       .map(
@@ -1372,6 +1528,7 @@
           <td style="color: #34a853;">${m.cached_tokens.toLocaleString()}</td>
           <td>${m.cache_miss_tokens.toLocaleString()}</td>
           <td>${m.cache_hit_rate}%</td>
+          <td style="font-weight: 600;">${formatCost(m.cost)}</td>
         </tr>
       `
       )
@@ -1388,10 +1545,20 @@
             <th>Cache Hits</th>
             <th>Cache Misses</th>
             <th>Hit Rate</th>
+            <th>Cost</th>
           </tr>
         </thead>
         <tbody>
           ${tableRows}
+          <tr style="border-top: 1px solid var(--border-subtle); font-weight: 600;">
+            <td colspan="2">Est. Total</td>
+            <td>${gt.prompt_tokens.toLocaleString()}</td>
+            <td>${gt.completion_tokens.toLocaleString()}</td>
+            <td style="color: #34a853;">${gt.cached_tokens.toLocaleString()}</td>
+            <td>${gt.cache_miss_tokens.toLocaleString()}</td>
+            <td>${gt.cache_hit_rate}%</td>
+            <td>${formatCost(gt.total_cost)}</td>
+          </tr>
         </tbody>
       </table>
     `;
@@ -1593,7 +1760,7 @@
             retryBtn.onclick = async () => {
               if (tab.isStreaming) return;
               if (!tab.modelId || !tab.providerId) {
-                alert("Please configure a valid provider & model in Settings (Ctrl+,) first.");
+                showNoticeDialog("Please configure a valid provider & model in Settings (Ctrl+,) first.");
                 return;
               }
               const prevRow = targetRow.previousElementSibling;
@@ -1649,10 +1816,10 @@
         </div>
       `;
 
-      item.onclick = (e) => {
+      item.onclick = async (e) => {
         if (e.target.closest(".edit-title-btn")) {
           e.stopPropagation();
-          const newTitle = prompt("Rename Chat:", conv.title);
+          const newTitle = await showPromptDialog("Rename chat", conv.title);
           if (newTitle && newTitle.trim()) {
             conv.title = newTitle.trim();
             state.tabs.forEach((t) => {
@@ -1665,7 +1832,8 @@
           }
         } else if (e.target.closest(".delete-conv-btn")) {
           e.stopPropagation();
-          if (confirm(`Delete conversation "${conv.title}"?`)) {
+          const confirmed = await showConfirmDialog(`Delete chat "${conv.title}"?`);
+          if (confirmed) {
             callApi("delete_conversation", conv.id);
             state.conversations = state.conversations.filter((c) => c.id !== conv.id);
             state.tabs.forEach((t) => {
@@ -1757,18 +1925,69 @@
     }
   }
 
+  // Model Pricing & Thinking Configuration Sub-Modal
+  let activeConfigModelRef = null;
+
+  function openModelConfigModal(prov, modelObj) {
+    activeConfigModelRef = { prov, modelObj };
+    el.modelConfigTitle.textContent = `${modelObj.name || modelObj.id}`;
+    el.modelInputPrice.value = Number(modelObj.input_price || 0);
+    el.modelCachedPrice.value = Number(modelObj.cached_input_price || 0);
+    el.modelOutputPrice.value = Number(modelObj.output_price || 0);
+    el.modelSupportsThinkingCheck.checked = Boolean(modelObj.supports_thinking);
+    el.modelConfigModal.classList.add("open");
+  }
+
+  function closeModelConfigModal(save = false) {
+    if (save && activeConfigModelRef) {
+      const { modelObj } = activeConfigModelRef;
+      const inVal = parseFloat(el.modelInputPrice.value);
+      const cacheVal = parseFloat(el.modelCachedPrice.value);
+      const outVal = parseFloat(el.modelOutputPrice.value);
+      modelObj.input_price = !isNaN(inVal) && inVal >= 0 ? inVal : 0.0;
+      modelObj.cached_input_price = !isNaN(cacheVal) && cacheVal >= 0 ? cacheVal : 0.0;
+      modelObj.output_price = !isNaN(outVal) && outVal >= 0 ? outVal : 0.0;
+      modelObj.supports_thinking = el.modelSupportsThinkingCheck.checked ? 1 : 0;
+      renderSettingsContent();
+    }
+    activeConfigModelRef = null;
+    el.modelConfigModal.classList.remove("open");
+  }
+
+  function sanitizeProviderNameAlpha(raw) {
+    return String(raw || "").replace(/[^A-Za-z]/g, "");
+  }
+
+  function validateAllProviders() {
+    const seen = new Set();
+    for (const p of state.providers) {
+      const name = (p.name || "").trim();
+      if (!name || !/^[A-Za-z]+$/.test(name)) {
+        return `Provider name "${name || "(empty)"}" must contain only English alphabet letters (A-Z, a-z) with no spaces, numbers, dashes, underscores, or special characters.`;
+      }
+      const upper = name.toUpperCase();
+      if (seen.has(upper)) {
+        return `Duplicate provider name "${name}". No two providers can have the same name (even with different case).`;
+      }
+      seen.add(upper);
+    }
+    return null;
+  }
+
   function refreshProviderAccessibility(prov) {
     if (!prov) return;
-    const apiKey = (prov.api_key || "").trim();
-    const hasCredentials = Boolean(apiKey);
+    const typedKey = (prov.api_key || "").trim();
+    const hasCredentials = prov.clear_api_key ? false : Boolean(typedKey || prov.has_api_key);
     const fetchedIds = Array.isArray(prov.fetched_model_ids) ? new Set(prov.fetched_model_ids) : new Set();
     const verifiedModels = Array.isArray(prov.models) ? prov.models.filter((m) => fetchedIds.has(m.id)) : [];
     if (!hasCredentials) {
       prov.models = [];
       prov.fetched_model_ids = [];
+      prov.has_api_key = false;
       prov.is_accessible = false;
       return;
     }
+    prov.has_api_key = true;
     prov.models = verifiedModels;
     prov.is_accessible = Boolean(prov.is_enabled && hasCredentials && verifiedModels.length > 0);
   }
@@ -1826,12 +2045,16 @@
       let detailHtml = "";
       if (activeProv) {
         const isBuiltin = ["openai", "openrouter", "deepseek", "ollama"].includes(activeProv.id);
+        const envKeyName = `${sanitizeProviderNameAlpha(activeProv.name).toUpperCase() || "PROVIDER"}_API_KEY`;
+        const keyPlaceholder = activeProv.has_api_key && !activeProv.clear_api_key
+          ? `Saved in .env (${envKeyName}) — type to replace or click eye to view`
+          : `Saved in .env as ${envKeyName}...`;
 
         detailHtml = `
           <div class="provider-detail-pane">
             <div style="display: flex; align-items: center; justify-content: space-between;">
               <div style="display: flex; align-items: center; gap: 8px;">
-                <input type="text" class="settings-input" id="prov-name-input" value="${escapeHtml(activeProv.name)}" style="font-weight: 600; width: 200px;">
+                <input type="text" class="settings-input" id="prov-name-input" value="${escapeHtml(activeProv.name)}" title="English letters only (A-Z, a-z)" style="font-weight: 600; width: 200px;">
               </div>
               <div style="display: flex; align-items: center; gap: 10px;">
                 <label style="display: flex; align-items: center; gap: 6px; font-size: 13px; cursor: pointer;">
@@ -1848,9 +2071,16 @@
             </div>
 
             <div class="settings-group">
-              <label class="settings-label">API Key</label>
+              <div style="display: flex; align-items: center; justify-content: space-between;">
+                <label class="settings-label" id="prov-env-key-label">API Key (.env: ${escapeHtml(envKeyName)})</label>
+                ${
+                  activeProv.has_api_key && !activeProv.clear_api_key
+                    ? `<button class="btn-secondary" id="clear-api-key-btn" style="padding: 1px 7px; font-size: 10.5px;">Clear Key</button>`
+                    : ""
+                }
+              </div>
               <div style="position: relative;">
-                <input type="password" class="settings-input" id="prov-api-key-input" value="${escapeHtml(activeProv.api_key || "")}" placeholder="Enter API Key...">
+                <input type="password" class="settings-input" id="prov-api-key-input" value="${escapeHtml(activeProv.api_key || "")}" placeholder="${escapeHtml(keyPlaceholder)}">
                 <button class="icon-btn toggle-key-visibility" style="position: absolute; right: 8px; top: 6px;" title="Show/Hide">
                   <i data-lucide="eye" style="width: 14px; height: 14px;"></i>
                 </button>
@@ -1868,22 +2098,29 @@
 
               <div class="models-manager-list" id="prov-models-list">
                 ${(activeProv.models || [])
-                  .map(
-                    (m) => `
+                  .map((m) => {
+                    const inP = Number(m.input_price || 0);
+                    const cP = Number(m.cached_input_price || 0);
+                    const outP = Number(m.output_price || 0);
+                    const thinkTag = m.supports_thinking ? " · Thinking" : "";
+                    return `
                   <div class="model-row-item">
-                    <span style="font-weight: 500;">${escapeHtml(m.name || m.id)} <small style="color: var(--text-muted); font-size: 10.5px;">(${escapeHtml(m.id)})</small></span>
-                    <div style="display: flex; align-items: center; gap: 8px;">
-                      <label style="font-size: 11px; display: flex; align-items: center; gap: 4px;">
-                        <input type="checkbox" class="model-thinking-check" data-model-id="${escapeHtml(m.id)}" ${m.supports_thinking ? "checked" : ""}>
-                        <span>Thinking</span>
-                      </label>
+                    <div style="display: flex; flex-direction: column; min-width: 0;">
+                      <span style="font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${escapeHtml(m.name || m.id)}</span>
+                      <span style="color: var(--text-muted); font-size: 10.5px;">$${inP}/M in · $${cP}/M cached · $${outP}/M out${thinkTag}</span>
+                    </div>
+                    <div style="display: flex; align-items: center; gap: 6px; flex-shrink: 0;">
+                      <button class="btn-secondary model-config-btn" data-model-id="${escapeHtml(m.id)}" style="padding: 3px 8px; font-size: 11px; display: flex; align-items: center; gap: 4px;" title="Configure Pricing & Thinking">
+                        <i data-lucide="sliders-horizontal" style="width: 11px; height: 11px;"></i>
+                        <span>Pricing &amp; Thinking</span>
+                      </button>
                       <button class="conv-action-btn delete-model-btn" data-model-id="${escapeHtml(m.id)}" title="Remove Model">
                         <i data-lucide="trash-2" style="width: 12px; height: 12px;"></i>
                       </button>
                     </div>
                   </div>
-                `
-                  )
+                `;
+                  })
                   .join("")}
               </div>
 
@@ -1903,13 +2140,23 @@
         </div>
       `;
 
-      // Live update provider sub-nav label as user edits provider name
+      // Enforce English alphabet only on provider name input & live update sub-nav and .env key label
       const provNameInput = document.getElementById("prov-name-input");
       if (provNameInput && activeProv) {
         provNameInput.oninput = () => {
-          activeProv.name = provNameInput.value.trim() || activeProv.name;
+          const cleaned = sanitizeProviderNameAlpha(provNameInput.value);
+          if (provNameInput.value !== cleaned) {
+            provNameInput.value = cleaned;
+          }
+          if (cleaned) {
+            activeProv.name = cleaned;
+          }
           const subBtnSpan = el.settingsTabContent.querySelector(`.provider-sub-btn[data-prov-id="${activeProv.id}"] span`);
           if (subBtnSpan) subBtnSpan.textContent = activeProv.name;
+          const envLbl = document.getElementById("prov-env-key-label");
+          if (envLbl) {
+            envLbl.textContent = `API Key (.env: ${(cleaned || activeProv.name).toUpperCase()}_API_KEY)`;
+          }
         };
       }
 
@@ -1925,18 +2172,32 @@
       // Add New Provider button (+)
       const addProvBtn = document.getElementById("add-new-provider-btn");
       if (addProvBtn) {
-        addProvBtn.onclick = () => {
+        addProvBtn.onclick = async () => {
           saveActiveProviderInputs();
-          const pName = prompt("Enter Provider Name:", "Custom Provider");
-          if (!pName) return;
+          const rawName = await showPromptDialog(
+            "Enter Provider Name (English letters only, e.g. Anthropic):",
+            "CustomProvider",
+            "Letters A-Z only"
+          );
+          if (!rawName) return;
+          const cleanName = sanitizeProviderNameAlpha(rawName);
+          if (!cleanName || cleanName !== rawName.trim()) {
+            await showNoticeDialog("Provider name may only contain English alphabet letters (A-Z, a-z) with no spaces, dashes, underscores, numbers, or special characters.");
+            return;
+          }
+          if (state.providers.some((p) => p.name.toUpperCase() === cleanName.toUpperCase())) {
+            await showNoticeDialog(`A provider named "${cleanName}" already exists (case-insensitive). Please choose a unique name.`);
+            return;
+          }
           const newId = "provider_" + Date.now();
           const newProv = {
             id: newId,
-            name: pName.trim(),
+            name: cleanName,
             base_url: "https://api.openai.com/v1",
-            api_key: "",
+            has_api_key: false,
             is_enabled: true,
             models: [],
+            fetched_model_ids: [],
             is_accessible: false,
           };
           state.providers.push(newProv);
@@ -1945,16 +2206,38 @@
         };
       }
 
-      // Password visibility toggle
-      const keyInput = document.getElementById("prov-api-key-input");
-      const toggleBtn = el.settingsTabContent.querySelector(".toggle-key-visibility");
-      if (toggleBtn && keyInput) {
-        toggleBtn.onclick = () => {
-          keyInput.type = keyInput.type === "password" ? "text" : "password";
+      // Clear API Key button
+      const clearKeyBtn = document.getElementById("clear-api-key-btn");
+      if (clearKeyBtn && activeProv) {
+        clearKeyBtn.onclick = () => {
+          activeProv.api_key = "";
+          activeProv.clear_api_key = true;
+          activeProv.has_api_key = false;
+          refreshProviderAccessibility(activeProv);
+          renderSettingsContent();
         };
       }
 
-      // Add Model (Only allow models that have been successfully fetched from the endpoint)
+      // Password visibility toggle (fetches from .env on demand if not yet loaded into input)
+      const keyInput = document.getElementById("prov-api-key-input");
+      const toggleBtn = el.settingsTabContent.querySelector(".toggle-key-visibility");
+      if (toggleBtn && keyInput && activeProv) {
+        toggleBtn.onclick = async () => {
+          if (keyInput.type === "password") {
+            if (!keyInput.value && activeProv.has_api_key && !activeProv.clear_api_key) {
+              const res = await callApi("get_provider_api_key", activeProv.name);
+              if (res && res.api_key) {
+                keyInput.value = res.api_key;
+              }
+            }
+            keyInput.type = "text";
+          } else {
+            keyInput.type = "password";
+          }
+        };
+      }
+
+      // Add Model (Only allow models that have been successfully fetched from the endpoint; default $0 pricing and thinking unchecked)
       const addMBtn = document.getElementById("add-model-btn");
       const newMInput = document.getElementById("new-model-id-input");
       if (addMBtn && newMInput && activeProv) {
@@ -1964,7 +2247,7 @@
           if (!mid) return;
           const fetchedIds = Array.isArray(activeProv.fetched_model_ids) ? new Set(activeProv.fetched_model_ids) : new Set();
           if (!fetchedIds.has(mid)) {
-            alert(
+            showNoticeDialog(
               fetchedIds.size === 0
                 ? "Please fetch models from the endpoint first (requires a valid API key)."
                 : `Model "${mid}" was not found in the models fetched from ${activeProv.name}. Only successfully fetched models can be added.`
@@ -1977,12 +2260,17 @@
             return;
           }
           if (activeProv.models.length >= 5) {
-            alert("Maximum 5 models can be configured per provider. Remove an existing model first.");
+            showNoticeDialog("Maximum 5 models can be configured per provider. Remove an existing model first.");
             return;
           }
-          const mLower = mid.toLowerCase();
-          const hasThink = ["o1", "o3", "o4", "r1", "qwq", "reasoner", "thinking"].some((k) => mLower.includes(k));
-          activeProv.models.push({ id: mid, name: mid, supports_thinking: hasThink ? 1 : 0 });
+          activeProv.models.push({
+            id: mid,
+            name: mid,
+            supports_thinking: 0,
+            input_price: 0.0,
+            cached_input_price: 0.0,
+            output_price: 0.0,
+          });
           refreshProviderAccessibility(activeProv);
           renderSettingsContent();
         };
@@ -1995,6 +2283,18 @@
         };
       }
 
+      // Open Model Pricing & Thinking Configuration Modal
+      el.settingsTabContent.querySelectorAll(".model-config-btn").forEach((btn) => {
+        btn.onclick = () => {
+          saveActiveProviderInputs();
+          const mid = btn.dataset.modelId;
+          const target = (activeProv.models || []).find((m) => m.id === mid);
+          if (target) {
+            openModelConfigModal(activeProv, target);
+          }
+        };
+      });
+
       // Delete Model
       el.settingsTabContent.querySelectorAll(".delete-model-btn").forEach((btn) => {
         btn.onclick = () => {
@@ -2006,20 +2306,12 @@
         };
       });
 
-      // Model Thinking Checkbox
-      el.settingsTabContent.querySelectorAll(".model-thinking-check").forEach((chk) => {
-        chk.onchange = () => {
-          const mid = chk.dataset.modelId;
-          const target = activeProv.models.find((m) => m.id === mid);
-          if (target) target.supports_thinking = chk.checked ? 1 : 0;
-        };
-      });
-
       // Delete Provider
       const delProvBtn = document.getElementById("delete-provider-btn");
       if (delProvBtn && activeProv) {
-        delProvBtn.onclick = () => {
-          if (confirm(`Delete provider "${activeProv.name}"?`)) {
+        delProvBtn.onclick = async () => {
+          const confirmed = await showConfirmDialog(`Delete provider "${activeProv.name}"?`);
+          if (confirmed) {
             callApi("delete_provider", activeProv.id);
             state.providers = state.providers.filter((p) => p.id !== activeProv.id);
             if (state.settings.default_provider === activeProv.id) {
@@ -2047,7 +2339,16 @@
       if (fetchBtn && activeProv) {
         fetchBtn.onclick = async () => {
           saveActiveProviderInputs();
-          await callApi("save_settings", state.providers, state.settings);
+          const validationErr = validateAllProviders();
+          if (validationErr) {
+            showNoticeDialog(validationErr);
+            return;
+          }
+          const saveRes = await callApi("save_settings", state.providers, state.settings);
+          if (saveRes && saveRes.error) {
+            showNoticeDialog(saveRes.error);
+            return;
+          }
 
           fetchBtn.disabled = true;
           fetchBtn.innerHTML = '<i data-lucide="loader" style="width: 11px; height: 11px;"></i> Fetching...';
@@ -2059,27 +2360,38 @@
           lucide.createIcons();
 
           if (res && res.models && res.models.length > 0) {
-            // Keep at most 5 models
+            // Keep at most 5 models; new models default to $0 pricing and thinking=0
             const fetched = res.models;
             const fetchedIds = new Set(fetched.map((m) => m.id));
             const current = activeProv.models || [];
 
-            // 1. Keep existing models that are present in fetch
+            // 1. Keep existing models that are present in fetch (preserving user-configured pricing/thinking)
             const retained = current.filter((m) => fetchedIds.has(m.id));
             const retainedIds = new Set(retained.map((m) => m.id));
 
-            // 2. Add new models until 5
+            // 2. Add new models until 5 with $0 pricing and thinking unchecked
             for (const fm of fetched) {
               if (retained.length >= 5) break;
               if (!retainedIds.has(fm.id)) {
-                retained.push(fm);
+                retained.push({
+                  id: fm.id,
+                  name: fm.name || fm.id,
+                  supports_thinking: 0,
+                  input_price: 0.0,
+                  cached_input_price: 0.0,
+                  output_price: 0.0,
+                });
                 retainedIds.add(fm.id);
               }
             }
 
             activeProv.models = retained.slice(0, 5);
             activeProv.fetched_model_ids = Array.from(fetchedIds);
+            activeProv.has_api_key = true;
             activeProv.is_accessible = true;
+            delete activeProv.api_key;
+            delete activeProv.clear_api_key;
+
             await callApi("save_settings", state.providers, state.settings);
             if (state.settingsSnapshot) {
               state.settingsSnapshot.providers = JSON.parse(JSON.stringify(state.providers));
@@ -2092,7 +2404,7 @@
                 updatePaneModelDropdown(paneEl, targetTab);
               }
             });
-            alert(`Synced ${activeProv.models.length} models for ${activeProv.name}!`);
+            showNoticeDialog(`Synced ${activeProv.models.length} models for ${activeProv.name}!`);
           } else {
             activeProv.models = [];
             activeProv.fetched_model_ids = [];
@@ -2106,7 +2418,7 @@
                 updatePaneModelDropdown(paneEl, targetTab);
               }
             });
-            alert(`Could not fetch models: ${res?.error || "Endpoint unreachable or invalid API key"}`);
+            showNoticeDialog(`Could not fetch models: ${res?.error || "Endpoint unreachable or invalid API key"}`);
           }
         };
       }
@@ -2133,7 +2445,10 @@
       const prov = state.providers.find((p) => p.id === state.activeProviderId);
       if (prov) {
         const nameInput = document.getElementById("prov-name-input");
-        if (nameInput) prov.name = nameInput.value.trim() || prov.name;
+        if (nameInput) {
+          const cleaned = sanitizeProviderNameAlpha(nameInput.value);
+          if (cleaned) prov.name = cleaned;
+        }
 
         const enCheck = document.getElementById("prov-enabled-check");
         if (enCheck) prov.is_enabled = enCheck.checked;
@@ -2142,7 +2457,14 @@
         if (bUrl) prov.base_url = bUrl.value.trim();
 
         const aKey = document.getElementById("prov-api-key-input");
-        if (aKey) prov.api_key = aKey.value.trim();
+        if (aKey) {
+          const typed = aKey.value.trim();
+          if (typed) {
+            prov.api_key = typed;
+            prov.has_api_key = true;
+            prov.clear_api_key = false;
+          }
+        }
 
         refreshProviderAccessibility(prov);
       }
@@ -2153,8 +2475,36 @@
     saveGeneralTabInputs();
     saveActiveProviderInputs();
 
-    await callApi("save_settings", state.providers, state.settings);
+    const validationErr = validateAllProviders();
+    if (validationErr) {
+      showNoticeDialog(validationErr);
+      return;
+    }
+
+    const res = await callApi("save_settings", state.providers, state.settings);
+    if (res && res.error) {
+      showNoticeDialog(res.error);
+      return;
+    }
+    if (res && Array.isArray(res.providers)) {
+      state.providers = res.providers;
+    } else {
+      state.providers.forEach((p) => {
+        delete p.api_key;
+        delete p.clear_api_key;
+      });
+    }
     closeSettingsModal(true);
+    for (const tab of state.tabs) {
+      if (tab.conversationId) {
+        try {
+          const stats = await callApi("get_conversation_token_stats", tab.conversationId);
+          if (stats) tab.tokenStats = stats;
+        } catch (err) {
+          console.warn("[saveSettingsFromModal] Failed refreshing token stats:", err);
+        }
+      }
+    }
     renderActivePanes();
   }
 
@@ -2254,7 +2604,7 @@
     if (!res) return;
     if (res.cancelled) return;
     if (res.error) {
-      alert(res.error);
+      showNoticeDialog(res.error);
       return;
     }
     if (res.saved) {
@@ -2355,10 +2705,32 @@
     el.globalSettingsBtn.onclick = openSettingsModal;
 
     el.newTabBtn.onclick = () => createNewTab();
+    if (el.allTabsMenuBtn && el.allTabsPopover) {
+      el.allTabsMenuBtn.onclick = (e) => {
+        e.stopPropagation();
+        const isOpen = el.allTabsPopover.classList.toggle("open");
+        if (isOpen) {
+          renderAllTabsPopover();
+        }
+      };
+    }
     el.splitViewBtn.onclick = addSplitPane;
 
-    // Delegated click listeners for code block copying and thinking accordions
+    if (el.cancelModelConfigBtn) {
+      el.cancelModelConfigBtn.onclick = () => closeModelConfigModal(false);
+    }
+    if (el.saveModelConfigBtn) {
+      el.saveModelConfigBtn.onclick = () => closeModelConfigModal(true);
+    }
+
+    // Delegated click listeners for code block copying, thinking accordions, and closing all-tabs menu
     document.addEventListener("click", (e) => {
+      if (el.allTabsPopover && el.allTabsPopover.classList.contains("open")) {
+        if (!e.target.closest("#all-tabs-dropdown-wrapper")) {
+          el.allTabsPopover.classList.remove("open");
+        }
+      }
+
       const copyCodeBtn = e.target.closest(".copy-code-btn");
       if (copyCodeBtn) {
         const wrapper = copyCodeBtn.closest(".code-block-wrapper");
@@ -2415,6 +2787,18 @@
     // Keyboard Shortcuts
     window.addEventListener("keydown", (e) => {
       if (e.key === "Escape") {
+        if (el.appDialogModal && el.appDialogModal.classList.contains("open")) {
+          el.appDialogCancelBtn.click();
+          return;
+        }
+        if (el.modelConfigModal && el.modelConfigModal.classList.contains("open")) {
+          closeModelConfigModal(false);
+          return;
+        }
+        if (el.allTabsPopover && el.allTabsPopover.classList.contains("open")) {
+          el.allTabsPopover.classList.remove("open");
+          return;
+        }
         if (el.settingsModal.classList.contains("open")) closeSettingsModal(false);
         el.convSettingsModal.classList.remove("open");
         el.exportModal.classList.remove("open");

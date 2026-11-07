@@ -66,6 +66,12 @@
           <button id="new-tab-btn" class="icon-btn" title="New Tab (Ctrl+T)">
             <i data-lucide="plus" style="width: 15px; height: 15px;"></i>
           </button>
+          <div class="all-tabs-dropdown-wrapper" id="all-tabs-dropdown-wrapper">
+            <button id="all-tabs-menu-btn" class="icon-btn" title="All Open Tabs">
+              <i data-lucide="chevron-down" style="width: 15px; height: 15px;"></i>
+            </button>
+            <div class="all-tabs-popover" id="all-tabs-popover"></div>
+          </div>
           <button id="split-view-btn" class="icon-btn split-toggle-btn" title="Add / Toggle Split View (up to 5 panes, Ctrl+\)">
             <i data-lucide="columns-2" style="width: 15px; height: 15px;"></i>
           </button>
@@ -175,6 +181,45 @@
       </div>
       <div class="modal-footer">
         <button class="btn-secondary close-export-modal-btn">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Model Pricing & Thinking Configuration Modal -->
+  <div class="modal-overlay" id="model-config-modal">
+    <div class="modal-card single-space-dialog" style="width: 400px;">
+      <div class="single-dialog-title" id="model-config-title">Model Pricing &amp; Thinking</div>
+      <div class="settings-group">
+        <label class="settings-label">Input Price ($ per 1M tokens)</label>
+        <input type="number" step="any" min="0" class="settings-input" id="model-input-price" value="0">
+      </div>
+      <div class="settings-group">
+        <label class="settings-label">Cached Input Price ($ per 1M tokens)</label>
+        <input type="number" step="any" min="0" class="settings-input" id="model-cached-price" value="0">
+      </div>
+      <div class="settings-group">
+        <label class="settings-label">Output Price ($ per 1M tokens)</label>
+        <input type="number" step="any" min="0" class="settings-input" id="model-output-price" value="0">
+      </div>
+      <label class="model-thinking-toggle-row">
+        <input type="checkbox" id="model-supports-thinking-check">
+        <span>Supports Thinking / Reasoning</span>
+      </label>
+      <div class="single-dialog-actions">
+        <button class="btn-secondary" id="cancel-model-config-btn">Cancel</button>
+        <button class="btn-primary" id="save-model-config-btn">Done</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Headerless Single-Space App Dialog (Alerts, Confirmations, Prompts) -->
+  <div class="modal-overlay" id="app-dialog-modal" style="z-index: 250;">
+    <div class="modal-card single-space-dialog" id="app-dialog-card">
+      <div class="single-dialog-message" id="app-dialog-message"></div>
+      <input type="text" class="settings-input" id="app-dialog-input" style="display: none;">
+      <div class="single-dialog-actions">
+        <button class="btn-secondary" id="app-dialog-cancel-btn" style="display: none;">Cancel</button>
+        <button class="btn-primary" id="app-dialog-ok-btn">OK</button>
       </div>
     </div>
   </div>

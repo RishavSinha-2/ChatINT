@@ -141,7 +141,31 @@ class DesktopBridge:
         db_delete_provider(provider_id)
         return {"success": True, "providers": get_providers()}
 
+    def get_provider_api_key(self, provider_name: str) -> Dict[str, Any]:
+        from chatint.db import get_api_key_from_env
+        return {"api_key": get_api_key_from_env(provider_name)}
+
+    def get_conversation_token_stats(self, conv_id: str) -> Dict[str, Any]:
+        return get_token_stats(conv_id)
+
     def save_settings(self, providers: List[Dict[str, Any]], settings: Dict[str, str]) -> Dict[str, Any]:
+        from chatint.db import is_valid_provider_name
+        seen_names = set()
+        for p in providers:
+            pname = (p.get("name") or "").strip()
+            if not is_valid_provider_name(pname):
+                return {
+                    "success": False,
+                    "error": f"Invalid provider name '{pname}'. Provider names may only contain English alphabet letters (A-Z, a-z) with no spaces, dashes, underscores, numbers, or special characters.",
+                }
+            upper_name = pname.upper()
+            if upper_name in seen_names:
+                return {
+                    "success": False,
+                    "error": f"Duplicate provider name '{pname}'. No two providers can have the same name (case-insensitive).",
+                }
+            seen_names.add(upper_name)
+
         save_providers(providers)
         save_app_settings(settings)
 
@@ -149,7 +173,7 @@ class DesktopBridge:
         from chatint.client_manager import BackgroundModelSyncer
         BackgroundModelSyncer.start_background_sync(self)
 
-        return {"success": True}
+        return {"success": True, "providers": get_providers()}
 
     def fetch_provider_models(self, provider_id: str) -> Dict[str, Any]:
         models, err, is_net = ClientManager.fetch_remote_models(provider_id, timeout=60.0)

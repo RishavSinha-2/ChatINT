@@ -1,9 +1,91 @@
 import json
+import re
 import sqlite3
+import threading
 import time
 import uuid
 from typing import Any, Dict, List, Optional
-from chatint.config import DB_PATH, DEFAULT_PROVIDERS
+from chatint.config import DB_PATH, DEFAULT_PROVIDERS, ENV_PATH
+
+_ENV_LOCK = threading.Lock()
+
+
+def sanitize_provider_name(name: str) -> str:
+    """
+    Removes any non-English alphabet characters from a provider name.
+    """
+    return re.sub(r"[^A-Za-z]", "", (name or "").strip())
+
+
+def is_valid_provider_name(name: str) -> bool:
+    """
+    Provider name must consist exclusively of English alphabet letters (A-Z, a-z).
+    """
+    return bool(name and re.fullmatch(r"[A-Za-z]+", name))
+
+
+def provider_env_key(provider_name: str) -> str:
+    clean = sanitize_provider_name(provider_name)
+    return f"{clean.upper()}_API_KEY"
+
+
+def ensure_env_file():
+    if not ENV_PATH.exists():
+        ENV_PATH.write_text("", encoding="utf-8")
+
+
+def read_env_dict() -> Dict[str, str]:
+    with _ENV_LOCK:
+        ensure_env_file()
+        env_map: Dict[str, str] = {}
+        for line in ENV_PATH.read_text(encoding="utf-8").splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#") or "=" not in stripped:
+                continue
+            k, v = stripped.split("=", 1)
+            k = k.strip()
+            v = v.strip()
+            if len(v) >= 2 and ((v[0] == '"' and v[-1] == '"') or (v[0] == "'" and v[-1] == "'")):
+                v = v[1:-1]
+            env_map[k] = v
+        return env_map
+
+
+def write_env_dict(env_map: Dict[str, str]):
+    with _ENV_LOCK:
+        ensure_env_file()
+        lines = [f"{k}={v}" for k, v in env_map.items()]
+        content = "\n".join(lines) + ("\n" if lines else "")
+        ENV_PATH.write_text(content, encoding="utf-8")
+
+
+def get_api_key_from_env(provider_name: str) -> str:
+    key_name = provider_env_key(provider_name)
+    if key_name == "_API_KEY":
+        return ""
+    env_map = read_env_dict()
+    return env_map.get(key_name, "")
+
+
+def set_api_key_in_env(provider_name: str, api_key: str, old_provider_name: Optional[str] = None):
+    env_map = read_env_dict()
+    old_val = ""
+    if old_provider_name and sanitize_provider_name(old_provider_name).upper() != sanitize_provider_name(provider_name).upper():
+        old_key = provider_env_key(old_provider_name)
+        old_val = env_map.pop(old_key, "")
+    new_key = provider_env_key(provider_name)
+    if new_key != "_API_KEY":
+        final_val = (api_key if api_key is not None else "").strip() or old_val
+        env_map[new_key] = final_val
+    write_env_dict(env_map)
+
+
+def remove_api_key_from_env(provider_name: str):
+    env_map = read_env_dict()
+    key_name = provider_env_key(provider_name)
+    if key_name in env_map:
+        env_map.pop(key_name, None)
+        write_env_dict(env_map)
 
 
 def get_connection() -> sqlite3.Connection:
@@ -77,27 +159,65 @@ def init_db():
     # Clean up legacy 'custom' provider if present from earlier runs
     cursor.execute("DELETE FROM providers WHERE id = 'custom'")
 
-    # Reset any unverified models for providers that have no API key
-    cursor.execute("UPDATE providers SET models_json = '[]' WHERE (api_key = '' OR api_key IS NULL)")
+    # Ensure .env exists
+    ensure_env_file()
 
     # Seed default providers if none exist
     cursor.execute("SELECT COUNT(*) FROM providers")
     if cursor.fetchone()[0] == 0:
         for p in DEFAULT_PROVIDERS:
+            clean_name = sanitize_provider_name(p["name"]) or "Provider"
             cursor.execute(
                 """
                 INSERT INTO providers (id, name, base_url, api_key, is_enabled, models_json)
-                VALUES (?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, '', ?, ?)
             """,
                 (
                     p["id"],
-                    p["name"],
+                    clean_name,
                     p["base_url"],
-                    p["api_key"],
                     p["is_enabled"],
                     json.dumps(p["models"]),
                 ),
             )
+            set_api_key_in_env(clean_name, "")
+
+    # Migrate any legacy API keys out of SQLite into .env, sanitize provider names to English letters only,
+    # deduplicate case-insensitively, and wipe api_key column in DB.
+    cursor.execute("SELECT id, name, api_key FROM providers")
+    existing_rows = cursor.fetchall()
+    seen_upper_names = set()
+    for r in existing_rows:
+        pid = r["id"]
+        raw_name = r["name"] or ""
+        if raw_name.strip().lower() in ("ollama (local)", "ollamalocal"):
+            clean_name = "Ollama"
+        else:
+            clean_name = sanitize_provider_name(raw_name) or "Provider"
+        base_clean = clean_name
+        suffix_idx = 0
+        while clean_name.upper() in seen_upper_names:
+            # Append letters (A, B, C...) if duplicate
+            letter = chr(ord("A") + (suffix_idx % 26))
+            clean_name = f"{base_clean}{letter}"
+            suffix_idx += 1
+        seen_upper_names.add(clean_name.upper())
+
+        db_key = (r["api_key"] or "").strip()
+        env_key_val = get_api_key_from_env(clean_name) or (get_api_key_from_env(raw_name) if raw_name != clean_name else "")
+        final_key = env_key_val or db_key
+        set_api_key_in_env(clean_name, final_key, old_provider_name=raw_name if raw_name != clean_name else None)
+
+        cursor.execute(
+            "UPDATE providers SET name = ?, api_key = '' WHERE id = ?",
+            (clean_name, pid),
+        )
+
+    # Clear models in DB for any provider that has no API key in .env
+    cursor.execute("SELECT id, name FROM providers")
+    for r in cursor.fetchall():
+        if not get_api_key_from_env(r["name"]):
+            cursor.execute("UPDATE providers SET models_json = '[]' WHERE id = ?", (r["id"],))
 
     # Seed default app settings if none exist
     cursor.execute("SELECT COUNT(*) FROM app_settings")
@@ -118,30 +238,43 @@ def init_db():
     conn.close()
 
 
+def _normalize_model_entry(m: Dict[str, Any]) -> Dict[str, Any]:
+    mid = (m.get("id") or "").strip()
+    return {
+        "id": mid,
+        "name": (m.get("name") or mid).strip(),
+        "supports_thinking": 1 if m.get("supports_thinking") else 0,
+        "input_price": float(m.get("input_price") or 0.0),
+        "cached_input_price": float(m.get("cached_input_price") or 0.0),
+        "output_price": float(m.get("output_price") or 0.0),
+    }
+
+
 def get_providers() -> List[Dict[str, Any]]:
     from chatint.client_manager import BackgroundModelSyncer
 
     conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT id, name, base_url, api_key, is_enabled, models_json FROM providers")
+    cursor.execute("SELECT id, name, base_url, is_enabled, models_json FROM providers")
     rows = cursor.fetchall()
     conn.close()
 
     providers = []
     for r in rows:
         pid = r["id"]
-        models = json.loads(r["models_json"])
-        api_key = (r["api_key"] or "").strip()
-        has_api_key = bool(api_key)
+        pname = sanitize_provider_name(r["name"]) or "Provider"
+        raw_models = json.loads(r["models_json"] or "[]")
+        models = [_normalize_model_entry(m) for m in raw_models if m.get("id")]
+        has_api_key = bool(get_api_key_from_env(pname))
         is_enabled = bool(r["is_enabled"])
         is_verified = BackgroundModelSyncer.is_provider_verified(pid) if has_api_key else False
         verified_ids = BackgroundModelSyncer.get_verified_model_ids(pid) if is_verified else set()
         effective_models = [m for m in models if m.get("id") in verified_ids] if is_verified else []
         providers.append({
             "id": pid,
-            "name": r["name"],
+            "name": pname,
             "base_url": r["base_url"],
-            "api_key": r["api_key"],
+            "has_api_key": has_api_key,
             "is_enabled": is_enabled,
             "models": effective_models,
             "fetched_model_ids": sorted(list(verified_ids)),
@@ -153,25 +286,49 @@ def get_providers() -> List[Dict[str, Any]]:
 def save_providers(providers: List[Dict[str, Any]]):
     conn = get_connection()
     cursor = conn.cursor()
+
+    cursor.execute("SELECT id, name FROM providers")
+    existing_names = {r["id"]: r["name"] for r in cursor.fetchall()}
+
     for p in providers:
+        pid = p["id"]
+        old_name = existing_names.get(pid)
+        clean_name = sanitize_provider_name(p.get("name", "")) or sanitize_provider_name(old_name or "") or "Provider"
+
+        # If provider was renamed or a new api_key was explicitly passed in payload, update .env ONLY
+        raw_new_key = p.get("api_key")
+        if raw_new_key is not None and str(raw_new_key).strip() != "":
+            set_api_key_in_env(clean_name, str(raw_new_key).strip(), old_provider_name=old_name)
+        elif p.get("clear_api_key"):
+            set_api_key_in_env(clean_name, "", old_provider_name=old_name)
+        elif old_name and sanitize_provider_name(old_name).upper() != clean_name.upper():
+            # Renamed without changing key -> migrate existing .env entry to new name
+            existing_val = get_api_key_from_env(old_name)
+            set_api_key_in_env(clean_name, existing_val, old_provider_name=old_name)
+        elif not old_name:
+            # Newly added provider -> ensure entry exists in .env
+            set_api_key_in_env(clean_name, "")
+
+        normalized_models = [_normalize_model_entry(m) for m in (p.get("models") or []) if m.get("id")]
+
+        # Never store api_key in the database (always '')
         cursor.execute(
             """
             INSERT INTO providers (id, name, base_url, api_key, is_enabled, models_json)
-            VALUES (?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, '', ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 name=excluded.name,
                 base_url=excluded.base_url,
-                api_key=excluded.api_key,
+                api_key='',
                 is_enabled=excluded.is_enabled,
                 models_json=excluded.models_json
         """,
             (
-                p["id"],
-                p["name"],
-                p["base_url"],
-                p.get("api_key", ""),
+                pid,
+                clean_name,
+                p.get("base_url", ""),
                 1 if p.get("is_enabled", True) else 0,
-                json.dumps(p.get("models", [])),
+                json.dumps(normalized_models),
             ),
         )
     conn.commit()
@@ -261,6 +418,9 @@ def get_conversations() -> List[Dict[str, Any]]:
 def delete_provider(provider_id: str):
     conn = get_connection()
     cursor = conn.cursor()
+    row = cursor.execute("SELECT name FROM providers WHERE id = ?", (provider_id,)).fetchone()
+    if row and row["name"]:
+        remove_api_key_from_env(row["name"])
     cursor.execute("DELETE FROM providers WHERE id = ?", (provider_id,))
     conn.commit()
     conn.close()
@@ -445,8 +605,7 @@ def delete_messages_from(conversation_id: str, from_msg_id: str, include_self: b
 
 def get_token_stats(conversation_id: str) -> Dict[str, Any]:
     """
-    Returns aggregated token stats per model and grand total for the conversation.
-    Input tokens, output tokens, cache hits, cache misses per model!
+    Returns aggregated token stats and estimated cost per model and grand total for the conversation.
     """
     conn = get_connection()
     cursor = conn.cursor()
@@ -463,33 +622,76 @@ def get_token_stats(conversation_id: str) -> Dict[str, Any]:
         (conversation_id,),
     )
     rows = cursor.fetchall()
+
+    cursor.execute("SELECT id, models_json FROM providers")
+    prov_rows = cursor.fetchall()
     conn.close()
+
+    pricing_map: Dict[tuple[str, str], Dict[str, float]] = {}
+    model_fallback_map: Dict[str, Dict[str, float]] = {}
+    for pr in prov_rows:
+        pid = pr["id"]
+        try:
+            mlist = json.loads(pr["models_json"] or "[]")
+            for m in mlist:
+                mid = m.get("id")
+                if mid:
+                    rates = {
+                        "input_price": float(m.get("input_price") or 0.0),
+                        "cached_input_price": float(m.get("cached_input_price") or 0.0),
+                        "output_price": float(m.get("output_price") or 0.0),
+                    }
+                    pricing_map[(pid, mid)] = rates
+                    model_fallback_map[mid] = rates
+        except Exception:
+            pass
 
     per_model = []
     grand_in = 0
     grand_out = 0
     grand_cached = 0
+    grand_cost = 0.0
 
     for r in rows:
+        mid = r["model_id"] or "default"
+        pid = r["provider_id"] or "unknown"
         tin = r["total_in"] or 0
         tout = r["total_out"] or 0
         tcached = r["total_cached"] or 0
         tmiss = max(0, tin - tcached)
         hit_rate = round((tcached / tin * 100), 1) if tin > 0 else 0.0
 
+        rates = pricing_map.get((pid, mid)) or model_fallback_map.get(mid) or {
+            "input_price": 0.0,
+            "cached_input_price": 0.0,
+            "output_price": 0.0,
+        }
+        in_price = rates["input_price"]
+        cached_price = rates["cached_input_price"]
+        out_price = rates["output_price"]
+
+        # Prices are per 1M tokens ($ / 1,000,000 tokens); default is $0
+        model_cost = (
+            (tmiss / 1_000_000.0) * in_price
+            + (tcached / 1_000_000.0) * cached_price
+            + (tout / 1_000_000.0) * out_price
+        )
+
         grand_in += tin
         grand_out += tout
         grand_cached += tcached
+        grand_cost += model_cost
 
         per_model.append({
-            "model_id": r["model_id"] or "default",
-            "provider_id": r["provider_id"] or "unknown",
+            "model_id": mid,
+            "provider_id": pid,
             "prompt_tokens": tin,
             "completion_tokens": tout,
             "cached_tokens": tcached,
             "cache_miss_tokens": tmiss,
             "cache_hit_rate": hit_rate,
             "total_tokens": tin + tout,
+            "cost": model_cost,
         })
 
     grand_miss = max(0, grand_in - grand_cached)
@@ -504,6 +706,7 @@ def get_token_stats(conversation_id: str) -> Dict[str, Any]:
             "cache_miss_tokens": grand_miss,
             "cache_hit_rate": grand_hit_rate,
             "total_tokens": grand_in + grand_out,
+            "total_cost": grand_cost,
         },
     }
 
