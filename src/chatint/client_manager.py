@@ -4,9 +4,12 @@ import socket
 import threading
 import time
 from typing import Any, Dict, List, Optional, Set
+import anthropic
+from google import genai
+from google.genai import types as genai_types
 import httpx
 import openai
-from chatint.db import get_api_key_from_env, get_providers, save_providers
+from chatint.db import get_api_key_from_env, get_providers, sanitize_provider_name, save_providers
 
 
 def _is_network_available() -> bool:
@@ -36,6 +39,59 @@ class ClientManager:
             if p["id"] == provider_id:
                 return p
         return None
+
+    @classmethod
+    def get_sdk_type(cls, provider: Optional[Dict[str, Any]], provider_id: str = "") -> str:
+        """
+        Determines which SDK to use: 'anthropic', 'gemini', or 'openai'.
+        """
+        pid = (provider.get("id") if provider else provider_id or "").strip().lower()
+        pname = sanitize_provider_name(provider.get("name", "") if provider else "").lower()
+        if pid == "anthropic" or pname == "anthropic":
+            return "anthropic"
+        if pid == "gemini" or pname == "gemini":
+            return "gemini"
+        return "openai"
+
+    @classmethod
+    def get_anthropic_client(
+        cls, provider_id: str, timeout: float = 60.0
+    ) -> tuple[Optional[anthropic.Anthropic], Optional[str]]:
+        provider = cls.get_provider(provider_id)
+        if not provider:
+            return None, f"Provider '{provider_id}' not found."
+        if not provider.get("is_enabled", True):
+            return None, f"Provider '{provider['name']}' is currently disabled in Settings."
+        api_key = get_api_key_from_env(provider.get("name", ""))
+        if not api_key:
+            return None, f"API key for {provider['name']} is missing in .env. Please set it in Settings (Ctrl+,)."
+
+        client = anthropic.Anthropic(
+            api_key=api_key,
+            timeout=httpx.Timeout(timeout, connect=min(15.0, timeout)),
+            max_retries=0,
+        )
+        return client, None
+
+    @classmethod
+    def get_gemini_client(
+        cls, provider_id: str, timeout: float = 60.0
+    ) -> tuple[Optional[genai.Client], Optional[str]]:
+        provider = cls.get_provider(provider_id)
+        if not provider:
+            return None, f"Provider '{provider_id}' not found."
+        if not provider.get("is_enabled", True):
+            return None, f"Provider '{provider['name']}' is currently disabled in Settings."
+        api_key = get_api_key_from_env(provider.get("name", ""))
+        if not api_key:
+            return None, f"API key for {provider['name']} is missing in .env. Please set it in Settings (Ctrl+,)."
+
+        timeout_ms = int(max(1.0, timeout) * 1000)
+        client = genai.Client(
+            api_key=api_key,
+            http_options=genai_types.HttpOptions(timeout=timeout_ms),
+        )
+        return client, None
 
     @classmethod
     def get_client(cls, provider_id: str, timeout: float = 60.0) -> tuple[Optional[openai.OpenAI], Optional[str]]:
@@ -72,31 +128,84 @@ class ClientManager:
     ) -> tuple[List[Dict[str, Any]], Optional[str], bool]:
         """
         Fetches models with a strict wall-clock TTL (default 60s).
+        Uses native SDK for Anthropic and Gemini, and OpenAI SDK for all other providers.
         Returns (models_list, error_message, is_network_error).
         """
-        client, err = cls.get_client(provider_id, timeout=timeout)
-        if err or not client:
-            return [], err, False
+        provider = cls.get_provider(provider_id)
+        if not provider:
+            return [], f"Provider '{provider_id}' not found.", False
 
-        def _do_fetch():
-            return client.models.list()
+        sdk_type = cls.get_sdk_type(provider, provider_id)
+
+        if sdk_type == "anthropic":
+            client, err = cls.get_anthropic_client(provider_id, timeout=timeout)
+            if err or not client:
+                return [], err, False
+
+            def _do_fetch_anthropic():
+                page = client.models.list(limit=100)
+                items = getattr(page, "data", None) or list(page)
+                result = []
+                for m in items:
+                    mid = (getattr(m, "id", "") or "").strip()
+                    if mid:
+                        result.append(mid)
+                return result
+
+            fetch_fn = _do_fetch_anthropic
+
+        elif sdk_type == "gemini":
+            client, err = cls.get_gemini_client(provider_id, timeout=timeout)
+            if err or not client:
+                return [], err, False
+
+            def _do_fetch_gemini():
+                result = []
+                for m in client.models.list():
+                    raw_name = (getattr(m, "name", "") or "").strip()
+                    if not raw_name:
+                        continue
+                    mid = raw_name[len("models/"):] if raw_name.startswith("models/") else raw_name
+                    actions = getattr(m, "supported_actions", None) or getattr(m, "supported_generation_methods", None)
+                    if actions and isinstance(actions, (list, tuple, set)):
+                        if not any("generateContent" in str(a) or "generate" in str(a).lower() for a in actions):
+                            continue
+                    if any(skip in mid.lower() for skip in ("embedding", "aqa", "imagen", "veo")):
+                        continue
+                    result.append(mid)
+                return result
+
+            fetch_fn = _do_fetch_gemini
+
+        else:
+            client, err = cls.get_client(provider_id, timeout=timeout)
+            if err or not client:
+                return [], err, False
+
+            def _do_fetch_openai():
+                model_list = client.models.list()
+                return [(getattr(m, "id", "") or "").strip() for m in model_list.data if getattr(m, "id", "")]
+
+            fetch_fn = _do_fetch_openai
 
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-        future = executor.submit(_do_fetch)
+        future = executor.submit(fetch_fn)
         try:
-            model_list = future.result(timeout=timeout)
+            model_ids = future.result(timeout=timeout)
             executor.shutdown(wait=False)
+            seen = set()
             models = []
-            for m in model_list.data:
-                mid = m.id
-                models.append({
-                    "id": mid,
-                    "name": mid,
-                    "supports_thinking": 0,
-                    "input_price": 0.0,
-                    "cached_input_price": 0.0,
-                    "output_price": 0.0,
-                })
+            for mid in model_ids:
+                if mid and mid not in seen:
+                    seen.add(mid)
+                    models.append({
+                        "id": mid,
+                        "name": mid,
+                        "supports_thinking": 0,
+                        "input_price": 0.0,
+                        "cached_input_price": 0.0,
+                        "output_price": 0.0,
+                    })
             models.sort(key=lambda x: x["name"])
             if models:
                 BackgroundModelSyncer.mark_provider_verified(provider_id, {m["id"] for m in models})
@@ -107,11 +216,11 @@ class ClientManager:
             executor.shutdown(wait=False, cancel_futures=True)
             BackgroundModelSyncer.clear_provider_verified(provider_id)
             return [], f"Request timed out after {int(timeout)}s", True
-        except openai.APIConnectionError as conn_err:
+        except (openai.APIConnectionError, anthropic.APIConnectionError) as conn_err:
             executor.shutdown(wait=False)
             BackgroundModelSyncer.clear_provider_verified(provider_id)
             return [], str(conn_err), True
-        except openai.APITimeoutError:
+        except (openai.APITimeoutError, anthropic.APITimeoutError) as time_err:
             executor.shutdown(wait=False)
             BackgroundModelSyncer.clear_provider_verified(provider_id)
             return [], f"Request timed out after {int(timeout)}s", True

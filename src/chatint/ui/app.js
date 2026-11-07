@@ -2044,7 +2044,10 @@
 
       let detailHtml = "";
       if (activeProv) {
-        const isBuiltin = ["openai", "openrouter", "deepseek", "ollama"].includes(activeProv.id);
+        const isBuiltin = ["openai", "anthropic", "gemini", "openrouter", "deepseek", "ollama"].includes(activeProv.id);
+        const isNativeSdkProv =
+          ["anthropic", "gemini"].includes((activeProv.id || "").toLowerCase()) ||
+          ["anthropic", "gemini"].includes(sanitizeProviderNameAlpha(activeProv.name).toLowerCase());
         const envKeyName = `${sanitizeProviderNameAlpha(activeProv.name).toUpperCase() || "PROVIDER"}_API_KEY`;
         const keyPlaceholder = activeProv.has_api_key && !activeProv.clear_api_key
           ? `Saved in .env (${envKeyName}) — type to replace or click eye to view`
@@ -2054,7 +2057,7 @@
           <div class="provider-detail-pane">
             <div style="display: flex; align-items: center; justify-content: space-between;">
               <div style="display: flex; align-items: center; gap: 8px;">
-                <input type="text" class="settings-input" id="prov-name-input" value="${escapeHtml(activeProv.name)}" title="English letters only (A-Z, a-z)" style="font-weight: 600; width: 200px;">
+                <input type="text" class="settings-input" id="prov-name-input" value="${escapeHtml(activeProv.name)}" ${isNativeSdkProv ? "disabled title=\"Built-in Native SDK Provider\"" : "title=\"English letters only (A-Z, a-z)\""} style="font-weight: 600; width: 200px;">
               </div>
               <div style="display: flex; align-items: center; gap: 10px;">
                 <label style="display: flex; align-items: center; gap: 6px; font-size: 13px; cursor: pointer;">
@@ -2067,7 +2070,7 @@
 
             <div class="settings-group">
               <label class="settings-label">Endpoint Base URL</label>
-              <input type="text" class="settings-input" id="prov-base-url-input" value="${escapeHtml(activeProv.base_url || "")}" placeholder="https://api.openai.com/v1">
+              <input type="text" class="settings-input" id="prov-base-url-input" value="${escapeHtml(isNativeSdkProv ? "" : (activeProv.base_url || ""))}" placeholder="${isNativeSdkProv ? "Managed automatically by official SDK (no endpoint needed)" : "https://api.openai.com/v1"}" ${isNativeSdkProv ? "disabled" : ""}>
             </div>
 
             <div class="settings-group">
@@ -2454,7 +2457,7 @@
         if (enCheck) prov.is_enabled = enCheck.checked;
 
         const bUrl = document.getElementById("prov-base-url-input");
-        if (bUrl) prov.base_url = bUrl.value.trim();
+        if (bUrl && !bUrl.disabled) prov.base_url = bUrl.value.trim();
 
         const aKey = document.getElementById("prov-api-key-input");
         if (aKey) {

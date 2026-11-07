@@ -17,7 +17,7 @@ A minimalist, multi-tab, multi-provider desktop chat interface built with **Pyth
   - Rename chats at any time via the sidebar or settings.
 - **Streamlined Settings (General & Providers)**:
   - Settings navigation with two clean master tabs: **General** and **Providers**.
-  - Under **Providers**: configure endpoints for OpenAI, OpenRouter, DeepSeek, Ollama, or click **`+ Add Provider`** to connect any OpenAI-compatible API.
+  - Under **Providers**: native SDK support for **Anthropic** (`anthropic` SDK) and **Gemini** (`google-genai` SDK) with automatic endpoint management (endpoint field disabled), plus configurable endpoints for OpenAI, OpenRouter, DeepSeek, Ollama, or **`+ Add Provider`** for any OpenAI-compatible API.
 - **Dynamic Endpoint Sync & Model Dropdown Mirroring**:
   - At startup, automatically checks accessible endpoints with configured keys, discovers available models, removes absent ones, and syncs the top 5 models into the config list.
   - The model selection dropdown directly mirrors the configured models list.

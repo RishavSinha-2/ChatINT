@@ -33,6 +33,22 @@ DEFAULT_PROVIDERS = [
         "models": [],
     },
     {
+        "id": "anthropic",
+        "name": "Anthropic",
+        "base_url": "",
+        "api_key": "",
+        "is_enabled": 1,
+        "models": [],
+    },
+    {
+        "id": "gemini",
+        "name": "Gemini",
+        "base_url": "",
+        "api_key": "",
+        "is_enabled": 1,
+        "models": [],
+    },
+    {
         "id": "openrouter",
         "name": "OpenRouter",
         "base_url": "https://openrouter.ai/api/v1",

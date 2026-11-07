@@ -1464,6 +1464,12 @@ body {
   border-color: var(--accent-color);
 }
 
+.settings-input:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+  background: var(--bg-tertiary);
+}
+
 .models-manager-list {
   display: flex;
   flex-direction: column;

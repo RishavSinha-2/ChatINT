@@ -38,6 +38,24 @@ def ensure_env_file():
                 default_val = "ollama" if clean.lower() == "ollama" else (p.get("api_key") or "")
                 lines.append(f"{clean.upper()}_API_KEY={default_val}")
         ENV_PATH.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    else:
+        raw_text = ENV_PATH.read_text(encoding="utf-8")
+        existing_keys = set()
+        for line in raw_text.splitlines():
+            s = line.strip()
+            if s and not s.startswith("#") and "=" in s:
+                existing_keys.add(s.split("=", 1)[0].strip().upper())
+        appended = []
+        for p in DEFAULT_PROVIDERS:
+            clean = sanitize_provider_name(p.get("name", ""))
+            if clean:
+                env_k = f"{clean.upper()}_API_KEY"
+                if env_k not in existing_keys:
+                    default_val = "ollama" if clean.lower() == "ollama" else (p.get("api_key") or "")
+                    appended.append(f"{env_k}={default_val}")
+        if appended:
+            prefix = raw_text if raw_text.endswith("\n") else (raw_text + "\n")
+            ENV_PATH.write_text(prefix + "\n".join(appended) + "\n", encoding="utf-8")
 
 
 def read_env_dict() -> Dict[str, str]:
@@ -168,11 +186,15 @@ def init_db():
     # Ensure .env exists
     ensure_env_file()
 
-    # Seed default providers if none exist
-    cursor.execute("SELECT COUNT(*) FROM providers")
-    if cursor.fetchone()[0] == 0:
-        for p in DEFAULT_PROVIDERS:
-            clean_name = sanitize_provider_name(p["name"]) or "Provider"
+    # Seed default providers if none exist, and ensure newly added built-in providers (e.g. anthropic, gemini) exist
+    cursor.execute("SELECT id, name FROM providers")
+    existing_prov_rows = cursor.fetchall()
+    existing_ids = {r["id"] for r in existing_prov_rows}
+    existing_upper_names = {sanitize_provider_name(r["name"]).upper() for r in existing_prov_rows if r["name"]}
+
+    for p in DEFAULT_PROVIDERS:
+        clean_name = sanitize_provider_name(p["name"]) or "Provider"
+        if p["id"] not in existing_ids and clean_name.upper() not in existing_upper_names:
             cursor.execute(
                 """
                 INSERT INTO providers (id, name, base_url, api_key, is_enabled, models_json)
@@ -188,6 +210,13 @@ def init_db():
             )
             default_env_key = get_api_key_from_env(clean_name) or ("ollama" if clean_name.lower() == "ollama" else (p.get("api_key") or ""))
             set_api_key_in_env(clean_name, default_env_key)
+            existing_ids.add(p["id"])
+            existing_upper_names.add(clean_name.upper())
+
+    # Ensure anthropic and gemini providers have empty base_url since they use native SDKs without user endpoints
+    cursor.execute(
+        "UPDATE providers SET base_url = '' WHERE id IN ('anthropic', 'gemini') OR LOWER(name) IN ('anthropic', 'gemini')"
+    )
 
     # Migrate any legacy API keys out of SQLite into .env, sanitize provider names to English letters only,
     # deduplicate case-insensitively, and wipe api_key column in DB.
@@ -318,6 +347,8 @@ def save_providers(providers: List[Dict[str, Any]]):
             set_api_key_in_env(clean_name, default_env_key)
 
         normalized_models = [_normalize_model_entry(m) for m in (p.get("models") or []) if m.get("id")]
+        is_native_sdk = pid.lower() in ("anthropic", "gemini") or clean_name.lower() in ("anthropic", "gemini")
+        base_url_val = "" if is_native_sdk else p.get("base_url", "")
 
         # Never store api_key in the database (always '')
         cursor.execute(
@@ -334,7 +365,7 @@ def save_providers(providers: List[Dict[str, Any]]):
             (
                 pid,
                 clean_name,
-                p.get("base_url", ""),
+                base_url_val,
                 1 if p.get("is_enabled", True) else 0,
                 json.dumps(normalized_models),
             ),

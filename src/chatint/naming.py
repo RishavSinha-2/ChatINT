@@ -1,6 +1,24 @@
 import re
 from typing import Optional
+from google.genai import types as genai_types
 from chatint.client_manager import ClientManager
+
+_NAMING_SYSTEM_INSTRUCTION = (
+    "Generate a concise 2 to 5 word title for this conversation based on the user's message. "
+    "Output ONLY the title text, with no quotes or trailing punctuation."
+)
+
+
+def _clean_generated_title(raw_title: str) -> Optional[str]:
+    if not raw_title:
+        return None
+    raw_title = re.sub(r"<think>[\s\S]*?</think>", "", raw_title).strip()
+    raw_title = raw_title.split("\n")[0].strip().strip('"\'`.?!:;,-')
+    if raw_title and len(raw_title) >= 2:
+        if len(raw_title) > 42:
+            raw_title = raw_title[:39].rsplit(" ", 1)[0]
+        return raw_title
+    return None
 
 
 def generate_chat_title(
@@ -10,36 +28,72 @@ def generate_chat_title(
 ) -> str:
     """
     Generates a concise, human-readable title from the initial user prompt.
-    Uses the active chat model if available and falls back to offline heuristic extraction.
+    Uses the active chat model via its provider's SDK if available and falls back to offline heuristic extraction.
     """
     if not prompt or not prompt.strip():
         return "New Chat"
 
     if provider_id and model_id:
         try:
-            client, err = ClientManager.get_client(provider_id, timeout=10.0)
-            if client and not err:
-                resp = client.chat.completions.create(
-                    model=model_id,
-                    messages=[
-                        {
-                            "role": "system",
-                            "content": "Generate a concise 2 to 5 word title for this conversation based on the user's message. Output ONLY the title text, with no quotes or trailing punctuation.",
-                        },
-                        {"role": "user", "content": prompt.strip()[:500]},
-                    ],
-                    max_tokens=20,
-                    stream=False,
-                )
-                if resp and resp.choices and resp.choices[0].message:
-                    raw_title = (resp.choices[0].message.content or "").strip()
-                    # Strip any <think>...</think> blocks if a reasoning model included them
-                    raw_title = re.sub(r"<think>[\s\S]*?</think>", "", raw_title).strip()
-                    raw_title = raw_title.split("\n")[0].strip().strip('"\'`.?!:;,-')
-                    if raw_title and len(raw_title) >= 2:
-                        if len(raw_title) > 42:
-                            raw_title = raw_title[:39].rsplit(" ", 1)[0]
-                        return raw_title
+            provider = ClientManager.get_provider(provider_id)
+            sdk_type = ClientManager.get_sdk_type(provider, provider_id)
+            user_snippet = prompt.strip()[:500]
+
+            if sdk_type == "anthropic":
+                client, err = ClientManager.get_anthropic_client(provider_id, timeout=10.0)
+                if client and not err:
+                    resp = client.messages.create(
+                        model=model_id,
+                        system=_NAMING_SYSTEM_INSTRUCTION,
+                        messages=[{"role": "user", "content": user_snippet}],
+                        max_tokens=25,
+                    )
+                    if resp and getattr(resp, "content", None):
+                        text_blocks = [
+                            getattr(b, "text", "")
+                            for b in resp.content
+                            if getattr(b, "type", "") == "text"
+                        ]
+                        cleaned = _clean_generated_title(" ".join(text_blocks))
+                        if cleaned:
+                            return cleaned
+
+            elif sdk_type == "gemini":
+                client, err = ClientManager.get_gemini_client(provider_id, timeout=10.0)
+                if client and not err:
+                    resp = client.models.generate_content(
+                        model=model_id,
+                        contents=user_snippet,
+                        config=genai_types.GenerateContentConfig(
+                            system_instruction=_NAMING_SYSTEM_INSTRUCTION,
+                            max_output_tokens=25,
+                        ),
+                    )
+                    raw_text = (getattr(resp, "text", "") or "").strip()
+                    cleaned = _clean_generated_title(raw_text)
+                    if cleaned:
+                        return cleaned
+
+            else:
+                client, err = ClientManager.get_client(provider_id, timeout=10.0)
+                if client and not err:
+                    resp = client.chat.completions.create(
+                        model=model_id,
+                        messages=[
+                            {
+                                "role": "system",
+                                "content": _NAMING_SYSTEM_INSTRUCTION,
+                            },
+                            {"role": "user", "content": user_snippet},
+                        ],
+                        max_tokens=20,
+                        stream=False,
+                    )
+                    if resp and resp.choices and resp.choices[0].message:
+                        raw_title = (resp.choices[0].message.content or "").strip()
+                        cleaned = _clean_generated_title(raw_title)
+                        if cleaned:
+                            return cleaned
         except Exception:
             pass
 
