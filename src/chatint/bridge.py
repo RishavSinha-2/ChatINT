@@ -92,7 +92,8 @@ class DesktopBridge:
             role = m.get("role", "user")
             content = m.get("content", "")
             if context_msgs and context_msgs[-1]["role"] == role and role in ("user", "assistant"):
-                context_msgs[-1]["content"] = content if role == "user" else (context_msgs[-1]["content"] + "\n\n" + content)
+                if content != context_msgs[-1]["content"]:
+                    context_msgs[-1]["content"] = context_msgs[-1]["content"] + "\n\n" + content
             else:
                 context_msgs.append({"role": role, "content": content})
 

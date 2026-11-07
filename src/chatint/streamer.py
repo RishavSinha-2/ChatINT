@@ -3,6 +3,10 @@ import re
 import threading
 import time
 from typing import Any, Dict, List, Optional
+import warnings
+
+warnings.filterwarnings("ignore", category=SyntaxWarning)
+
 import anthropic
 from google import genai
 from google.genai import types as genai_types
@@ -258,6 +262,7 @@ def _stream_anthropic(
     provider_id: str,
     model_id: str,
     thinking_level: str,
+    assistant_msg_id: Optional[str],
     abort_event: threading.Event,
     user_question: str,
 ) -> tuple[List[str], List[str], int, int, int, bool]:
@@ -286,7 +291,7 @@ def _stream_anthropic(
             "type": "start",
             "tab_id": tab_id,
             "conversation_id": conversation_id,
-            "assistant_msg_id": None,
+            "assistant_msg_id": assistant_msg_id,
             "provider_id": provider_id,
             "model_id": model_id,
             "thinking_level": thinking_level,
@@ -304,6 +309,7 @@ def _stream_anthropic(
     if system_prompt:
         call_kwargs["system"] = system_prompt
 
+    budget = 0
     if thinking_level and thinking_level != "none":
         budget = _ANTHROPIC_THINKING_BUDGETS.get(thinking_level, 4096)
         call_kwargs["thinking"] = {"type": "enabled", "budget_tokens": budget}
@@ -315,16 +321,24 @@ def _stream_anthropic(
             response_stream = client.messages.create(**call_kwargs)
         except anthropic.APIStatusError as api_err:
             if api_err.status_code in (400, 422) and "thinking" in call_kwargs:
-                call_kwargs.pop("thinking", None)
-                call_kwargs["max_tokens"] = 8192
-                try:
-                    response_stream = client.messages.create(**call_kwargs)
-                except anthropic.APIStatusError as retry_err:
-                    if retry_err.status_code in (400, 422):
-                        call_kwargs["max_tokens"] = 4096
+                if budget > 4096:
+                    call_kwargs["thinking"] = {"type": "enabled", "budget_tokens": 4096}
+                    call_kwargs["max_tokens"] = 8192
+                    try:
                         response_stream = client.messages.create(**call_kwargs)
-                    else:
-                        raise retry_err
+                    except anthropic.APIStatusError:
+                        response_stream = None
+                if response_stream is None:
+                    call_kwargs.pop("thinking", None)
+                    call_kwargs["max_tokens"] = 8192
+                    try:
+                        response_stream = client.messages.create(**call_kwargs)
+                    except anthropic.APIStatusError as retry_err:
+                        if retry_err.status_code in (400, 422):
+                            call_kwargs["max_tokens"] = 4096
+                            response_stream = client.messages.create(**call_kwargs)
+                        else:
+                            raise retry_err
             elif api_err.status_code in (400, 422) and call_kwargs.get("max_tokens", 0) > 4096:
                 call_kwargs["max_tokens"] = 4096
                 response_stream = client.messages.create(**call_kwargs)
@@ -473,6 +487,7 @@ def _stream_gemini(
     provider_id: str,
     model_id: str,
     thinking_level: str,
+    assistant_msg_id: Optional[str],
     abort_event: threading.Event,
     user_question: str,
 ) -> tuple[List[str], List[str], int, int, int, bool]:
@@ -501,7 +516,7 @@ def _stream_gemini(
             "type": "start",
             "tab_id": tab_id,
             "conversation_id": conversation_id,
-            "assistant_msg_id": None,
+            "assistant_msg_id": assistant_msg_id,
             "provider_id": provider_id,
             "model_id": model_id,
             "thinking_level": thinking_level,
@@ -520,11 +535,26 @@ def _stream_gemini(
             )
         )
 
-    def _build_config(with_thinking: bool) -> genai_types.GenerateContentConfig:
+    _GEMINI_LEVEL_ENUM_MAP = {
+        "minimal": "MINIMAL",
+        "low": "LOW",
+        "medium": "MEDIUM",
+        "high": "HIGH",
+        "xhigh": "HIGH",
+        "max": "HIGH",
+    }
+
+    def _build_config(mode: str) -> genai_types.GenerateContentConfig:
         cfg_kwargs: Dict[str, Any] = {}
         if system_prompt:
             cfg_kwargs["system_instruction"] = system_prompt
-        if with_thinking and thinking_level and thinking_level != "none":
+        if mode == "level" and thinking_level and thinking_level != "none":
+            lvl_str = _GEMINI_LEVEL_ENUM_MAP.get(thinking_level, "MEDIUM")
+            cfg_kwargs["thinking_config"] = genai_types.ThinkingConfig(
+                include_thoughts=True,
+                thinking_level=lvl_str,
+            )
+        elif mode == "budget" and thinking_level and thinking_level != "none":
             budget = _GEMINI_THINKING_BUDGETS.get(thinking_level, 4096)
             cfg_kwargs["thinking_config"] = genai_types.ThinkingConfig(
                 include_thoughts=True,
@@ -532,25 +562,30 @@ def _stream_gemini(
             )
         return genai_types.GenerateContentConfig(**cfg_kwargs)
 
+    is_gemini_3 = "gemini-3" in (model_id or "").lower()
+    if thinking_level and thinking_level != "none":
+        config_modes = ["level", "budget", "none"] if is_gemini_3 else ["budget", "level", "none"]
+    else:
+        config_modes = ["none"]
+
     response_stream = None
-    used_thinking_cfg = bool(thinking_level and thinking_level != "none")
+    active_mode_idx = 0
     try:
-        try:
-            response_stream = client.models.generate_content_stream(
-                model=model_id,
-                contents=contents,
-                config=_build_config(with_thinking=used_thinking_cfg),
-            )
-        except Exception as first_err:
-            if used_thinking_cfg:
-                used_thinking_cfg = False
+        last_err = None
+        for idx, mode in enumerate(config_modes):
+            try:
+                active_mode_idx = idx
                 response_stream = client.models.generate_content_stream(
                     model=model_id,
                     contents=contents,
-                    config=_build_config(with_thinking=False),
+                    config=_build_config(mode),
                 )
-            else:
-                raise first_err
+                last_err = None
+                break
+            except Exception as attempt_err:
+                last_err = attempt_err
+        if last_err is not None and response_stream is None:
+            raise last_err
     except Exception as e:
         _safe_dispatch(
             bridge,
@@ -632,15 +667,24 @@ def _stream_gemini(
         try:
             _consume_gemini_stream(response_stream)
         except Exception as stream_err:
-            # If the generator raised on the first yield because the model doesn't support thinking_config, retry without it
-            if used_thinking_cfg and not full_content and not full_thinking:
-                used_thinking_cfg = False
-                fallback_stream = client.models.generate_content_stream(
-                    model=model_id,
-                    contents=contents,
-                    config=_build_config(with_thinking=False),
-                )
-                _consume_gemini_stream(fallback_stream)
+            # If the generator raised on the first yield because the model rejected the thinking config mode, try remaining modes
+            if active_mode_idx + 1 < len(config_modes) and not full_content and not full_thinking:
+                recovered = False
+                for next_mode in config_modes[active_mode_idx + 1 :]:
+                    try:
+                        fallback_stream = client.models.generate_content_stream(
+                            model=model_id,
+                            contents=contents,
+                            config=_build_config(next_mode),
+                        )
+                        _consume_gemini_stream(fallback_stream)
+                        recovered = True
+                        break
+                    except Exception:
+                        if full_content or full_thinking:
+                            break
+                if not recovered:
+                    raise stream_err
             else:
                 raise stream_err
     except Exception as e:
@@ -709,9 +753,12 @@ def _stream_openai(
         },
     )
 
+    system_prompt, turns = _prepare_system_and_turns(messages)
+    normalized_messages = ([{"role": "system", "content": system_prompt}] if system_prompt else []) + turns
+
     call_kwargs: Dict[str, Any] = {
         "model": model_id,
-        "messages": messages,
+        "messages": normalized_messages,
         "stream": True,
         "stream_options": {"include_usage": True},
     }
@@ -726,15 +773,30 @@ def _stream_openai(
         except openai.APIStatusError as api_err:
             if api_err.status_code in (400, 422):
                 if "reasoning_effort" in call_kwargs:
-                    call_kwargs.pop("reasoning_effort", None)
-                    try:
-                        response_stream = client.chat.completions.create(**call_kwargs)
-                    except openai.APIStatusError as retry_err:
-                        if retry_err.status_code in (400, 422) and "stream_options" in call_kwargs:
-                            call_kwargs.pop("stream_options", None)
+                    # If extended effort ('xhigh'/'max'/'minimal') was rejected, try standard OpenAI effort ('high'/'low') first
+                    fallback_effort = None
+                    if call_kwargs["reasoning_effort"] in ("xhigh", "max"):
+                        fallback_effort = "high"
+                    elif call_kwargs["reasoning_effort"] == "minimal":
+                        fallback_effort = "low"
+
+                    if fallback_effort:
+                        call_kwargs["reasoning_effort"] = fallback_effort
+                        try:
                             response_stream = client.chat.completions.create(**call_kwargs)
-                        else:
-                            raise retry_err
+                        except openai.APIStatusError:
+                            response_stream = None
+
+                    if response_stream is None:
+                        call_kwargs.pop("reasoning_effort", None)
+                        try:
+                            response_stream = client.chat.completions.create(**call_kwargs)
+                        except openai.APIStatusError as retry_err:
+                            if retry_err.status_code in (400, 422) and "stream_options" in call_kwargs:
+                                call_kwargs.pop("stream_options", None)
+                                response_stream = client.chat.completions.create(**call_kwargs)
+                            else:
+                                raise retry_err
                 elif "stream_options" in call_kwargs:
                     call_kwargs.pop("stream_options", None)
                     response_stream = client.chat.completions.create(**call_kwargs)
@@ -877,6 +939,7 @@ def stream_chat_completion(
                 provider_id=provider_id,
                 model_id=model_id,
                 thinking_level=thinking_level,
+                assistant_msg_id=assistant_msg_id,
                 abort_event=abort_event,
                 user_question=user_question,
             )
@@ -896,6 +959,7 @@ def stream_chat_completion(
                 provider_id=provider_id,
                 model_id=model_id,
                 thinking_level=thinking_level,
+                assistant_msg_id=assistant_msg_id,
                 abort_event=abort_event,
                 user_question=user_question,
             )

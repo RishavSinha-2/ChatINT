@@ -2057,7 +2057,7 @@
           <div class="provider-detail-pane">
             <div style="display: flex; align-items: center; justify-content: space-between;">
               <div style="display: flex; align-items: center; gap: 8px;">
-                <input type="text" class="settings-input" id="prov-name-input" value="${escapeHtml(activeProv.name)}" ${isNativeSdkProv ? "disabled title=\"Built-in Native SDK Provider\"" : "title=\"English letters only (A-Z, a-z)\""} style="font-weight: 600; width: 200px;">
+                <input type="text" class="settings-input" id="prov-name-input" value="${escapeHtml(activeProv.name)}" title="English letters only (A-Z, a-z)" style="font-weight: 600; width: 200px;">
               </div>
               <div style="display: flex; align-items: center; gap: 10px;">
                 <label style="display: flex; align-items: center; gap: 6px; font-size: 13px; cursor: pointer;">
@@ -2352,6 +2352,8 @@
             showNoticeDialog(saveRes.error);
             return;
           }
+          delete activeProv.api_key;
+          delete activeProv.clear_api_key;
 
           fetchBtn.disabled = true;
           fetchBtn.innerHTML = '<i data-lucide="loader" style="width: 11px; height: 11px;"></i> Fetching...';
@@ -2372,28 +2374,28 @@
             const retained = current.filter((m) => fetchedIds.has(m.id));
             const retainedIds = new Set(retained.map((m) => m.id));
 
-            // 2. Add new models until 5 with $0 pricing and thinking unchecked
-            for (const fm of fetched) {
-              if (retained.length >= 5) break;
-              if (!retainedIds.has(fm.id)) {
-                retained.push({
-                  id: fm.id,
-                  name: fm.name || fm.id,
-                  supports_thinking: 0,
-                  input_price: 0.0,
-                  cached_input_price: 0.0,
-                  output_price: 0.0,
-                });
-                retainedIds.add(fm.id);
+            // 2. If no existing configured models matched, auto-fill up to 5 with $0 pricing and thinking unchecked
+            if (retained.length === 0) {
+              for (const fm of fetched) {
+                if (retained.length >= 5) break;
+                if (!retainedIds.has(fm.id)) {
+                  retained.push({
+                    id: fm.id,
+                    name: fm.name || fm.id,
+                    supports_thinking: 0,
+                    input_price: 0.0,
+                    cached_input_price: 0.0,
+                    output_price: 0.0,
+                  });
+                  retainedIds.add(fm.id);
+                }
               }
             }
 
             activeProv.models = retained.slice(0, 5);
             activeProv.fetched_model_ids = Array.from(fetchedIds);
             activeProv.has_api_key = true;
-            activeProv.is_accessible = true;
-            delete activeProv.api_key;
-            delete activeProv.clear_api_key;
+            activeProv.is_accessible = activeProv.is_enabled && activeProv.models.length > 0;
 
             await callApi("save_settings", state.providers, state.settings);
             if (state.settingsSnapshot) {

@@ -4,6 +4,10 @@ import socket
 import threading
 import time
 from typing import Any, Dict, List, Optional, Set
+import warnings
+
+warnings.filterwarnings("ignore", category=SyntaxWarning)
+
 import anthropic
 from google import genai
 from google.genai import types as genai_types
@@ -305,9 +309,11 @@ class BackgroundModelSyncer:
             if not is_enabled or not api_key:
                 cls.clear_provider_verified(provider_id)
                 provider["models"] = []
+                provider["fetched_model_ids"] = []
                 provider["has_api_key"] = bool(api_key)
                 provider["is_accessible"] = False
-                save_providers([provider])
+                if not api_key:
+                    save_providers([provider])
                 if cls._bridge:
                     cls._bridge.push_event({
                         "type": "provider_models_updated",
@@ -323,8 +329,8 @@ class BackgroundModelSyncer:
                 latest_failed = ClientManager.get_provider(provider_id)
                 if latest_failed:
                     latest_failed["models"] = []
+                    latest_failed["fetched_model_ids"] = []
                     latest_failed["is_accessible"] = False
-                    save_providers([latest_failed])
                     if cls._bridge:
                         cls._bridge.push_event({
                             "type": "provider_models_updated",

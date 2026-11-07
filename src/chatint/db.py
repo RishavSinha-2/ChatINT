@@ -286,14 +286,19 @@ def _normalize_model_entry(m: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+_BUILTIN_PROVIDER_ORDER = {p["id"]: idx for idx, p in enumerate(DEFAULT_PROVIDERS)}
+
+
 def get_providers() -> List[Dict[str, Any]]:
     from chatint.client_manager import BackgroundModelSyncer
 
     conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT id, name, base_url, is_enabled, models_json FROM providers")
-    rows = cursor.fetchall()
+    cursor.execute("SELECT rowid, id, name, base_url, is_enabled, models_json FROM providers")
+    rows = list(cursor.fetchall())
     conn.close()
+
+    rows.sort(key=lambda r: (_BUILTIN_PROVIDER_ORDER.get(r["id"], 999), r["rowid"]))
 
     providers = []
     for r in rows:
@@ -320,15 +325,18 @@ def get_providers() -> List[Dict[str, Any]]:
 
 
 def save_providers(providers: List[Dict[str, Any]]):
+    from chatint.client_manager import BackgroundModelSyncer
+
     conn = get_connection()
     cursor = conn.cursor()
 
-    cursor.execute("SELECT id, name FROM providers")
-    existing_names = {r["id"]: r["name"] for r in cursor.fetchall()}
+    cursor.execute("SELECT id, name, models_json FROM providers")
+    existing_rows = {r["id"]: r for r in cursor.fetchall()}
 
     for p in providers:
         pid = p["id"]
-        old_name = existing_names.get(pid)
+        old_row = existing_rows.get(pid)
+        old_name = old_row["name"] if old_row else None
         clean_name = sanitize_provider_name(p.get("name", "")) or sanitize_provider_name(old_name or "") or "Provider"
 
         # If provider was renamed or a new api_key was explicitly passed in payload, update .env ONLY
@@ -347,6 +355,22 @@ def save_providers(providers: List[Dict[str, Any]]):
             set_api_key_in_env(clean_name, default_env_key)
 
         normalized_models = [_normalize_model_entry(m) for m in (p.get("models") or []) if m.get("id")]
+        has_api_key = bool(get_api_key_from_env(clean_name))
+        if (
+            not normalized_models
+            and has_api_key
+            and not p.get("clear_api_key")
+            and not BackgroundModelSyncer.is_provider_verified(pid)
+            and old_row
+            and old_row["models_json"]
+        ):
+            # Preserve existing stored models in DB if provider simply hasn't finished background verification yet
+            models_json_str = old_row["models_json"]
+        elif not has_api_key:
+            models_json_str = "[]"
+        else:
+            models_json_str = json.dumps(normalized_models)
+
         is_native_sdk = pid.lower() in ("anthropic", "gemini") or clean_name.lower() in ("anthropic", "gemini")
         base_url_val = "" if is_native_sdk else p.get("base_url", "")
 
@@ -367,7 +391,7 @@ def save_providers(providers: List[Dict[str, Any]]):
                 clean_name,
                 base_url_val,
                 1 if p.get("is_enabled", True) else 0,
-                json.dumps(normalized_models),
+                models_json_str,
             ),
         )
     conn.commit()
@@ -455,6 +479,8 @@ def get_conversations() -> List[Dict[str, Any]]:
 
 
 def delete_provider(provider_id: str):
+    if provider_id in _BUILTIN_PROVIDER_ORDER:
+        return
     conn = get_connection()
     cursor = conn.cursor()
     row = cursor.execute("SELECT name FROM providers WHERE id = ?", (provider_id,)).fetchone()
