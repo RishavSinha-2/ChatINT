@@ -30,8 +30,14 @@ def provider_env_key(provider_name: str) -> str:
 
 
 def ensure_env_file():
-    if not ENV_PATH.exists():
-        ENV_PATH.write_text("", encoding="utf-8")
+    if not ENV_PATH.exists() or ENV_PATH.read_text(encoding="utf-8").strip() == "":
+        lines = []
+        for p in DEFAULT_PROVIDERS:
+            clean = sanitize_provider_name(p.get("name", ""))
+            if clean:
+                default_val = "ollama" if clean.lower() == "ollama" else (p.get("api_key") or "")
+                lines.append(f"{clean.upper()}_API_KEY={default_val}")
+        ENV_PATH.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def read_env_dict() -> Dict[str, str]:
@@ -180,7 +186,8 @@ def init_db():
                     json.dumps(p["models"]),
                 ),
             )
-            set_api_key_in_env(clean_name, "")
+            default_env_key = get_api_key_from_env(clean_name) or ("ollama" if clean_name.lower() == "ollama" else (p.get("api_key") or ""))
+            set_api_key_in_env(clean_name, default_env_key)
 
     # Migrate any legacy API keys out of SQLite into .env, sanitize provider names to English letters only,
     # deduplicate case-insensitively, and wipe api_key column in DB.
@@ -205,7 +212,7 @@ def init_db():
 
         db_key = (r["api_key"] or "").strip()
         env_key_val = get_api_key_from_env(clean_name) or (get_api_key_from_env(raw_name) if raw_name != clean_name else "")
-        final_key = env_key_val or db_key
+        final_key = env_key_val or db_key or ("ollama" if clean_name.lower() == "ollama" else "")
         set_api_key_in_env(clean_name, final_key, old_provider_name=raw_name if raw_name != clean_name else None)
 
         cursor.execute(
@@ -307,7 +314,8 @@ def save_providers(providers: List[Dict[str, Any]]):
             set_api_key_in_env(clean_name, existing_val, old_provider_name=old_name)
         elif not old_name:
             # Newly added provider -> ensure entry exists in .env
-            set_api_key_in_env(clean_name, "")
+            default_env_key = get_api_key_from_env(clean_name) or ("ollama" if clean_name.lower() == "ollama" else (p.get("api_key") or ""))
+            set_api_key_in_env(clean_name, default_env_key)
 
         normalized_models = [_normalize_model_entry(m) for m in (p.get("models") or []) if m.get("id")]
 

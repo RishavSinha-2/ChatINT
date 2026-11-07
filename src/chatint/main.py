@@ -30,7 +30,8 @@ def main():
     )
 
     # Launch desktop application loop
-    webview.start(debug=False)
+    icon_path = UI_DIR / "assets" / "logo.ico"
+    webview.start(debug=False, icon=str(icon_path) if icon_path.exists() else None)
 
 
 if __name__ == "__main__":

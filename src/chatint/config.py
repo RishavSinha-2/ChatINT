@@ -52,7 +52,7 @@ DEFAULT_PROVIDERS = [
         "id": "ollama",
         "name": "Ollama",
         "base_url": "http://localhost:11434/v1",
-        "api_key": "",
+        "api_key": "ollama",
         "is_enabled": 1,
         "models": [],
     },
