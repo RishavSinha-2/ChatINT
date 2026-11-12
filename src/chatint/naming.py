@@ -1,6 +1,7 @@
+from __future__ import annotations
+
 import re
 from typing import Optional
-from google.genai import types as genai_types
 from chatint.client_manager import ClientManager
 
 _NAMING_SYSTEM_INSTRUCTION = (
@@ -21,17 +22,28 @@ def _clean_generated_title(raw_title: str) -> Optional[str]:
     return None
 
 
+def _finalize_title_usage(
+    cleaned: str, user_snippet: str, in_tok: int, out_tok: int, cache_tok: int
+) -> tuple[str, int, int, int]:
+    if in_tok == 0 and user_snippet:
+        in_tok = max(1, len(user_snippet) // 4)
+    if out_tok == 0 and cleaned:
+        out_tok = max(1, len(cleaned) // 4)
+    return cleaned, in_tok, out_tok, cache_tok
+
+
 def generate_chat_title(
     prompt: str,
     provider_id: Optional[str] = None,
     model_id: Optional[str] = None,
-) -> str:
+) -> tuple[str, int, int, int]:
     """
     Generates a concise, human-readable title from the initial user prompt.
     Uses the active chat model via its provider's SDK if available and falls back to offline heuristic extraction.
+    Returns (title, prompt_tokens, completion_tokens, cached_tokens).
     """
     if not prompt or not prompt.strip():
-        return "New Chat"
+        return "New Chat", 0, 0, 0
 
     if provider_id and model_id:
         try:
@@ -56,23 +68,55 @@ def generate_chat_title(
                         ]
                         cleaned = _clean_generated_title(" ".join(text_blocks))
                         if cleaned:
-                            return cleaned
+                            usage = getattr(resp, "usage", None)
+                            return _finalize_title_usage(
+                                cleaned,
+                                user_snippet,
+                                getattr(usage, "input_tokens", 0) or 0,
+                                getattr(usage, "output_tokens", 0) or 0,
+                                getattr(usage, "cache_read_input_tokens", 0) or 0,
+                            )
 
             elif sdk_type == "gemini":
+                from google.genai import types as genai_types
                 client, err = ClientManager.get_gemini_client(provider_id, timeout=10.0)
                 if client and not err:
-                    resp = client.models.generate_content(
-                        model=model_id,
-                        contents=user_snippet,
-                        config=genai_types.GenerateContentConfig(
-                            system_instruction=_NAMING_SYSTEM_INSTRUCTION,
-                            max_output_tokens=25,
-                        ),
-                    )
-                    raw_text = (getattr(resp, "text", "") or "").strip()
-                    cleaned = _clean_generated_title(raw_text)
-                    if cleaned:
-                        return cleaned
+                    # Disable thinking for concise title generation to prevent thinking budget from truncating title text
+                    resp = None
+                    try:
+                        resp = client.models.generate_content(
+                            model=model_id,
+                            contents=user_snippet,
+                            config=genai_types.GenerateContentConfig(
+                                system_instruction=_NAMING_SYSTEM_INSTRUCTION,
+                                max_output_tokens=40,
+                                thinking_config=genai_types.ThinkingConfig(thinking_budget=0),
+                            ),
+                        )
+                    except Exception:
+                        try:
+                            resp = client.models.generate_content(
+                                model=model_id,
+                                contents=user_snippet,
+                                config=genai_types.GenerateContentConfig(
+                                    system_instruction=_NAMING_SYSTEM_INSTRUCTION,
+                                    max_output_tokens=60,
+                                ),
+                            )
+                        except Exception:
+                            resp = None
+
+                    if resp:
+                        cleaned = _clean_generated_title((getattr(resp, "text", "") or "").strip())
+                        if cleaned:
+                            usage = getattr(resp, "usage_metadata", None)
+                            return _finalize_title_usage(
+                                cleaned,
+                                user_snippet,
+                                getattr(usage, "prompt_token_count", 0) or 0,
+                                getattr(usage, "candidates_token_count", 0) or 0,
+                                getattr(usage, "cached_content_token_count", 0) or 0,
+                            )
 
             else:
                 client, err = ClientManager.get_client(provider_id, timeout=10.0)
@@ -80,24 +124,28 @@ def generate_chat_title(
                     resp = client.chat.completions.create(
                         model=model_id,
                         messages=[
-                            {
-                                "role": "system",
-                                "content": _NAMING_SYSTEM_INSTRUCTION,
-                            },
+                            {"role": "system", "content": _NAMING_SYSTEM_INSTRUCTION},
                             {"role": "user", "content": user_snippet},
                         ],
                         max_tokens=20,
                         stream=False,
                     )
                     if resp and resp.choices and resp.choices[0].message:
-                        raw_title = (resp.choices[0].message.content or "").strip()
-                        cleaned = _clean_generated_title(raw_title)
+                        cleaned = _clean_generated_title((resp.choices[0].message.content or "").strip())
                         if cleaned:
-                            return cleaned
+                            usage = getattr(resp, "usage", None)
+                            details = getattr(usage, "prompt_tokens_details", None)
+                            return _finalize_title_usage(
+                                cleaned,
+                                user_snippet,
+                                getattr(usage, "prompt_tokens", 0) or 0,
+                                getattr(usage, "completion_tokens", 0) or 0,
+                                getattr(details, "cached_tokens", 0) if details else 0,
+                            )
         except Exception:
             pass
 
-    return _offline_heuristic_title(prompt)
+    return _offline_heuristic_title(prompt), 0, 0, 0
 
 
 def _offline_heuristic_title(prompt: str) -> str:

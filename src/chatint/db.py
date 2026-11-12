@@ -10,6 +10,10 @@ from chatint.config import DB_PATH, DEFAULT_PROVIDERS, ENV_PATH
 _ENV_LOCK = threading.Lock()
 
 
+def strip_model_prefix(model_id: str) -> str:
+    return model_id[7:] if model_id.startswith("models/") else model_id
+
+
 def sanitize_provider_name(name: str) -> str:
     """
     Removes any non-English alphabet characters from a provider name.
@@ -180,6 +184,52 @@ def init_db():
     )
     """)
 
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS token_ledger (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        conversation_id TEXT NOT NULL,
+        provider_id TEXT NOT NULL DEFAULT '',
+        model_id TEXT NOT NULL DEFAULT '',
+        prompt_tokens INTEGER NOT NULL DEFAULT 0,
+        completion_tokens INTEGER NOT NULL DEFAULT 0,
+        cached_tokens INTEGER NOT NULL DEFAULT 0,
+        google_search_requests INTEGER NOT NULL DEFAULT 0,
+        created_at REAL NOT NULL,
+        FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
+    )
+    """)
+
+    cursor.execute("PRAGMA table_info(token_ledger)")
+    ledger_cols = {r["name"] for r in cursor.fetchall()}
+    if "google_search_requests" not in ledger_cols:
+        cursor.execute("ALTER TABLE token_ledger ADD COLUMN google_search_requests INTEGER NOT NULL DEFAULT 0")
+
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS google_search_usage (
+        month_key TEXT PRIMARY KEY,
+        request_count INTEGER NOT NULL DEFAULT 0,
+        updated_at REAL NOT NULL
+    )
+    """)
+
+    # Populate token_ledger from historical messages if token_ledger is empty
+    cursor.execute("SELECT COUNT(*) as count FROM token_ledger")
+    t_count = cursor.fetchone()
+    if t_count and t_count["count"] == 0:
+        cursor.execute("""
+            INSERT INTO token_ledger (
+                conversation_id, provider_id, model_id,
+                prompt_tokens, completion_tokens, cached_tokens, created_at
+            )
+            SELECT conversation_id, provider_id, model_id,
+                   prompt_tokens, completion_tokens, cached_tokens, created_at
+            FROM messages
+            WHERE role = 'assistant' AND (prompt_tokens > 0 OR completion_tokens > 0)
+        """)
+
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(conversation_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_token_ledger_conv ON token_ledger(conversation_id)")
+
     # Clean up legacy 'custom' provider if present from earlier runs
     cursor.execute("DELETE FROM providers WHERE id = 'custom'")
 
@@ -249,29 +299,100 @@ def init_db():
             (clean_name, pid),
         )
 
-    # Clear models in DB for any provider that has no API key in .env
-    cursor.execute("SELECT id, name FROM providers")
-    for r in cursor.fetchall():
-        if not get_api_key_from_env(r["name"]):
-            cursor.execute("UPDATE providers SET models_json = '[]' WHERE id = ?", (r["id"],))
-
-    # Seed default app settings if none exist
-    cursor.execute("SELECT COUNT(*) FROM app_settings")
-    if cursor.fetchone()[0] == 0:
-        cursor.executemany(
-            """
-            INSERT INTO app_settings (key, value) VALUES (?, ?)
-        """,
-            [
-                ("theme", "dark"),
-                ("global_system_prompt", "You are a helpful, brilliant, and precise assistant."),
-                ("default_provider", "openai"),
-                ("default_model", "gpt-4o"),
-            ],
-        )
+    # Seed default app settings if missing
+    default_ws_models = json.dumps([
+        {
+            "id": PRIMARY_WEB_SEARCH_MODEL,
+            "name": PRIMARY_WEB_SEARCH_MODEL,
+            "input_price": 0.0,
+            "cached_input_price": 0.0,
+            "output_price": 0.0,
+        }
+    ])
+    cursor.executemany(
+        "INSERT OR IGNORE INTO app_settings (key, value) VALUES (?, ?)",
+        [
+            ("theme", "dark"),
+            ("global_system_prompt", "You are a helpful, brilliant, and precise assistant."),
+            ("default_provider", "openai"),
+            ("default_model", "gpt-4o"),
+            ("default_thinking", "medium"),
+            ("web_search_models", default_ws_models),
+        ],
+    )
 
     conn.commit()
     conn.close()
+
+
+PRIMARY_WEB_SEARCH_MODEL = "gemini-3.1-flash-lite"
+
+
+def _normalize_search_model_entry(m: Dict[str, Any]) -> Dict[str, Any]:
+    mid = strip_model_prefix((m.get("id") or "").strip())
+    return {
+        "id": mid,
+        "name": strip_model_prefix((m.get("name") or mid).strip()) or mid,
+        "input_price": max(0.0, float(m.get("input_price") or 0.0)),
+        "cached_input_price": max(0.0, float(m.get("cached_input_price") or 0.0)),
+        "output_price": max(0.0, float(m.get("output_price") or 0.0)),
+    }
+
+
+def normalize_web_search_models(models: Optional[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+    """
+    Normalize Web Search models (max 5): gemini-3.1-flash-lite is always fixed at index 0
+    (preserving any user-configured pricing), followed by up to 4 unique fallback Gemini models.
+    """
+    primary_entry: Optional[Dict[str, Any]] = None
+    fallbacks: List[Dict[str, Any]] = []
+    seen = set()
+
+    for raw in models or []:
+        if not isinstance(raw, dict):
+            continue
+        entry = _normalize_search_model_entry(raw)
+        mid = entry["id"]
+        if not mid:
+            continue
+        low = mid.lower()
+        if low == PRIMARY_WEB_SEARCH_MODEL:
+            if primary_entry is None:
+                entry["id"] = PRIMARY_WEB_SEARCH_MODEL
+                entry["name"] = PRIMARY_WEB_SEARCH_MODEL
+                primary_entry = entry
+            continue
+        if low in seen:
+            continue
+        seen.add(low)
+        fallbacks.append(entry)
+
+    if primary_entry is None:
+        primary_entry = {
+            "id": PRIMARY_WEB_SEARCH_MODEL,
+            "name": PRIMARY_WEB_SEARCH_MODEL,
+            "input_price": 0.0,
+            "cached_input_price": 0.0,
+            "output_price": 0.0,
+        }
+
+    return [primary_entry, *fallbacks[:4]]
+
+
+def get_web_search_models() -> List[Dict[str, Any]]:
+    settings = get_app_settings()
+    raw = settings.get("web_search_models") or "[]"
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        parsed = []
+    return normalize_web_search_models(parsed if isinstance(parsed, list) else [])
+
+
+def save_web_search_models(models: Optional[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+    normalized = normalize_web_search_models(models)
+    save_app_settings({"web_search_models": json.dumps(normalized)})
+    return normalized
 
 
 def _normalize_model_entry(m: Dict[str, Any]) -> Dict[str, Any]:
@@ -310,16 +431,18 @@ def get_providers() -> List[Dict[str, Any]]:
         is_enabled = bool(r["is_enabled"])
         is_verified = BackgroundModelSyncer.is_provider_verified(pid) if has_api_key else False
         verified_ids = BackgroundModelSyncer.get_verified_model_ids(pid) if is_verified else set()
-        effective_models = [m for m in models if m.get("id") in verified_ids] if is_verified else []
+        sync_status, sync_error = BackgroundModelSyncer.get_sync_status(pid, has_api_key=has_api_key, is_enabled=is_enabled)
         providers.append({
             "id": pid,
             "name": pname,
             "base_url": r["base_url"],
             "has_api_key": has_api_key,
             "is_enabled": is_enabled,
-            "models": effective_models,
+            "models": models,
             "fetched_model_ids": sorted(list(verified_ids)),
-            "is_accessible": bool(is_enabled and has_api_key and is_verified and len(effective_models) > 0),
+            "is_accessible": bool(is_enabled and has_api_key and is_verified and len(models) > 0),
+            "sync_status": sync_status,
+            "sync_error": sync_error,
         })
     return providers
 
@@ -330,7 +453,7 @@ def save_providers(providers: List[Dict[str, Any]]):
     conn = get_connection()
     cursor = conn.cursor()
 
-    cursor.execute("SELECT id, name, models_json FROM providers")
+    cursor.execute("SELECT id, name, base_url, models_json FROM providers")
     existing_rows = {r["id"]: r for r in cursor.fetchall()}
 
     for p in providers:
@@ -355,24 +478,24 @@ def save_providers(providers: List[Dict[str, Any]]):
             set_api_key_in_env(clean_name, default_env_key)
 
         normalized_models = [_normalize_model_entry(m) for m in (p.get("models") or []) if m.get("id")]
-        has_api_key = bool(get_api_key_from_env(clean_name))
-        if (
-            not normalized_models
-            and has_api_key
-            and not p.get("clear_api_key")
-            and not BackgroundModelSyncer.is_provider_verified(pid)
-            and old_row
-            and old_row["models_json"]
-        ):
-            # Preserve existing stored models in DB if provider simply hasn't finished background verification yet
-            models_json_str = old_row["models_json"]
-        elif not has_api_key:
-            models_json_str = "[]"
-        else:
+        if p.get("models") is not None:
             models_json_str = json.dumps(normalized_models)
+        elif old_row and old_row["models_json"]:
+            models_json_str = old_row["models_json"]
+        else:
+            models_json_str = "[]"
 
         is_native_sdk = pid.lower() in ("anthropic", "gemini") or clean_name.lower() in ("anthropic", "gemini")
         base_url_val = "" if is_native_sdk else p.get("base_url", "")
+
+        key_changed = (raw_new_key is not None and str(raw_new_key).strip() != "") or bool(p.get("clear_api_key"))
+        url_changed = bool(old_row and not is_native_sdk and (base_url_val != old_row["base_url"]))
+        if key_changed or url_changed:
+            BackgroundModelSyncer.clear_provider_verified(pid)
+            if p.get("clear_api_key"):
+                BackgroundModelSyncer.set_sync_status(pid, "no_key", "NO API KEY")
+            else:
+                BackgroundModelSyncer.set_sync_status(pid, "checking", "CHECKING...")
 
         # Never store api_key in the database (always '')
         cursor.execute(
@@ -532,6 +655,7 @@ def get_conversation(conv_id: str) -> Optional[Dict[str, Any]]:
         "created_at": conv_row["created_at"],
         "updated_at": conv_row["updated_at"],
         "messages": messages,
+        "token_stats": get_token_stats(conv_id),
     }
 
 
@@ -555,7 +679,86 @@ def delete_conversation(conv_id: str):
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute("DELETE FROM messages WHERE conversation_id = ?", (conv_id,))
+    cursor.execute("DELETE FROM token_ledger WHERE conversation_id = ?", (conv_id,))
     cursor.execute("DELETE FROM conversations WHERE id = ?", (conv_id,))
+    conn.commit()
+    conn.close()
+
+
+def record_google_search_requests(query_count: int):
+    """Increment the durable monthly Google Search request counter (actual queries run by Flash Lite)."""
+    count = max(0, int(query_count or 0))
+    if count <= 0:
+        return
+    month_key = time.strftime("%Y-%m")
+    now = time.time()
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        INSERT INTO google_search_usage (month_key, request_count, updated_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(month_key) DO UPDATE SET
+            request_count = request_count + excluded.request_count,
+            updated_at = excluded.updated_at
+        """,
+        (month_key, count, now),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_google_search_request_totals() -> Dict[str, Any]:
+    """Return current month and all-time actual Google Search request counts."""
+    month_key = time.strftime("%Y-%m")
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT month_key, request_count FROM google_search_usage")
+    rows = cursor.fetchall()
+    conn.close()
+    monthly = 0
+    all_time = 0
+    for r in rows:
+        cnt = int(r["request_count"] or 0)
+        all_time += cnt
+        if r["month_key"] == month_key:
+            monthly = cnt
+    return {"month": month_key, "monthly": monthly, "all_time": all_time}
+
+
+def record_token_usage(
+    conversation_id: str,
+    provider_id: str,
+    model_id: str,
+    prompt_tokens: int,
+    completion_tokens: int,
+    cached_tokens: int = 0,
+    google_search_requests: int = 0,
+):
+    search_cnt = max(0, int(google_search_requests or 0))
+    if not conversation_id or (prompt_tokens == 0 and completion_tokens == 0 and cached_tokens == 0 and search_cnt == 0):
+        return
+    conn = get_connection()
+    cursor = conn.cursor()
+    now = time.time()
+    cursor.execute(
+        """
+        INSERT INTO token_ledger (
+            conversation_id, provider_id, model_id,
+            prompt_tokens, completion_tokens, cached_tokens, google_search_requests, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            conversation_id,
+            provider_id or "",
+            model_id or "",
+            prompt_tokens,
+            completion_tokens,
+            cached_tokens,
+            search_cnt,
+            now,
+        ),
+    )
     conn.commit()
     conn.close()
 
@@ -606,6 +809,25 @@ def add_message(
     # Touch conversation updated_at
     cursor.execute("UPDATE conversations SET updated_at = ? WHERE id = ?", (now, conversation_id))
 
+    if prompt_tokens > 0 or completion_tokens > 0 or cached_tokens > 0:
+        cursor.execute(
+            """
+            INSERT INTO token_ledger (
+                conversation_id, provider_id, model_id,
+                prompt_tokens, completion_tokens, cached_tokens, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                conversation_id,
+                provider_id or "",
+                model_id or "",
+                prompt_tokens,
+                completion_tokens,
+                cached_tokens,
+                now,
+            ),
+        )
+
     conn.commit()
     conn.close()
 
@@ -648,6 +870,14 @@ def delete_messages_from(conversation_id: str, from_msg_id: str, include_self: b
         (from_msg_id, conversation_id),
     )
     target = cursor.fetchone()
+    if not target and (from_msg_id.startswith("user_temp_") or not from_msg_id):
+        # Fallback: if client passed a temporary user message ID, match the latest user message
+        cursor.execute(
+            "SELECT rowid, id, created_at FROM messages WHERE conversation_id = ? AND role = 'user' ORDER BY rowid DESC LIMIT 1",
+            (conversation_id,),
+        )
+        target = cursor.fetchone()
+
     if target:
         target_rowid = target["rowid"]
         target_time = target["created_at"]
@@ -671,22 +901,67 @@ def delete_messages_from(conversation_id: str, from_msg_id: str, include_self: b
 def get_token_stats(conversation_id: str) -> Dict[str, Any]:
     """
     Returns aggregated token stats and estimated cost per model and grand total for the conversation.
+    Uses token_ledger so token and cost counts are never lost when branching, editing, or regenerating.
     """
+    global_search_totals = get_google_search_request_totals()
+    if not conversation_id:
+        return {
+            "per_model": [],
+            "grand_total": {
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "cached_tokens": 0,
+                "cache_miss_tokens": 0,
+                "cache_hit_rate": 0.0,
+                "total_tokens": 0,
+                "total_cost": 0.0,
+                "google_search_requests": 0,
+            },
+            "google_search_totals": global_search_totals,
+        }
+
     conn = get_connection()
     cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT COALESCE(SUM(google_search_requests), 0) as conv_searches
+        FROM token_ledger
+        WHERE conversation_id = ?
+    """,
+        (conversation_id,),
+    )
+    conv_search_row = cursor.fetchone()
+    conv_search_requests = int((conv_search_row["conv_searches"] if conv_search_row else 0) or 0)
+
     cursor.execute(
         """
         SELECT model_id, provider_id,
                SUM(prompt_tokens) as total_in,
                SUM(completion_tokens) as total_out,
                SUM(cached_tokens) as total_cached
-        FROM messages
-        WHERE conversation_id = ? AND role = 'assistant' AND (model_id != '' OR prompt_tokens > 0)
+        FROM token_ledger
+        WHERE conversation_id = ? AND (model_id != '' OR prompt_tokens > 0)
         GROUP BY model_id, provider_id
     """,
         (conversation_id,),
     )
     rows = cursor.fetchall()
+
+    # Fallback to messages table if token_ledger has no records for this conversation
+    if not rows:
+        cursor.execute(
+            """
+            SELECT model_id, provider_id,
+                   SUM(prompt_tokens) as total_in,
+                   SUM(completion_tokens) as total_out,
+                   SUM(cached_tokens) as total_cached
+            FROM messages
+            WHERE conversation_id = ? AND role = 'assistant' AND (model_id != '' OR prompt_tokens > 0)
+            GROUP BY model_id, provider_id
+        """,
+            (conversation_id,),
+        )
+        rows = cursor.fetchall()
 
     cursor.execute("SELECT id, models_json FROM providers")
     prov_rows = cursor.fetchall()
@@ -706,10 +981,56 @@ def get_token_stats(conversation_id: str) -> Dict[str, Any]:
                         "cached_input_price": float(m.get("cached_input_price") or 0.0),
                         "output_price": float(m.get("output_price") or 0.0),
                     }
+                    clean_id = strip_model_prefix(mid)
                     pricing_map[(pid, mid)] = rates
+                    pricing_map[(pid, clean_id)] = rates
                     model_fallback_map[mid] = rates
+                    model_fallback_map[clean_id] = rates
         except Exception:
             pass
+
+    for wm in get_web_search_models():
+        mid = wm.get("id")
+        if not mid:
+            continue
+        clean_id = strip_model_prefix(mid)
+        rates = {
+            "input_price": float(wm.get("input_price") or 0.0),
+            "cached_input_price": float(wm.get("cached_input_price") or 0.0),
+            "output_price": float(wm.get("output_price") or 0.0),
+        }
+        has_nonzero = any(rates.values())
+        # Map under 'websearch' provider (and fill missing/zero 'gemini' or global fallback rates)
+        existing_gem = pricing_map.get(("gemini", clean_id))
+        if has_nonzero or not existing_gem:
+            pricing_map[("websearch", mid)] = rates
+            pricing_map[("websearch", clean_id)] = rates
+        else:
+            pricing_map[("websearch", mid)] = existing_gem
+            pricing_map[("websearch", clean_id)] = existing_gem
+        if not existing_gem or (has_nonzero and not any(existing_gem.values())):
+            pricing_map[("gemini", clean_id)] = rates
+        if clean_id not in model_fallback_map or (has_nonzero and not any(model_fallback_map[clean_id].values())):
+            model_fallback_map[clean_id] = rates
+
+    # Consolidate models that only differ by prefix (e.g. 'models/gemini-2.5-flash' vs 'gemini-2.5-flash')
+    aggregated_models: Dict[tuple[str, str], Dict[str, Any]] = {}
+    for r in rows:
+        raw_mid = r["model_id"] or "default"
+        pid = r["provider_id"] or "unknown"
+        clean_mid = strip_model_prefix(raw_mid)
+        key = (pid, clean_mid)
+        if key not in aggregated_models:
+            aggregated_models[key] = {
+                "model_id": clean_mid,
+                "provider_id": pid,
+                "total_in": 0,
+                "total_out": 0,
+                "total_cached": 0,
+            }
+        aggregated_models[key]["total_in"] += (r["total_in"] or 0)
+        aggregated_models[key]["total_out"] += (r["total_out"] or 0)
+        aggregated_models[key]["total_cached"] += (r["total_cached"] or 0)
 
     per_model = []
     grand_in = 0
@@ -717,20 +1038,22 @@ def get_token_stats(conversation_id: str) -> Dict[str, Any]:
     grand_cached = 0
     grand_cost = 0.0
 
-    for r in rows:
-        mid = r["model_id"] or "default"
-        pid = r["provider_id"] or "unknown"
-        tin = r["total_in"] or 0
-        tout = r["total_out"] or 0
-        tcached = r["total_cached"] or 0
+    for (pid, mid), item in aggregated_models.items():
+        tin = item["total_in"]
+        tout = item["total_out"]
+        tcached = item["total_cached"]
         tmiss = max(0, tin - tcached)
         hit_rate = round((tcached / tin * 100), 1) if tin > 0 else 0.0
 
-        rates = pricing_map.get((pid, mid)) or model_fallback_map.get(mid) or {
-            "input_price": 0.0,
-            "cached_input_price": 0.0,
-            "output_price": 0.0,
-        }
+        rates = (
+            pricing_map.get((pid, mid))
+            or model_fallback_map.get(mid)
+            or {
+                "input_price": 0.0,
+                "cached_input_price": 0.0,
+                "output_price": 0.0,
+            }
+        )
         in_price = rates["input_price"]
         cached_price = rates["cached_input_price"]
         out_price = rates["output_price"]
@@ -772,7 +1095,9 @@ def get_token_stats(conversation_id: str) -> Dict[str, Any]:
             "cache_hit_rate": grand_hit_rate,
             "total_tokens": grand_in + grand_out,
             "total_cost": grand_cost,
+            "google_search_requests": conv_search_requests,
         },
+        "google_search_totals": global_search_totals,
     }
 
 

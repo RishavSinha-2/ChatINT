@@ -100,10 +100,11 @@
       </div>
 
       <div class="modal-body">
-        <!-- Exactly Two Master Tabs: General & Providers -->
+        <!-- Master Tabs: General, Providers, Web Search -->
         <div class="master-settings-tabs">
           <button class="master-tab-btn active" id="master-tab-general">General</button>
           <button class="master-tab-btn" id="master-tab-providers">Providers</button>
+          <button class="master-tab-btn" id="master-tab-websearch">Web Search</button>
         </div>
 
         <div id="settings-tab-content">
@@ -202,7 +203,7 @@
         <label class="settings-label">Output Price ($ per 1M tokens)</label>
         <input type="number" step="any" min="0" class="settings-input" id="model-output-price" value="0">
       </div>
-      <label class="model-thinking-toggle-row">
+      <label class="model-thinking-toggle-row" id="model-thinking-config-row">
         <input type="checkbox" id="model-supports-thinking-check">
         <span>Supports Thinking / Reasoning</span>
       </label>

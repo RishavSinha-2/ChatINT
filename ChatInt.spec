@@ -3,12 +3,19 @@ from PyInstaller.utils.hooks import collect_all, collect_submodules, copy_metada
 
 datas = [('src/chatint/ui', 'chatint/ui')]
 binaries = []
-hiddenimports = []
+hiddenimports = ['chatint.web_search_tool']
 
 for pkg in ('webview', 'anthropic', 'openai', 'google.genai', 'google.auth', 'httpx2'):
     try:
         tmp_ret = collect_all(pkg)
-        datas += tmp_ret[0]
+        # Filter datas: do not extract thousands of python source files, docs, or tests to disk.
+        # Python modules belong in the internal pyz bytecode archive (via hiddenimports).
+        clean_datas = [
+            item for item in tmp_ret[0]
+            if not item[0].lower().endswith(('.py', '.pyc', '.pyi', '.md', '.txt', '.rst', '.keep', 'license', 'notice'))
+            and 'test' not in item[0].lower()
+        ]
+        datas += clean_datas
         binaries += tmp_ret[1]
         hiddenimports += tmp_ret[2]
     except Exception:
@@ -30,9 +37,9 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=['pytest', 'unittest', 'test', 'tkinter'],
     noarchive=False,
-    optimize=0,
+    optimize=1,
 )
 pyz = PYZ(a.pure)
 
@@ -46,7 +53,7 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    upx=False,
     upx_exclude=[],
     runtime_tmpdir=None,
     console=False,
@@ -57,3 +64,4 @@ exe = EXE(
     entitlements_file=None,
     icon=['logo.ico'],
 )
+

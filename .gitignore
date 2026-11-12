@@ -13,3 +13,5 @@ wheels/
 .env
 
 data/
+me.md
+bugs.md

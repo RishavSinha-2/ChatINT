@@ -3,14 +3,65 @@
  */
 
 (function () {
+  const THINKING_LEVELS = [
+    { value: "none", label: "None" },
+    { value: "minimal", label: "Minimal" },
+    { value: "low", label: "Low" },
+    { value: "medium", label: "Medium" },
+    { value: "high", label: "High" },
+    { value: "xhigh", label: "XHigh" },
+    { value: "max", label: "Max" },
+  ];
+  const VALID_THINKING_LEVELS = new Set(THINKING_LEVELS.map((t) => t.value));
+  const stripModelPrefix = (id) => (id && id.startsWith("models/") ? id.slice(7) : id || "");
+
+  const PRIMARY_WEB_SEARCH_MODEL = "gemini-3.1-flash-lite";
+  const normalizeWebSearchModelsClient = (list) => {
+    let primary = null;
+    const fallbacks = [];
+    const seen = new Set();
+    for (const raw of Array.isArray(list) ? list : []) {
+      if (!raw || !raw.id) continue;
+      const mid = stripModelPrefix(String(raw.id).trim());
+      if (!mid) continue;
+      const entry = {
+        id: mid,
+        name: stripModelPrefix(String(raw.name || mid).trim()) || mid,
+        input_price: Math.max(0, Number(raw.input_price || 0)),
+        cached_input_price: Math.max(0, Number(raw.cached_input_price || 0)),
+        output_price: Math.max(0, Number(raw.output_price || 0)),
+      };
+      if (mid.toLowerCase() === PRIMARY_WEB_SEARCH_MODEL) {
+        if (!primary) primary = { ...entry, id: PRIMARY_WEB_SEARCH_MODEL, name: PRIMARY_WEB_SEARCH_MODEL };
+        continue;
+      }
+      if (!seen.has(mid.toLowerCase())) {
+        seen.add(mid.toLowerCase());
+        fallbacks.push(entry);
+      }
+    }
+    if (!primary) {
+      primary = {
+        id: PRIMARY_WEB_SEARCH_MODEL,
+        name: PRIMARY_WEB_SEARCH_MODEL,
+        input_price: 0,
+        cached_input_price: 0,
+        output_price: 0,
+      };
+    }
+    return [primary, ...fallbacks.slice(0, 4)];
+  };
+
   // Global State
   const state = {
     providers: [],
+    webSearchModels: normalizeWebSearchModelsClient([]),
     settings: {
       theme: "dark",
       global_system_prompt: "You are a helpful, brilliant, and precise assistant.",
       default_provider: "openai",
       default_model: "gpt-4o",
+      default_thinking: "medium",
     },
     conversations: [],
     tabs: [],
@@ -21,6 +72,7 @@
     activeProviderId: null,
     activeConvSettingsId: null,
     activeExportConvId: null,
+    googleSearchTotals: { month: "", monthly: 0, all_time: 0 },
   };
 
   // Configure marked for Markdown rendering
@@ -48,6 +100,7 @@
     settingsModal: document.getElementById("settings-modal"),
     masterTabGeneral: document.getElementById("master-tab-general"),
     masterTabProviders: document.getElementById("master-tab-providers"),
+    masterTabWebSearch: document.getElementById("master-tab-websearch"),
     settingsTabContent: document.getElementById("settings-tab-content"),
     saveSettingsBtn: document.getElementById("save-settings-btn"),
     convSettingsModal: document.getElementById("conv-settings-modal"),
@@ -68,6 +121,7 @@
     modelCachedPrice: document.getElementById("model-cached-price"),
     modelOutputPrice: document.getElementById("model-output-price"),
     modelSupportsThinkingCheck: document.getElementById("model-supports-thinking-check"),
+    modelThinkingConfigRow: document.getElementById("model-thinking-config-row"),
     cancelModelConfigBtn: document.getElementById("cancel-model-config-btn"),
     saveModelConfigBtn: document.getElementById("save-model-config-btn"),
     appDialogModal: document.getElementById("app-dialog-modal"),
@@ -222,12 +276,18 @@
 
   // Event Poller for real-time events from Python bridge (chunks, naming, model updates)
   let isPollingEvents = false;
+  let isPageUnloading = false;
+  window.addEventListener("beforeunload", () => {
+    isPageUnloading = true;
+  });
+
   function startEventPolling() {
     setInterval(async () => {
-      if (isPollingEvents) return;
+      if (isPollingEvents || isPageUnloading) return;
       isPollingEvents = true;
       try {
         const events = await callApi("get_pending_events");
+        if (isPageUnloading) return;
         if (Array.isArray(events) && events.length > 0) {
           for (const ev of events) {
             if (window.ChatIntUI && window.ChatIntUI.onStreamEvent) {
@@ -258,6 +318,12 @@
         state.providers = data.providers || [];
         state.settings = { ...state.settings, ...(data.settings || {}) };
         state.conversations = data.conversations || [];
+        if (data.google_search_totals) {
+          state.googleSearchTotals = data.google_search_totals;
+        }
+        if (Array.isArray(data.web_search_models)) {
+          state.webSearchModels = normalizeWebSearchModelsClient(data.web_search_models);
+        }
 
         applyTheme(state.settings.theme || "dark");
 
@@ -268,21 +334,7 @@
         // Restore tabs state
         const savedTabs = data.tabs_state;
         if (savedTabs && Array.isArray(savedTabs.tabs) && savedTabs.tabs.length > 0) {
-          state.tabs = savedTabs.tabs.map((t) => ({
-            id: t.id || "tab_" + Date.now() + "_" + Math.random().toString(36).substr(2, 4),
-            conversationId: t.conversationId || null,
-            title: t.title || "New Chat",
-            systemPrompt: t.systemPrompt || "",
-            maxContextMessages: t.maxContextMessages || 30,
-            providerId: t.providerId || "",
-            modelId: t.modelId || "",
-            thinkingLevel: t.thinkingLevel || "none",
-            isStreaming: false,
-            streamingContent: "",
-            streamingThinking: "",
-            hasAutoCollapsedThinking: false,
-            tokenStats: null,
-          }));
+          state.tabs = savedTabs.tabs.map((t) => createTabObject(t));
           const validTabIds = new Set(state.tabs.map((t) => t.id));
           state.activeTabId = validTabIds.has(savedTabs.activeTabId) ? savedTabs.activeTabId : state.tabs[0].id;
           const seenSplitIds = new Set();
@@ -298,27 +350,7 @@
           state.splitTabIds = validSplitIds.length > 0 ? validSplitIds : [state.activeTabId];
         } else {
           // Initialize first tab (draft state, no DB entry yet)
-          const activeProviders = getDropdownProviders();
-          const defProvider = activeProviders.find((p) => p.id === state.settings.default_provider) || activeProviders[0] || null;
-          const defModelObj = defProvider?.models?.find((m) => m.id === state.settings.default_model) || defProvider?.models?.[0] || null;
-          const defModel = defModelObj?.id || "";
-          const supportsThinking = defModelObj?.supports_thinking ? "medium" : "none";
-
-          const initialTab = {
-            id: "tab_" + Date.now() + "_" + Math.random().toString(36).substr(2, 4),
-            conversationId: null,
-            title: "New Chat",
-            systemPrompt: "",
-            maxContextMessages: 30,
-            providerId: defProvider ? defProvider.id : "",
-            modelId: defModel,
-            thinkingLevel: supportsThinking,
-            isStreaming: false,
-            streamingContent: "",
-            streamingThinking: "",
-            hasAutoCollapsedThinking: false,
-            tokenStats: null,
-          };
+          const initialTab = createTabObject();
           state.tabs = [initialTab];
           state.activeTabId = initialTab.id;
           state.splitTabIds = [initialTab.id];
@@ -364,9 +396,12 @@
         title: t.title,
         systemPrompt: t.systemPrompt || "",
         maxContextMessages: t.maxContextMessages || 30,
-        providerId: t.providerId,
-        modelId: t.modelId,
-        thinkingLevel: t.thinkingLevel,
+        providerId: t._usingTempFallback ? (t._preferredProviderId || t.providerId) : t.providerId,
+        modelId: t._usingTempFallback ? (t._preferredModelId || t.modelId) : t.modelId,
+        thinkingLevel: t._preferredThinkingLevel || t.thinkingLevel,
+        userSelectedModel: Boolean(t._userSelectedModel),
+        userSelectedThinking: Boolean(t._userSelectedThinking),
+        webSearchEnabled: Boolean(t.webSearchEnabled),
       })),
       activeTabId: state.activeTabId,
       splitTabIds: state.splitTabIds,
@@ -400,42 +435,69 @@
     });
   }
 
-  // Tab Operations
-  async function createNewTab(conversationId = null, addToSplit = false) {
+  function getDefaultThinkingLevel() {
+    const val = state.settings.default_thinking;
+    return VALID_THINKING_LEVELS.has(val) ? val : "medium";
+  }
+
+  function createTabObject(overrides = {}) {
     const activeProviders = getDropdownProviders();
-    const defProvider = activeProviders.find((p) => p.id === state.settings.default_provider) || activeProviders[0] || null;
-    const defModelObj = defProvider?.models?.find((m) => m.id === state.settings.default_model) || defProvider?.models?.[0] || null;
-    const defModel = defModelObj?.id || "";
-    const supportsThinking = defModelObj?.supports_thinking ? "medium" : "none";
+    const defProvider =
+      activeProviders.find((p) => p.id === state.settings.default_provider) ||
+      activeProviders[0] ||
+      state.providers.find((p) => p.id === state.settings.default_provider) ||
+      null;
+    const defModelObj =
+      defProvider?.models?.find((m) => m.id === state.settings.default_model) ||
+      defProvider?.models?.[0] ||
+      null;
 
-    let title = "New Chat";
-    let systemPrompt = "";
-    let maxContextMessages = 30;
-    if (conversationId) {
-      const existing = state.conversations.find((c) => c.id === conversationId);
-      if (existing) {
-        title = existing.title;
-        systemPrompt = existing.system_prompt || "";
-        maxContextMessages = existing.max_context_messages || 30;
-      }
-    }
+    const isUnconfiguredDraft = !overrides.conversationId && !overrides.userSelectedModel;
+    const prefProvId = isUnconfiguredDraft
+      ? (state.settings.default_provider || "")
+      : (overrides.providerId || state.settings.default_provider || "");
+    const prefModelId = isUnconfiguredDraft
+      ? (state.settings.default_model || defModelObj?.id || "")
+      : (overrides.modelId || state.settings.default_model || defModelObj?.id || "");
+    const prefThinking =
+      overrides.userSelectedThinking || (overrides.conversationId && VALID_THINKING_LEVELS.has(overrides.thinkingLevel))
+        ? (overrides.thinkingLevel || getDefaultThinkingLevel())
+        : getDefaultThinkingLevel();
 
-    const prevActiveTabId = state.activeTabId;
-    const newTab = {
-      id: "tab_" + Date.now() + "_" + Math.random().toString(36).substr(2, 4),
-      conversationId: conversationId, // null for draft chats until first prompt is answered or settings saved
-      title: title,
-      systemPrompt: systemPrompt,
-      maxContextMessages: maxContextMessages,
-      providerId: defProvider ? defProvider.id : "",
-      modelId: defModel,
-      thinkingLevel: supportsThinking,
+    return {
+      id: overrides.id || "tab_" + Date.now() + "_" + Math.random().toString(36).substr(2, 4),
+      conversationId: overrides.conversationId || null,
+      title: overrides.title || "New Chat",
+      systemPrompt: overrides.systemPrompt || "",
+      maxContextMessages: overrides.maxContextMessages || 30,
+      providerId: isUnconfiguredDraft ? "" : (overrides.providerId || ""),
+      modelId: isUnconfiguredDraft ? "" : (overrides.modelId || ""),
+      thinkingLevel: prefThinking,
+      _preferredProviderId: prefProvId,
+      _preferredModelId: prefModelId,
+      _preferredThinkingLevel: prefThinking,
+      _userSelectedModel: Boolean(overrides.userSelectedModel),
+      _userSelectedThinking: Boolean(overrides.userSelectedThinking),
+      _usingTempFallback: false,
+      webSearchEnabled: Boolean(overrides.webSearchEnabled),
       isStreaming: false,
       streamingContent: "",
       streamingThinking: "",
       hasAutoCollapsedThinking: false,
       tokenStats: null,
     };
+  }
+
+  // Tab Operations
+  async function createNewTab(conversationId = null, addToSplit = false) {
+    const existing = conversationId ? state.conversations.find((c) => c.id === conversationId) : null;
+    const prevActiveTabId = state.activeTabId;
+    const newTab = createTabObject({
+      conversationId,
+      title: existing ? existing.title : "New Chat",
+      systemPrompt: existing ? (existing.system_prompt || "") : "",
+      maxContextMessages: existing ? (existing.max_context_messages || 30) : 30,
+    });
 
     state.tabs.push(newTab);
     state.activeTabId = newTab.id;
@@ -788,13 +850,7 @@
             <i data-lucide="brain" style="width: 13px; height: 13px; flex-shrink: 0;"></i>
             <span class="thinking-select-label" id="thinking-label-${tab.id}"></span>
             <select class="thinking-dropdown" id="thinking-dropdown-${tab.id}">
-              <option value="none">Thinking: None</option>
-              <option value="minimal">Thinking: Minimal</option>
-              <option value="low">Thinking: Low</option>
-              <option value="medium">Thinking: Medium</option>
-              <option value="high">Thinking: High</option>
-              <option value="xhigh">Thinking: XHigh</option>
-              <option value="max">Thinking: Max</option>
+              ${THINKING_LEVELS.map((lvl) => `<option value="${lvl.value}">Thinking: ${lvl.label}</option>`).join("")}
             </select>
           </div>
         </div>
@@ -816,7 +872,10 @@
           <textarea class="chat-input" id="input-${tab.id}" rows="1" placeholder="Ask anything..."></textarea>
           <div class="input-controls">
             <div class="input-model-hint" id="hint-${tab.id}">
-              <span>Press Enter to send</span>
+              <button type="button" class="web-search-toggle-btn" id="web-search-btn-${tab.id}" aria-pressed="false" title="Toggle Web Search">
+                <i data-lucide="globe" style="width: 13px; height: 13px;"></i>
+                <span>Web Search</span>
+              </button>
             </div>
             <div style="display: flex; gap: 6px;">
               <button class="stop-btn" id="stop-btn-${tab.id}" style="display: none;" title="Stop Generating">
@@ -915,61 +974,100 @@
     const activeProviders = getDropdownProviders();
 
     if (activeProviders.length === 0) {
-      tab.providerId = "";
-      tab.modelId = "";
-      tab.thinkingLevel = "none";
+      // Wait for background sync without wiping tab's preferred provider/model/thinking
       thinkingWrapper.style.display = "none";
       syncLabels();
       return;
-    } else {
-      let matched = false;
-      activeProviders.forEach((prov) => {
-        const fetchedIds = Array.isArray(prov.fetched_model_ids) ? new Set(prov.fetched_model_ids) : null;
-        const verifiedModels = (prov.models || []).filter((m) => !fetchedIds || fetchedIds.has(m.id)).slice(0, 5);
-        if (verifiedModels.length === 0) return;
+    }
 
-        const optgroup = document.createElement("optgroup");
-        optgroup.label = prov.name;
-        verifiedModels.forEach((m) => {
-          const opt = document.createElement("option");
-          opt.value = `${prov.id}::${m.id}`;
-          opt.textContent = m.name || m.id;
-          if (prov.id === tab.providerId && m.id === tab.modelId) {
-            opt.selected = true;
-            matched = true;
-          }
-          optgroup.appendChild(opt);
-        });
-        modelDropdown.appendChild(optgroup);
-      });
+    const getVerifiedModels = (prov) => {
+      const fetchedIds = Array.isArray(prov?.fetched_model_ids) ? new Set(prov.fetched_model_ids) : null;
+      return (prov?.models || []).filter((m) => !fetchedIds || fetchedIds.has(m.id)).slice(0, 5);
+    };
 
-      if (!matched) {
-        const fallbackProv = activeProviders.find((p) => p.id === state.settings.default_provider) || activeProviders[0];
-        const fetchedIds = Array.isArray(fallbackProv?.fetched_model_ids) ? new Set(fallbackProv.fetched_model_ids) : null;
-        const verifiedModels = (fallbackProv?.models || []).filter((m) => !fetchedIds || fetchedIds.has(m.id)).slice(0, 5);
-        const fallbackModel = verifiedModels.find((m) => m.id === state.settings.default_model) || verifiedModels[0];
-        if (fallbackProv && fallbackModel) {
-          tab.providerId = fallbackProv.id;
-          tab.modelId = fallbackModel.id;
-          modelDropdown.value = `${tab.providerId}::${tab.modelId}`;
-        } else {
-          tab.providerId = "";
-          tab.modelId = "";
-        }
+    const desiredProvId = tab.isStreaming
+      ? (tab.providerId || state.settings.default_provider)
+      : (tab._userSelectedModel || tab.conversationId
+          ? (tab._preferredProviderId || tab.providerId || state.settings.default_provider)
+          : state.settings.default_provider);
+    const desiredModelId = tab.isStreaming
+      ? (tab.modelId || state.settings.default_model)
+      : (tab._userSelectedModel || tab.conversationId
+          ? (tab._preferredModelId || tab.modelId || state.settings.default_model)
+          : state.settings.default_model);
+
+    let selectedProv = null;
+    let selectedModel = null;
+    let usingTempFallback = false;
+
+    const preferredProv = activeProviders.find((p) => p.id === desiredProvId);
+    if (preferredProv) {
+      const pModels = getVerifiedModels(preferredProv);
+      if (pModels.length > 0) {
+        selectedProv = preferredProv;
+        selectedModel = pModels.find((m) => m.id === desiredModelId) || pModels[0];
       }
     }
 
-    const prov = state.providers.find((p) => p.id === tab.providerId);
-    const mod = prov?.models?.find((m) => m.id === tab.modelId);
-    const validEfforts = new Set(["none", "minimal", "low", "medium", "high", "xhigh", "max"]);
-    if (mod && mod.supports_thinking) {
-      thinkingWrapper.style.display = "flex";
-      thinkingDropdown.value = validEfforts.has(tab.thinkingLevel) ? tab.thinkingLevel : "medium";
-      tab.thinkingLevel = thinkingDropdown.value;
-    } else {
-      thinkingWrapper.style.display = "none";
-      tab.thinkingLevel = "none";
+    if (!selectedProv || !selectedModel) {
+      const fbProv = activeProviders.find((p) => p.id === state.settings.default_provider) || activeProviders[0];
+      const fbModels = getVerifiedModels(fbProv);
+      if (fbProv && fbModels.length > 0) {
+        selectedProv = fbProv;
+        selectedModel = fbModels.find((m) => m.id === state.settings.default_model) || fbModels[0];
+        usingTempFallback = Boolean(desiredProvId && desiredProvId !== selectedProv.id);
+      }
     }
+
+    activeProviders.forEach((prov) => {
+      const verifiedModels = getVerifiedModels(prov);
+      if (verifiedModels.length === 0) return;
+
+      const optgroup = document.createElement("optgroup");
+      optgroup.label = prov.name;
+      verifiedModels.forEach((m) => {
+        const opt = document.createElement("option");
+        opt.value = `${prov.id}::${m.id}`;
+        opt.textContent = m.name || m.id;
+        if (selectedProv && selectedModel && prov.id === selectedProv.id && m.id === selectedModel.id) {
+          opt.selected = true;
+        }
+        optgroup.appendChild(opt);
+      });
+      modelDropdown.appendChild(optgroup);
+    });
+
+    if (selectedProv && selectedModel) {
+      tab.providerId = selectedProv.id;
+      tab.modelId = selectedModel.id;
+      tab._usingTempFallback = usingTempFallback;
+      modelDropdown.value = `${selectedProv.id}::${selectedModel.id}`;
+    } else {
+      tab.providerId = "";
+      tab.modelId = "";
+      tab._usingTempFallback = true;
+    }
+
+    const findModelObj = (pid, mid) => state.providers.find((p) => p.id === pid)?.models?.find((m) => m.id === mid);
+    const applyModelThinking = (modObj) => {
+      if (modObj && modObj.supports_thinking) {
+        const desiredThink = tab._userSelectedThinking
+          ? tab._preferredThinkingLevel
+          : (tab.conversationId && VALID_THINKING_LEVELS.has(tab._preferredThinkingLevel)
+              ? tab._preferredThinkingLevel
+              : getDefaultThinkingLevel());
+        thinkingWrapper.style.display = "flex";
+        thinkingDropdown.value = VALID_THINKING_LEVELS.has(desiredThink) ? desiredThink : getDefaultThinkingLevel();
+        tab.thinkingLevel = thinkingDropdown.value;
+      } else {
+        // Hide without overwriting _preferredThinkingLevel so preferred level applies when a thinking model loads
+        thinkingWrapper.style.display = "none";
+        thinkingDropdown.value = "none";
+        tab.thinkingLevel = "none";
+      }
+    };
+
+    applyModelThinking(findModelObj(tab.providerId, tab.modelId));
     syncLabels();
 
     modelDropdown.onchange = () => {
@@ -978,26 +1076,147 @@
       const [provId, mId] = val.split("::");
       tab.providerId = provId;
       tab.modelId = mId;
+      tab._preferredProviderId = provId;
+      tab._preferredModelId = mId;
+      tab._userSelectedModel = true;
+      tab._usingTempFallback = false;
 
-      const p = state.providers.find((item) => item.id === tab.providerId);
-      const m = p?.models?.find((item) => item.id === tab.modelId);
-      if (m && m.supports_thinking) {
-        thinkingWrapper.style.display = "flex";
-        thinkingDropdown.value = validEfforts.has(tab.thinkingLevel) ? tab.thinkingLevel : "medium";
-        tab.thinkingLevel = thinkingDropdown.value;
-      } else {
-        thinkingWrapper.style.display = "none";
-        tab.thinkingLevel = "none";
-      }
+      applyModelThinking(findModelObj(tab.providerId, tab.modelId));
       syncLabels();
       persistTabsState();
     };
 
     thinkingDropdown.onchange = () => {
       tab.thinkingLevel = thinkingDropdown.value;
+      tab._preferredThinkingLevel = thinkingDropdown.value;
+      tab._userSelectedThinking = true;
       syncLabels();
       persistTabsState();
     };
+  }
+
+  function getWebSearchAvailability() {
+    const gemini = state.providers.find((p) => p.id === "gemini");
+    if (!gemini || !gemini.has_api_key) {
+      return { available: false, reason: "NO API KEY" };
+    }
+    if (!gemini.is_enabled) {
+      return { available: false, reason: "GEMINI DISABLED" };
+    }
+    const status = gemini.sync_status || "";
+    if (status === "checking") {
+      return { available: false, reason: "CHECKING..." };
+    }
+    if (status === "invalid_key") {
+      return { available: false, reason: "INVALID KEY" };
+    }
+    if (status === "network_error") {
+      return { available: false, reason: "NETWORK ERROR" };
+    }
+    if (status === "invalid_model") {
+      return { available: false, reason: "INVALID MODEL" };
+    }
+    if (status === "error") {
+      return { available: false, reason: gemini.sync_error || "FETCH ERROR" };
+    }
+    if ((Array.isArray(gemini.fetched_model_ids) && gemini.fetched_model_ids.length > 0) || status === "ready") {
+      const fetchedClean = new Set((gemini.fetched_model_ids || []).map((id) => stripModelPrefix(id).toLowerCase()));
+      const wsIds = normalizeWebSearchModelsClient(state.webSearchModels).map((m) => stripModelPrefix(m.id).toLowerCase());
+      const hasAnySearchModel = wsIds.some((id) => fetchedClean.has(id));
+      if (!hasAnySearchModel) {
+        return { available: false, reason: "INVALID MODEL" };
+      }
+    }
+    return { available: true, reason: "Web Search (Google Search via configured Gemini search models)" };
+  }
+
+  function updatePaneWebSearchButton(pane, tab) {
+    const hintEl = pane.querySelector(`#hint-${tab.id}`);
+    const btn = pane.querySelector(`#web-search-btn-${tab.id}`);
+    if (!btn) return;
+    const { available, reason } = getWebSearchAvailability();
+    const active = available && Boolean(tab.webSearchEnabled);
+    btn.disabled = !available;
+    btn.classList.toggle("active", active);
+    btn.setAttribute("aria-pressed", active ? "true" : "false");
+    btn.title = reason;
+    if (hintEl) {
+      hintEl.title = reason;
+      if (!available && reason) {
+        hintEl.setAttribute("data-tooltip", reason);
+      } else {
+        hintEl.removeAttribute("data-tooltip");
+      }
+    }
+  }
+
+  function syncAllPaneWebSearchButtons() {
+    el.panesContainer.querySelectorAll(".chat-pane").forEach((paneEl) => {
+      const tabId = paneEl.dataset.tabId;
+      const targetTab = state.tabs.find((t) => t.id === tabId);
+      if (targetTab) {
+        updatePaneWebSearchButton(paneEl, targetTab);
+      }
+    });
+  }
+
+  function syncAllPaneModelDropdowns() {
+    el.panesContainer.querySelectorAll(".chat-pane").forEach((paneEl) => {
+      const tabId = paneEl.dataset.tabId;
+      const targetTab = state.tabs.find((t) => t.id === tabId);
+      if (targetTab) {
+        updatePaneModelDropdown(paneEl, targetTab);
+      }
+    });
+    syncAllPaneWebSearchButtons();
+  }
+
+  function getModelRecencyScore(m) {
+    const mid = (m && m.id ? m.id : String(m || "")).toLowerCase();
+    const created = typeof m.created === "number" ? m.created : 0;
+
+    let dateVal = 0;
+    const mDate = mid.match(/(202\d)[-_]?([01]\d)[-_]?([0-3]\d)/);
+    if (mDate) {
+      dateVal = parseInt(mDate[1] + mDate[2] + mDate[3], 10) || 0;
+    }
+
+    let verVal = 0;
+    const mDec = mid.match(/[-_v]?(\d+\.\d+)/);
+    if (mDec) {
+      verVal = parseFloat(mDec[1]) || 0;
+    } else {
+      const mDash = mid.match(/[-_](\d+)[-_](\d+)(?:[-_]|$)/);
+      if (mDash && parseInt(mDash[1], 10) <= 10) {
+        verVal = parseFloat(`${mDash[1]}.${mDash[2]}`) || 0;
+      } else {
+        const mSingle = mid.match(/(?:gpt|gemini|claude|llama|deepseek|qwen|v)[-_]?(\d+)/);
+        if (mSingle) {
+          verVal = parseFloat(mSingle[1]) || 0;
+        }
+      }
+    }
+
+    let bonus = 0;
+    if (/o3|o1|r1|reasoner/i.test(mid)) bonus += 50;
+    if (/4o|4\.5|argon|carbon/i.test(mid)) bonus += 40;
+    if (/latest|preview/i.test(mid)) bonus += 20;
+    if (/deprecated|legacy|0301|0314|0613/i.test(mid)) bonus -= 100;
+    if (/embedding|moderation|tts|whisper|audio|realtime/i.test(mid)) bonus -= 500;
+
+    return { created, dateVal, verVal, bonus };
+  }
+
+  function sortModelsNewerFirst(models) {
+    return [...models].sort((a, b) => {
+      const scoreA = getModelRecencyScore(a);
+      const scoreB = getModelRecencyScore(b);
+      if (scoreB.created !== scoreA.created) return scoreB.created - scoreA.created;
+      if (scoreB.dateVal !== scoreA.dateVal) return scoreB.dateVal - scoreA.dateVal;
+      if (scoreB.verVal !== scoreA.verVal) return scoreB.verVal - scoreA.verVal;
+      if (scoreB.bonus !== scoreA.bonus) return scoreB.bonus - scoreA.bonus;
+      return (a.id || "").localeCompare(b.id || "");
+    });
   }
 
   // Build Live Streaming Row Element for Active Streams
@@ -1030,6 +1249,7 @@
         </div>
         <div class="thinking-body" id="live-thinking-body-${tab.id}"></div>
       </div>
+      <div class="tool-status-banner" id="live-tool-status-${tab.id}" style="display: none;"></div>
       <div class="assistant-markdown-content" id="live-content-${tab.id}"></div>
     `;
 
@@ -1054,8 +1274,19 @@
     const convSettingsBtn = pane.querySelector(".pane-conv-settings-btn");
     const exportBtn = pane.querySelector(".pane-export-btn");
 
-    // 1. Populate Model Dropdown and Thinking selector
+    // 1. Populate Model Dropdown, Thinking selector, and Web Search button
     updatePaneModelDropdown(pane, tab);
+    updatePaneWebSearchButton(pane, tab);
+
+    const webSearchBtn = pane.querySelector(`#web-search-btn-${tab.id}`);
+    if (webSearchBtn) {
+      webSearchBtn.onclick = () => {
+        if (!getWebSearchAvailability().available) return;
+        tab.webSearchEnabled = !tab.webSearchEnabled;
+        updatePaneWebSearchButton(pane, tab);
+        persistTabsState();
+      };
+    }
 
     // Settings & Export Actions
     convSettingsBtn.onclick = () => openConvSettingsModal(tab);
@@ -1237,14 +1468,17 @@
         if (sendBtn) sendBtn.style.display = "none";
         if (stopBtn) stopBtn.style.display = "flex";
 
+        const realMsgId = row.dataset.msgId || msg.id;
+        const useWebSearch = Boolean(tab.webSearchEnabled && getWebSearchAvailability().available);
         const res = await callApi(
           "regenerate_message",
           tab.id,
           tab.conversationId,
-          msg.id,
+          realMsgId,
           tab.providerId,
           tab.modelId,
-          tab.thinkingLevel
+          tab.thinkingLevel,
+          useWebSearch
         );
         if (res && res.token_stats) {
           tab.tokenStats = res.token_stats;
@@ -1405,15 +1639,21 @@
       if (sendBtn) sendBtn.style.display = "none";
       if (stopBtn) stopBtn.style.display = "flex";
 
+      const realMsgId = row.dataset.msgId || msg.id;
+      msg.id = realMsgId;
+      row.dataset.msgId = realMsgId;
+
+      const useWebSearch = Boolean(tab.webSearchEnabled && getWebSearchAvailability().available);
       const res = await callApi(
         "edit_message",
         tab.id,
         tab.conversationId,
-        msg.id,
+        realMsgId,
         newText,
         tab.providerId,
         tab.modelId,
-        tab.thinkingLevel
+        tab.thinkingLevel,
+        useWebSearch
       );
       if (res && res.token_stats) {
         tab.tokenStats = res.token_stats;
@@ -1456,14 +1696,21 @@
     lucide.createIcons();
     messagesContainer.scrollTop = messagesContainer.scrollHeight;
 
-    // Toggle button state to streaming
+    // Toggle button state to streaming & lock selected model/thinking
     tab.isStreaming = true;
+    tab._userSelectedModel = true;
+    tab._userSelectedThinking = true;
+    tab._preferredProviderId = tab.providerId;
+    tab._preferredModelId = tab.modelId;
+    tab._preferredThinkingLevel = tab.thinkingLevel;
+    tab._usingTempFallback = false;
     const sendBtn = pane.querySelector(`#send-btn-${tab.id}`);
     const stopBtn = pane.querySelector(`#stop-btn-${tab.id}`);
     if (sendBtn) sendBtn.style.display = "none";
     if (stopBtn) stopBtn.style.display = "flex";
 
     // Call backend send_message
+    const useWebSearch = Boolean(tab.webSearchEnabled && getWebSearchAvailability().available);
     const res = await callApi(
       "send_message",
       tab.id,
@@ -1474,12 +1721,14 @@
       tab.thinkingLevel,
       tab.title || "New Chat",
       tab.systemPrompt || "",
-      tab.maxContextMessages || 30
+      tab.maxContextMessages || 30,
+      useWebSearch
     );
     if (res && res.conversation_id) {
       tab.conversationId = res.conversation_id;
     }
     if (res && res.user_message && res.user_message.id) {
+      tempUserMsg.id = res.user_message.id;
       userRow.dataset.msgId = res.user_message.id;
     }
   }
@@ -1492,10 +1741,32 @@
     const barEl = pane.querySelector(`#token-bar-${tabId}`);
     const summaryEl = pane.querySelector(`#token-summary-${tabId}`);
 
+    if (summaryEl && barEl) {
+      summaryEl.onclick = () => {
+        barEl.classList.toggle("expanded");
+      };
+    }
+
+    if (stats && stats.google_search_totals) {
+      state.googleSearchTotals = stats.google_search_totals;
+    }
+    const gt = (stats && stats.grand_total) || {};
+    const chatSearches = Number(gt.google_search_requests || 0);
+    const gTotals = (stats && stats.google_search_totals) || state.googleSearchTotals || { monthly: 0, all_time: 0 };
+    const monthSearches = Number(gTotals.monthly || 0);
+    const allTimeSearches = Number(gTotals.all_time || 0);
+    const searchSummaryHtml = `
+      <div class="search-requests-row">
+        <span class="search-requests-label"><i data-lucide="globe" style="width: 12px; height: 12px;"></i> Google Search Requests</span>
+        <span class="search-requests-values">${chatSearches.toLocaleString()} this chat · ${monthSearches.toLocaleString()} / 5,000 this month · ${allTimeSearches.toLocaleString()} total</span>
+      </div>
+    `;
+
     if (!stats || !stats.per_model || stats.per_model.length === 0) {
       chipsEl.innerHTML = '<span style="color: var(--text-muted);">Tokens: 0 in · 0 out · $0.00</span>';
       grandTotalEl.textContent = "0 total · Est. $0.00";
-      detailsEl.innerHTML = '<span style="color: var(--text-muted);">No tokens recorded yet for this chat.</span>';
+      detailsEl.innerHTML = `<span style="color: var(--text-muted);">No tokens recorded yet for this chat.</span>${searchSummaryHtml}`;
+      lucide.createIcons();
       return;
     }
 
@@ -1514,7 +1785,6 @@
       chipsEl.appendChild(chip);
     });
 
-    const gt = stats.grand_total;
     grandTotalEl.textContent = `${formatTokens(gt.total_tokens)} total · Est. ${formatCost(gt.total_cost)}`;
 
     let tableRows = stats.per_model
@@ -1561,11 +1831,9 @@
           </tr>
         </tbody>
       </table>
+      ${searchSummaryHtml}
     `;
-
-    summaryEl.onclick = () => {
-      barEl.classList.toggle("expanded");
-    };
+    lucide.createIcons();
   }
 
   // Stream Event Handler (Dispatched from Python)
@@ -1573,32 +1841,115 @@
     onStreamEvent: function (event) {
       if (event.type === "provider_models_updated") {
         const updated = event.provider;
-        if (el.settingsModal.classList.contains("open")) {
+        const isSettingsOpen = el.settingsModal.classList.contains("open");
+        if (isSettingsOpen) {
           saveGeneralTabInputs();
           saveActiveProviderInputs();
         }
+
         const idx = state.providers.findIndex((p) => p.id === updated.id);
+        let activeViewNeedsRefresh = false;
+
         if (idx !== -1) {
-          state.providers[idx] = updated;
+          const currentProv = state.providers[idx];
+          const snapProv = state.settingsSnapshot?.providers?.find((p) => p.id === updated.id);
+          const hasLocalEdits =
+            isSettingsOpen &&
+            snapProv &&
+            (snapProv.name !== currentProv.name ||
+              Boolean(snapProv.is_enabled) !== Boolean(currentProv.is_enabled) ||
+              (snapProv.base_url || "") !== (currentProv.base_url || "") ||
+              Boolean(currentProv.api_key) ||
+              Boolean(currentProv.clear_api_key) ||
+              JSON.stringify(snapProv.models || []) !== JSON.stringify(currentProv.models || []));
+
+          if (hasLocalEdits) {
+            // Preserve the user's in-progress Settings edits; only refresh remote metadata
+            currentProv.has_api_key = Boolean(updated.has_api_key);
+            currentProv.sync_status = updated.sync_status || "";
+            currentProv.sync_error = updated.sync_error || "";
+            if (Array.isArray(updated.fetched_model_ids) && updated.fetched_model_ids.length > 0) {
+              currentProv.fetched_model_ids = updated.fetched_model_ids;
+            }
+            refreshProviderAccessibility(currentProv);
+          } else {
+            const modelsChanged = JSON.stringify(currentProv.models || []) !== JSON.stringify(updated.models || []);
+            const accChanged = Boolean(currentProv.is_accessible) !== Boolean(updated.is_accessible);
+            const keyChanged = Boolean(currentProv.has_api_key) !== Boolean(updated.has_api_key);
+            const statusChanged = (currentProv.sync_status || "") !== (updated.sync_status || "");
+
+            // Mutate in-place to preserve active object references held by UI event closures
+            for (const k of Object.keys(currentProv)) {
+              if (!(k in updated)) delete currentProv[k];
+            }
+            Object.assign(currentProv, updated);
+            if (isSettingsOpen && state.settingsSnapshot?.providers) {
+              const sIdx = state.settingsSnapshot.providers.findIndex((p) => p.id === updated.id);
+              if (sIdx !== -1) {
+                state.settingsSnapshot.providers[sIdx] = JSON.parse(JSON.stringify(updated));
+              }
+            }
+            if (updated.id === state.activeProviderId && (modelsChanged || accChanged || keyChanged || statusChanged)) {
+              activeViewNeedsRefresh = true;
+            }
+          }
         } else {
           state.providers.push(updated);
+          if (isSettingsOpen && state.settingsSnapshot?.providers) {
+            state.settingsSnapshot.providers.push(JSON.parse(JSON.stringify(updated)));
+          }
         }
 
         // Live update model dropdowns across all visible panes
-        el.panesContainer.querySelectorAll(".chat-pane").forEach((paneEl) => {
-          const tabId = paneEl.dataset.tabId;
-          const targetTab = state.tabs.find((t) => t.id === tabId);
-          if (targetTab) {
-            updatePaneModelDropdown(paneEl, targetTab);
+        if (updated.id === "gemini" && Array.isArray(updated.web_search_models)) {
+          const snapWs = state.settingsSnapshot?.webSearchModels;
+          const wsLocallyEdited =
+            isSettingsOpen &&
+            snapWs &&
+            JSON.stringify(snapWs) !== JSON.stringify(state.webSearchModels || []);
+          if (!wsLocallyEdited) {
+            state.webSearchModels = normalizeWebSearchModelsClient(updated.web_search_models);
+            if (isSettingsOpen && state.settingsSnapshot) {
+              state.settingsSnapshot.webSearchModels = JSON.parse(JSON.stringify(state.webSearchModels));
+            }
           }
-        });
+        }
+        syncAllPaneModelDropdowns();
 
-        // Update settings modal view if open and user is not actively typing in an input
-        if (el.settingsModal.classList.contains("open")) {
+        // Update settings modal view cleanly without destroying scroll state
+        if (isSettingsOpen && state.masterSettingsTab === "websearch" && updated.id === "gemini") {
+          const isModelModalOpen = el.modelConfigModal && el.modelConfigModal.classList.contains("open");
           const activeEl = document.activeElement;
-          const isTypingInModal = activeEl && el.settingsModal.contains(activeEl) && (activeEl.tagName === "INPUT" || activeEl.tagName === "TEXTAREA");
-          if (!isTypingInModal) {
+          const isTypingInModal = activeEl && el.settingsModal.contains(activeEl) && activeEl.tagName === "INPUT";
+          if (!isModelModalOpen && !isTypingInModal) {
             renderSettingsContent();
+          }
+        } else if (isSettingsOpen && state.masterSettingsTab === "providers") {
+          const provObj = state.providers.find((p) => p.id === updated.id);
+          const subBtn = el.settingsTabContent.querySelector(`.provider-sub-btn[data-prov-id="${CSS.escape(updated.id)}"]`);
+          if (subBtn && provObj) {
+            let dot = subBtn.querySelector(".prov-status-dot");
+            if (provObj.is_accessible && !dot) {
+              dot = document.createElement("span");
+              dot.className = "prov-status-dot";
+              dot.style.cssText = "color: #34a853; font-size: 10px;";
+              dot.textContent = "●";
+              subBtn.appendChild(dot);
+            } else if (!provObj.is_accessible && dot) {
+              dot.remove();
+            }
+          }
+
+          const isModelModalOpen = el.modelConfigModal && el.modelConfigModal.classList.contains("open");
+          if (activeViewNeedsRefresh && !isModelModalOpen) {
+            const activeEl = document.activeElement;
+            const isTypingInModal =
+              activeEl &&
+              el.settingsModal.contains(activeEl) &&
+              (activeEl.tagName === "INPUT" || activeEl.tagName === "TEXTAREA");
+            if (!isTypingInModal) {
+              renderSettingsContent();
+            }
           }
         }
         return;
@@ -1633,6 +1984,11 @@
         persistTabsState();
         renderConversationsList();
         renderTabs();
+
+        if (event.token_stats && pane) {
+          tab.tokenStats = event.token_stats;
+          renderTokenStats(pane, tab.id, event.token_stats);
+        }
       } else if (event.type === "start") {
         tab.isStreaming = true;
         tab.streamingContent = "";
@@ -1661,6 +2017,27 @@
           messagesContainer.appendChild(liveRow);
           lucide.createIcons();
           messagesContainer.scrollTop = messagesContainer.scrollHeight;
+        }
+      } else if (event.type === "tool_status") {
+        if (pane && messagesContainer) {
+          const toolBanner = document.getElementById(`live-tool-status-${tab.id}`);
+          if (toolBanner) {
+            if (event.status === "searching") {
+              toolBanner.style.display = "inline-flex";
+              toolBanner.innerHTML = `<i data-lucide="globe" style="width: 12px; height: 12px;"></i><span>Searching Google${event.query ? `: "${escapeHtml(event.query)}"` : "..."}</span>`;
+              lucide.createIcons();
+            } else if (event.status === "done") {
+              const reqUsed = Number(event.search_requests_used || 0);
+              if (event.ok) {
+                toolBanner.style.display = "inline-flex";
+                toolBanner.innerHTML = `<i data-lucide="check" style="width: 12px; height: 12px; color: #34a853;"></i><span>Google Search complete (${reqUsed} ${reqUsed === 1 ? "request" : "requests"})</span>`;
+              } else {
+                toolBanner.style.display = "none";
+              }
+              lucide.createIcons();
+            }
+            messagesContainer.scrollTop = messagesContainer.scrollHeight;
+          }
         }
       } else if (event.type === "thinking_chunk") {
         tab.streamingThinking += event.chunk;
@@ -1723,7 +2100,20 @@
 
           if (event.token_stats) {
             tab.tokenStats = event.token_stats;
+            if (event.token_stats.google_search_totals) {
+              state.googleSearchTotals = event.token_stats.google_search_totals;
+            }
             renderTokenStats(pane, tab.id, event.token_stats);
+            // Keep Google Search Requests count updated across any other open split panes
+            el.panesContainer.querySelectorAll(".chat-pane").forEach((otherPane) => {
+              const otherId = otherPane.dataset.tabId;
+              if (otherId && otherId !== tab.id) {
+                const otherTab = state.tabs.find((t) => t.id === otherId);
+                if (otherTab) {
+                  renderTokenStats(otherPane, otherId, otherTab.tokenStats || null);
+                }
+              }
+            });
           }
         }
       } else if (event.type === "error") {
@@ -1769,10 +2159,11 @@
               const prevText = prevBubble ? prevBubble.textContent : "";
 
               targetRow.remove();
-              if (prevMsgId && !prevMsgId.startsWith("user_temp_") && tab.conversationId) {
+              if (prevMsgId && tab.conversationId) {
                 tab.isStreaming = true;
                 if (sendBtn) sendBtn.style.display = "none";
                 if (stopBtn) stopBtn.style.display = "flex";
+                const useWebSearch = Boolean(tab.webSearchEnabled && getWebSearchAvailability().available);
                 await callApi(
                   "edit_message",
                   tab.id,
@@ -1781,7 +2172,8 @@
                   prevText,
                   tab.providerId,
                   tab.modelId,
-                  tab.thinkingLevel
+                  tab.thinkingLevel,
+                  useWebSearch
                 );
               }
             };
@@ -1891,16 +2283,18 @@
     lucide.createIcons();
   }
 
-  // Settings Modal Management (General & Providers only)
+  // Settings Modal Management (General, Providers & Web Search)
   function openSettingsModal() {
+    state.webSearchModels = normalizeWebSearchModelsClient(state.webSearchModels);
     state.settingsSnapshot = JSON.parse(
       JSON.stringify({
         providers: state.providers,
         settings: state.settings,
+        webSearchModels: state.webSearchModels,
       })
     );
     updateMasterTabsUI();
-    renderSettingsContent();
+    renderSettingsContent({ resetScroll: true });
     el.settingsModal.classList.add("open");
     lucide.createIcons();
   }
@@ -1909,6 +2303,9 @@
     if (!saved && state.settingsSnapshot) {
       state.providers = state.settingsSnapshot.providers;
       state.settings = state.settingsSnapshot.settings;
+      if (Array.isArray(state.settingsSnapshot.webSearchModels)) {
+        state.webSearchModels = normalizeWebSearchModelsClient(state.settingsSnapshot.webSearchModels);
+      }
       applyTheme(state.settings.theme || "dark");
     }
     state.settingsSnapshot = null;
@@ -1916,38 +2313,42 @@
   }
 
   function updateMasterTabsUI() {
-    if (state.masterSettingsTab === "general") {
-      el.masterTabGeneral.classList.add("active");
-      el.masterTabProviders.classList.remove("active");
-    } else {
-      el.masterTabGeneral.classList.remove("active");
-      el.masterTabProviders.classList.add("active");
+    el.masterTabGeneral.classList.toggle("active", state.masterSettingsTab === "general");
+    el.masterTabProviders.classList.toggle("active", state.masterSettingsTab === "providers");
+    if (el.masterTabWebSearch) {
+      el.masterTabWebSearch.classList.toggle("active", state.masterSettingsTab === "websearch");
     }
   }
 
   // Model Pricing & Thinking Configuration Sub-Modal
   let activeConfigModelRef = null;
 
-  function openModelConfigModal(prov, modelObj) {
-    activeConfigModelRef = { prov, modelObj };
-    el.modelConfigTitle.textContent = `${modelObj.name || modelObj.id}`;
+  function openModelConfigModal(prov, modelObj, options = {}) {
+    const isWebSearch = Boolean(options.isWebSearch);
+    activeConfigModelRef = { prov, modelObj, isWebSearch };
+    el.modelConfigTitle.textContent = `${modelObj.name || modelObj.id}${isWebSearch ? " (Pricing)" : ""}`;
     el.modelInputPrice.value = Number(modelObj.input_price || 0);
     el.modelCachedPrice.value = Number(modelObj.cached_input_price || 0);
     el.modelOutputPrice.value = Number(modelObj.output_price || 0);
     el.modelSupportsThinkingCheck.checked = Boolean(modelObj.supports_thinking);
+    if (el.modelThinkingConfigRow) {
+      el.modelThinkingConfigRow.style.display = isWebSearch ? "none" : "flex";
+    }
     el.modelConfigModal.classList.add("open");
   }
 
   function closeModelConfigModal(save = false) {
     if (save && activeConfigModelRef) {
-      const { modelObj } = activeConfigModelRef;
+      const { modelObj, isWebSearch } = activeConfigModelRef;
       const inVal = parseFloat(el.modelInputPrice.value);
       const cacheVal = parseFloat(el.modelCachedPrice.value);
       const outVal = parseFloat(el.modelOutputPrice.value);
       modelObj.input_price = !isNaN(inVal) && inVal >= 0 ? inVal : 0.0;
       modelObj.cached_input_price = !isNaN(cacheVal) && cacheVal >= 0 ? cacheVal : 0.0;
       modelObj.output_price = !isNaN(outVal) && outVal >= 0 ? outVal : 0.0;
-      modelObj.supports_thinking = el.modelSupportsThinkingCheck.checked ? 1 : 0;
+      if (!isWebSearch) {
+        modelObj.supports_thinking = el.modelSupportsThinkingCheck.checked ? 1 : 0;
+      }
       renderSettingsContent();
     }
     activeConfigModelRef = null;
@@ -1974,25 +2375,131 @@
     return null;
   }
 
+  function canShowProviderModels(prov) {
+    if (!prov || prov.clear_api_key) return false;
+    const hasKey = Boolean((prov.api_key && prov.api_key.trim()) || prov.has_api_key);
+    return hasKey && prov.sync_status === "ready";
+  }
+
   function refreshProviderAccessibility(prov) {
     if (!prov) return;
     const typedKey = (prov.api_key || "").trim();
     const hasCredentials = prov.clear_api_key ? false : Boolean(typedKey || prov.has_api_key);
     const fetchedIds = Array.isArray(prov.fetched_model_ids) ? new Set(prov.fetched_model_ids) : new Set();
-    const verifiedModels = Array.isArray(prov.models) ? prov.models.filter((m) => fetchedIds.has(m.id)) : [];
-    if (!hasCredentials) {
-      prov.models = [];
-      prov.fetched_model_ids = [];
-      prov.has_api_key = false;
-      prov.is_accessible = false;
-      return;
-    }
-    prov.has_api_key = true;
-    prov.models = verifiedModels;
-    prov.is_accessible = Boolean(prov.is_enabled && hasCredentials && verifiedModels.length > 0);
+    const models = Array.isArray(prov.models) ? prov.models : [];
+    const verifiedModels = fetchedIds.size > 0 ? models.filter((m) => fetchedIds.has(m.id)) : models;
+    prov.has_api_key = Boolean(hasCredentials);
+    prov.is_accessible = Boolean(
+      prov.is_enabled && hasCredentials && prov.sync_status === "ready" && verifiedModels.length > 0
+    );
   }
 
-  function renderSettingsContent() {
+  function shuffleModelArray(models) {
+    const arr = [...(models || [])];
+    for (let i = arr.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [arr[i], arr[j]] = [arr[j], arr[i]];
+    }
+    if (arr.length > 1 && arr.every((m, i) => m.id === models[i].id)) {
+      arr.push(arr.shift());
+    }
+    return arr;
+  }
+
+  function swapModelInArray(models, mid, delta, minIdx = 0) {
+    const list = models || [];
+    const idx = list.findIndex((m) => m.id === mid);
+    const targetIdx = idx + delta;
+    if (idx < minIdx || targetIdx < minIdx || targetIdx >= list.length) {
+      return null;
+    }
+    const arr = [...list];
+    [arr[idx], arr[targetIdx]] = [arr[targetIdx], arr[idx]];
+    return arr;
+  }
+
+  function syncSearchModelsWithGeminiFetch(fetchedIds) {
+    const cleanFetchedSet = new Set(Array.from(fetchedIds || [], (id) => stripModelPrefix(id).toLowerCase()));
+    const [wsPrimary, ...wsFallbacks] = normalizeWebSearchModelsClient(state.webSearchModels);
+    const keptWs = wsFallbacks.filter((m) => cleanFetchedSet.has(stripModelPrefix(m.id).toLowerCase()));
+    state.webSearchModels = normalizeWebSearchModelsClient([wsPrimary, ...keptWs]);
+  }
+
+  function renderConfiguredModelRow(m, idx, totalM, isWebSearch = false) {
+    const inP = Number(m.input_price || 0);
+    const cP = Number(m.cached_input_price || 0);
+    const outP = Number(m.output_price || 0);
+    const isPrimaryWs = isWebSearch && idx === 0;
+    const minMoveIdx = isWebSearch ? 1 : 0;
+
+    const upDisabled = idx <= minMoveIdx ? "disabled style='opacity:0.25;cursor:default;'" : "";
+    const downDisabled = isPrimaryWs || idx === totalM - 1 ? "disabled style='opacity:0.25;cursor:default;'" : "";
+    const delDisabled = isPrimaryWs ? "disabled style='opacity:0.25;cursor:not-allowed;'" : "";
+
+    const clsPrefix = isWebSearch ? "ws-" : "";
+    const upCls = isWebSearch ? "ws-move-up-btn" : "move-model-up-btn";
+    const downCls = isWebSearch ? "ws-move-down-btn" : "move-model-down-btn";
+    const cfgCls = isWebSearch ? "ws-model-config-btn" : "model-config-btn";
+    const delCls = isWebSearch ? "ws-delete-model-btn" : "delete-model-btn";
+
+    const badgeHtml = isWebSearch
+      ? (isPrimaryWs
+          ? '<span class="ws-priority-badge primary">Primary · Fixed</span>'
+          : `<span class="ws-priority-badge">Fallback #${idx}</span>`)
+      : "";
+    const thinkTag = !isWebSearch && m.supports_thinking ? " · Thinking" : "";
+    const cfgLabel = isWebSearch ? "Pricing" : "Pricing &amp; Thinking";
+    const cfgTitle = isWebSearch ? "Configure Pricing" : "Configure Pricing & Thinking";
+    const delTitle = isPrimaryWs ? "Primary model cannot be removed" : "Remove Model";
+
+    return `
+      <div class="model-row-item" data-list-prefix="${clsPrefix}">
+        <div style="display: flex; flex-direction: column; min-width: 0; gap: 2px;">
+          <div style="display: flex; align-items: center; gap: 6px; min-width: 0;">
+            <span style="font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${escapeHtml(m.name || m.id)}</span>
+            ${badgeHtml}
+          </div>
+          <span style="color: var(--text-muted); font-size: 10.5px;">$${inP}/M in · $${cP}/M cached · $${outP}/M out${thinkTag}</span>
+        </div>
+        <div style="display: flex; align-items: center; gap: 4px; flex-shrink: 0;">
+          <button class="conv-action-btn ${upCls}" data-model-id="${escapeHtml(m.id)}" title="Move Up" ${upDisabled}>
+            <i data-lucide="arrow-up" style="width: 12px; height: 12px;"></i>
+          </button>
+          <button class="conv-action-btn ${downCls}" data-model-id="${escapeHtml(m.id)}" title="Move Down" ${downDisabled}>
+            <i data-lucide="arrow-down" style="width: 12px; height: 12px;"></i>
+          </button>
+          <button class="btn-secondary ${cfgCls}" data-model-id="${escapeHtml(m.id)}" style="padding: 3px 8px; font-size: 11px; display: flex; align-items: center; gap: 4px;" title="${cfgTitle}">
+            <i data-lucide="sliders-horizontal" style="width: 11px; height: 11px;"></i>
+            <span>${cfgLabel}</span>
+          </button>
+          <button class="conv-action-btn ${delCls}" data-model-id="${escapeHtml(m.id)}" title="${delTitle}" ${delDisabled}>
+            <i data-lucide="trash-2" style="width: 12px; height: 12px;"></i>
+          </button>
+        </div>
+      </div>
+    `;
+  }
+
+  function renderSettingsContent(options = {}) {
+    const resetScroll = Boolean(options.resetScroll);
+    const prevTab = el.settingsTabContent.dataset.renderedTab || "";
+    const prevProvId = el.settingsTabContent.dataset.renderedProvId || "";
+    const modalBody = el.settingsTabContent.closest(".modal-body");
+    const prevModelsList = document.getElementById("prov-models-list") || document.getElementById("ws-models-list");
+    const prevSubNav = el.settingsTabContent.querySelector(".providers-sub-nav");
+
+    const prevModalScroll = !resetScroll && modalBody ? modalBody.scrollTop : 0;
+    const prevSubNavScroll = !resetScroll && prevSubNav ? prevSubNav.scrollTop : 0;
+    const targetProvId = state.masterSettingsTab === "providers" ? (state.activeProviderId || state.providers[0]?.id || "") : "";
+    const sameProviderView =
+      !resetScroll &&
+      prevTab === "providers" &&
+      state.masterSettingsTab === "providers" &&
+      prevProvId === targetProvId;
+    const sameWebSearchView = !resetScroll && prevTab === "websearch" && state.masterSettingsTab === "websearch";
+    const prevModelsScroll = (sameProviderView || sameWebSearchView) && prevModelsList ? prevModelsList.scrollTop : 0;
+    const sameGeneralView = !resetScroll && prevTab === "general" && state.masterSettingsTab === "general";
+
     el.settingsTabContent.innerHTML = "";
 
     if (state.masterSettingsTab === "general") {
@@ -2010,6 +2517,15 @@
         </div>
 
         <div class="settings-group">
+          <label class="settings-label">Default Thinking</label>
+          <select class="settings-input" id="setting-default-thinking">
+            ${THINKING_LEVELS.map(
+              (lvl) => `<option value="${lvl.value}" ${lvl.value === getDefaultThinkingLevel() ? "selected" : ""}>${lvl.label}</option>`
+            ).join("")}
+          </select>
+        </div>
+
+        <div class="settings-group">
           <label class="settings-label">Appearance Theme</label>
           <select class="settings-input" id="setting-theme">
             <option value="dark" ${state.settings.theme === "dark" ? "selected" : ""}>Dark Theme</option>
@@ -2017,6 +2533,199 @@
           </select>
         </div>
       `;
+    } else if (state.masterSettingsTab === "websearch") {
+      state.webSearchModels = normalizeWebSearchModelsClient(state.webSearchModels);
+      const geminiProv = state.providers.find((p) => p.id === "gemini");
+      const { available: wsAvail, reason: wsReason } = getWebSearchAvailability();
+      const wsStatusLine = wsAvail
+        ? '<span style="color: #34a853; font-weight: 600;">Ready</span> · Using your Gemini provider API key.'
+        : `<span style="color: #ff8a80; font-weight: 600;">Unavailable (${escapeHtml(wsReason)})</span> · Configure Gemini in Providers.`;
+
+      const wsModels = state.webSearchModels;
+      const totalWs = wsModels.length;
+
+      el.settingsTabContent.innerHTML = `
+        <div class="provider-detail-pane">
+          <div class="websearch-info-banner">
+            <div><strong>Status:</strong> ${wsStatusLine}</div>
+          </div>
+
+          <div class="settings-group" style="margin-top: 4px;">
+            <div style="display: flex; align-items: center; justify-content: space-between;">
+              <label class="settings-label">Configured Search Models (Max 5 · Priority Order)</label>
+              <div style="display: flex; gap: 6px; align-items: center;">
+                <button class="btn-secondary ws-shuffle-models-btn" style="padding: 2px 8px; font-size: 11px; display: flex; align-items: center; gap: 4px;" title="Shuffle fallback models (keeps gemini-3.1-flash-lite pinned at top)">
+                  <i data-lucide="shuffle" style="width: 11px; height: 11px;"></i>
+                  <span>Shuffle</span>
+                </button>
+                <button class="btn-secondary ws-fetch-models-btn" style="padding: 2px 8px; font-size: 11px; display: flex; align-items: center; gap: 4px;" title="Fetch available Gemini models and discard missing fallback models">
+                  <i data-lucide="refresh-cw" style="width: 11px; height: 11px;"></i>
+                  <span>Fetch Gemini Models</span>
+                </button>
+              </div>
+            </div>
+
+            <div class="models-manager-list" id="ws-models-list">
+              ${wsModels.map((m, idx) => renderConfiguredModelRow(m, idx, totalWs, true)).join("")}
+            </div>
+
+            <div style="display: flex; gap: 6px; margin-top: 6px;">
+              <input type="text" class="settings-input" id="ws-new-model-id-input" placeholder="Add Gemini fallback model ID (e.g. gemini-3.8-flash)..." style="font-size: 12px;">
+              <button class="btn-secondary" id="ws-add-model-btn" style="padding: 5px 10px; font-size: 11.5px; white-space: nowrap;">Add Model</button>
+            </div>
+          </div>
+        </div>
+      `;
+
+      // Web Search Pricing Modal Trigger (without Thinking checkbox)
+      el.settingsTabContent.querySelectorAll(".ws-model-config-btn").forEach((btn) => {
+        btn.onclick = () => {
+          const mid = btn.dataset.modelId;
+          const target = state.webSearchModels.find((m) => m.id === mid);
+          if (target) {
+            openModelConfigModal(geminiProv || null, target, { isWebSearch: true });
+          }
+        };
+      });
+
+      // Shuffle fallback models only (index 0 stays fixed)
+      const wsShuffleBtn = el.settingsTabContent.querySelector(".ws-shuffle-models-btn");
+      if (wsShuffleBtn) {
+        wsShuffleBtn.onclick = () => {
+          if (state.webSearchModels.length <= 2) return;
+          const [primary, ...fallbacks] = state.webSearchModels;
+          state.webSearchModels = [primary, ...shuffleModelArray(fallbacks)];
+          renderSettingsContent();
+        };
+      }
+
+      // Move fallback models up/down (index 0 cannot move, index 1 cannot move above index 0)
+      const swapWsModel = (mid, delta) => {
+        const swapped = swapModelInArray(state.webSearchModels, mid, delta, 1);
+        if (swapped) {
+          state.webSearchModels = swapped;
+          renderSettingsContent();
+        }
+      };
+      el.settingsTabContent.querySelectorAll(".ws-move-up-btn").forEach((btn) => {
+        btn.onclick = () => swapWsModel(btn.dataset.modelId, -1);
+      });
+      el.settingsTabContent.querySelectorAll(".ws-move-down-btn").forEach((btn) => {
+        btn.onclick = () => swapWsModel(btn.dataset.modelId, 1);
+      });
+
+      // Remove fallback model (primary at index 0 cannot be deleted)
+      el.settingsTabContent.querySelectorAll(".ws-delete-model-btn").forEach((btn) => {
+        btn.onclick = () => {
+          const mid = btn.dataset.modelId;
+          if (mid.toLowerCase() === PRIMARY_WEB_SEARCH_MODEL) return;
+          state.webSearchModels = state.webSearchModels.filter((m) => m.id !== mid);
+          renderSettingsContent();
+        };
+      });
+
+      // Add Gemini fallback model (must exist in fetched Gemini models; no duplicates; max 5 total)
+      const wsAddBtn = document.getElementById("ws-add-model-btn");
+      const wsAddInput = document.getElementById("ws-new-model-id-input");
+      if (wsAddBtn && wsAddInput) {
+        const triggerAddWsModel = () => {
+          const mid = stripModelPrefix(wsAddInput.value.trim());
+          if (!mid) return;
+          const fetchedIds = geminiProv && Array.isArray(geminiProv.fetched_model_ids) ? geminiProv.fetched_model_ids : [];
+          const cleanFetched = new Map(fetchedIds.map((fid) => [stripModelPrefix(fid).toLowerCase(), stripModelPrefix(fid)]));
+          if (cleanFetched.size === 0) {
+            showNoticeDialog("Please click 'Fetch Gemini Models' first (requires a valid Gemini API key).");
+            return;
+          }
+          const canonical = cleanFetched.get(mid.toLowerCase());
+          if (!canonical) {
+            showNoticeDialog(`Model "${mid}" was not found in fetched Gemini models. Only verified Gemini models can be added.`);
+            return;
+          }
+          if (state.webSearchModels.some((m) => m.id.toLowerCase() === canonical.toLowerCase())) {
+            wsAddInput.value = "";
+            return;
+          }
+          if (state.webSearchModels.length >= 5) {
+            showNoticeDialog("Maximum 5 models can be configured for Web Search. Remove a fallback model first.");
+            return;
+          }
+          state.webSearchModels.push({
+            id: canonical,
+            name: canonical,
+            input_price: 0.0,
+            cached_input_price: 0.0,
+            output_price: 0.0,
+          });
+          renderSettingsContent();
+        };
+        wsAddBtn.onclick = triggerAddWsModel;
+        wsAddInput.onkeydown = (e) => {
+          if (e.key === "Enter") {
+            e.preventDefault();
+            triggerAddWsModel();
+          }
+        };
+      }
+
+      // Fetch Gemini Models from Web Search tab (discards missing fallbacks, never auto-adds)
+      const wsFetchBtn = el.settingsTabContent.querySelector(".ws-fetch-models-btn");
+      if (wsFetchBtn) {
+        wsFetchBtn.onclick = async () => {
+          const validationErr = validateAllProviders();
+          if (validationErr) {
+            showNoticeDialog(validationErr);
+            return;
+          }
+          const saveRes = await callApi("save_settings", state.providers, state.settings, state.webSearchModels);
+          if (saveRes && saveRes.error) {
+            showNoticeDialog(saveRes.error);
+            return;
+          }
+          state.providers.forEach((p) => {
+            delete p.api_key;
+            delete p.clear_api_key;
+          });
+
+          wsFetchBtn.disabled = true;
+          wsFetchBtn.innerHTML = '<i data-lucide="loader" style="width: 11px; height: 11px;"></i> Fetching...';
+          lucide.createIcons();
+
+          const res = await callApi("fetch_provider_models", "gemini");
+          wsFetchBtn.disabled = false;
+          wsFetchBtn.innerHTML = '<i data-lucide="refresh-cw" style="width: 11px; height: 11px;"></i> Fetch Gemini Models';
+          lucide.createIcons();
+
+          if (res && res.models && res.models.length > 0 && geminiProv) {
+            const fetchedIds = res.models.map((m) => m.id);
+            geminiProv.fetched_model_ids = fetchedIds;
+            geminiProv.has_api_key = true;
+            geminiProv.sync_status = res.sync_status || "ready";
+            geminiProv.sync_error = res.sync_error || "";
+
+            syncSearchModelsWithGeminiFetch(fetchedIds);
+
+            await callApi("save_settings", state.providers, state.settings, state.webSearchModels);
+            if (state.settingsSnapshot) {
+              state.settingsSnapshot.providers = JSON.parse(JSON.stringify(state.providers));
+              state.settingsSnapshot.webSearchModels = JSON.parse(JSON.stringify(state.webSearchModels));
+            }
+            syncAllPaneWebSearchButtons();
+            renderSettingsContent();
+            showNoticeDialog(`Verified Gemini search models (${fetchedIds.length} remote models fetched).`);
+          } else {
+            if (geminiProv) {
+              geminiProv.is_accessible = false;
+              geminiProv.fetched_model_ids = [];
+              geminiProv.sync_status = res?.sync_status || "error";
+              geminiProv.sync_error = res?.sync_error || "FETCH ERROR";
+            }
+            syncAllPaneWebSearchButtons();
+            renderSettingsContent();
+            showNoticeDialog(`Could not fetch Gemini models: ${res?.error || "Missing/invalid Gemini API key or network error"}`);
+          }
+        };
+      }
     } else {
       // Providers Tab Layout
       if (!state.activeProviderId && state.providers.length > 0) {
@@ -2029,7 +2738,7 @@
           (p) => `
         <button class="provider-sub-btn ${p.id === activeProv?.id ? "active" : ""}" data-prov-id="${escapeHtml(p.id)}">
           <span>${escapeHtml(p.name)}</span>
-          ${p.is_accessible ? '<span style="color: #34a853; font-size: 10px;">●</span>' : ""}
+          ${p.is_accessible ? '<span class="prov-status-dot" style="color: #34a853; font-size: 10px;">●</span>' : ""}
         </button>
       `
         )
@@ -2052,6 +2761,15 @@
         const keyPlaceholder = activeProv.has_api_key && !activeProv.clear_api_key
           ? `Saved in .env (${envKeyName}) — type to replace or click eye to view`
           : `Saved in .env as ${envKeyName}...`;
+
+        const provModelsVisible = canShowProviderModels(activeProv);
+        const provModelsHtml = provModelsVisible
+          ? (activeProv.models || []).map((m, idx, list) => renderConfiguredModelRow(m, idx, list.length, false)).join("")
+          : `<div style="padding: 10px; font-size: 11.5px; color: var(--text-muted); text-align: center;">${escapeHtml(
+              !activeProv.has_api_key || activeProv.clear_api_key
+                ? "Enter a valid API key and fetch models to view configured models. Any previously saved models remain preserved."
+                : `Configured models are hidden until verification succeeds (${activeProv.sync_error || activeProv.sync_status || "UNVERIFIED"}). Saved models & pricing remain preserved.`
+            )}</div>`;
 
         detailHtml = `
           <div class="provider-detail-pane">
@@ -2093,38 +2811,20 @@
             <div class="settings-group" style="margin-top: 4px;">
               <div style="display: flex; align-items: center; justify-content: space-between;">
                 <label class="settings-label">Configured Models (Max 5 shown in dropdown)</label>
-                <button class="btn-secondary fetch-models-btn" style="padding: 2px 8px; font-size: 11px; display: flex; align-items: center; gap: 4px;">
-                  <i data-lucide="refresh-cw" style="width: 11px; height: 11px;"></i>
-                  <span>Fetch from Endpoint</span>
-                </button>
+                <div style="display: flex; gap: 6px; align-items: center;">
+                  <button class="btn-secondary shuffle-models-btn" style="padding: 2px 8px; font-size: 11px; display: flex; align-items: center; gap: 4px;" title="Shuffle the order of configured models">
+                    <i data-lucide="shuffle" style="width: 11px; height: 11px;"></i>
+                    <span>Shuffle</span>
+                  </button>
+                  <button class="btn-secondary fetch-models-btn" style="padding: 2px 8px; font-size: 11px; display: flex; align-items: center; gap: 4px;">
+                    <i data-lucide="refresh-cw" style="width: 11px; height: 11px;"></i>
+                    <span>Fetch from Endpoint</span>
+                  </button>
+                </div>
               </div>
 
               <div class="models-manager-list" id="prov-models-list">
-                ${(activeProv.models || [])
-                  .map((m) => {
-                    const inP = Number(m.input_price || 0);
-                    const cP = Number(m.cached_input_price || 0);
-                    const outP = Number(m.output_price || 0);
-                    const thinkTag = m.supports_thinking ? " · Thinking" : "";
-                    return `
-                  <div class="model-row-item">
-                    <div style="display: flex; flex-direction: column; min-width: 0;">
-                      <span style="font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${escapeHtml(m.name || m.id)}</span>
-                      <span style="color: var(--text-muted); font-size: 10.5px;">$${inP}/M in · $${cP}/M cached · $${outP}/M out${thinkTag}</span>
-                    </div>
-                    <div style="display: flex; align-items: center; gap: 6px; flex-shrink: 0;">
-                      <button class="btn-secondary model-config-btn" data-model-id="${escapeHtml(m.id)}" style="padding: 3px 8px; font-size: 11px; display: flex; align-items: center; gap: 4px;" title="Configure Pricing & Thinking">
-                        <i data-lucide="sliders-horizontal" style="width: 11px; height: 11px;"></i>
-                        <span>Pricing &amp; Thinking</span>
-                      </button>
-                      <button class="conv-action-btn delete-model-btn" data-model-id="${escapeHtml(m.id)}" title="Remove Model">
-                        <i data-lucide="trash-2" style="width: 12px; height: 12px;"></i>
-                      </button>
-                    </div>
-                  </div>
-                `;
-                  })
-                  .join("")}
+                ${provModelsHtml}
               </div>
 
               <div style="display: flex; gap: 6px; margin-top: 6px;">
@@ -2139,7 +2839,7 @@
       el.settingsTabContent.innerHTML = `
         <div class="providers-container-layout">
           <div class="providers-sub-nav">${subNavHtml}</div>
-          <div style="flex: 1;">${detailHtml}</div>
+          <div style="flex: 1; min-width: 0;">${detailHtml}</div>
         </div>
       `;
 
@@ -2216,7 +2916,11 @@
           activeProv.api_key = "";
           activeProv.clear_api_key = true;
           activeProv.has_api_key = false;
+          activeProv.sync_status = "no_key";
+          activeProv.sync_error = "NO API KEY";
+          activeProv.fetched_model_ids = [];
           refreshProviderAccessibility(activeProv);
+          syncAllPaneModelDropdowns();
           renderSettingsContent();
         };
       }
@@ -2298,6 +3002,35 @@
         };
       });
 
+      // Shuffle Models
+      const shuffleBtn = el.settingsTabContent.querySelector(".shuffle-models-btn");
+      if (shuffleBtn && activeProv) {
+        shuffleBtn.onclick = () => {
+          saveActiveProviderInputs();
+          if (!activeProv.models || activeProv.models.length <= 1) return;
+          activeProv.models = shuffleModelArray(activeProv.models);
+          renderSettingsContent();
+          syncAllPaneModelDropdowns();
+        };
+      }
+
+      // Move Model Up / Down
+      const swapModel = (mid, delta) => {
+        saveActiveProviderInputs();
+        const swapped = swapModelInArray(activeProv.models, mid, delta, 0);
+        if (swapped) {
+          activeProv.models = swapped;
+          renderSettingsContent();
+          syncAllPaneModelDropdowns();
+        }
+      };
+      el.settingsTabContent.querySelectorAll(".move-model-up-btn").forEach((btn) => {
+        btn.onclick = () => swapModel(btn.dataset.modelId, -1);
+      });
+      el.settingsTabContent.querySelectorAll(".move-model-down-btn").forEach((btn) => {
+        btn.onclick = () => swapModel(btn.dataset.modelId, 1);
+      });
+
       // Delete Model
       el.settingsTabContent.querySelectorAll(".delete-model-btn").forEach((btn) => {
         btn.onclick = () => {
@@ -2306,6 +3039,7 @@
           activeProv.models = activeProv.models.filter((m) => m.id !== mid);
           refreshProviderAccessibility(activeProv);
           renderSettingsContent();
+          syncAllPaneModelDropdowns();
         };
       });
 
@@ -2326,13 +3060,7 @@
               state.settingsSnapshot.settings = JSON.parse(JSON.stringify(state.settings));
             }
             renderSettingsContent();
-            el.panesContainer.querySelectorAll(".chat-pane").forEach((paneEl) => {
-              const tabId = paneEl.dataset.tabId;
-              const targetTab = state.tabs.find((t) => t.id === tabId);
-              if (targetTab) {
-                updatePaneModelDropdown(paneEl, targetTab);
-              }
-            });
+            syncAllPaneModelDropdowns();
           }
         };
       }
@@ -2371,24 +3099,30 @@
             const current = activeProv.models || [];
 
             // 1. Keep existing models that are present in fetch (preserving user-configured pricing/thinking)
-            const retained = current.filter((m) => fetchedIds.has(m.id));
+            const cleanFetchedIds = new Set(Array.from(fetchedIds, stripModelPrefix));
+            const retained = current.filter((m) => fetchedIds.has(m.id) || cleanFetchedIds.has(stripModelPrefix(m.id)));
             const retainedIds = new Set(retained.map((m) => m.id));
 
-            // 2. If no existing configured models matched, auto-fill up to 5 with $0 pricing and thinking unchecked
-            if (retained.length === 0) {
-              for (const fm of fetched) {
+            // 2. If any slots for configured models is empty out of maximum 5,
+            // add unconfigured fetched models, newer ones first!
+            const cleanRetainedIds = new Set(Array.from(retainedIds, stripModelPrefix));
+            if (retained.length < 5) {
+              const unconfigured = fetched.filter(
+                (fm) => !retainedIds.has(fm.id) && !cleanRetainedIds.has(stripModelPrefix(fm.id))
+              );
+              for (const candidate of sortModelsNewerFirst(unconfigured)) {
                 if (retained.length >= 5) break;
-                if (!retainedIds.has(fm.id)) {
-                  retained.push({
-                    id: fm.id,
-                    name: fm.name || fm.id,
-                    supports_thinking: 0,
-                    input_price: 0.0,
-                    cached_input_price: 0.0,
-                    output_price: 0.0,
-                  });
-                  retainedIds.add(fm.id);
-                }
+                const isThinking = /o1|o3|r1|reasoning|thinking/i.test(candidate.id) ? 1 : (candidate.supports_thinking || 0);
+                retained.push({
+                  id: candidate.id,
+                  name: candidate.name || candidate.id,
+                  supports_thinking: isThinking,
+                  input_price: candidate.input_price || 0.0,
+                  cached_input_price: candidate.cached_input_price || 0.0,
+                  output_price: candidate.output_price || 0.0,
+                });
+                retainedIds.add(candidate.id);
+                cleanRetainedIds.add(stripModelPrefix(candidate.id));
               }
             }
 
@@ -2396,33 +3130,28 @@
             activeProv.fetched_model_ids = Array.from(fetchedIds);
             activeProv.has_api_key = true;
             activeProv.is_accessible = activeProv.is_enabled && activeProv.models.length > 0;
+            activeProv.sync_status = res.sync_status || "ready";
+            activeProv.sync_error = res.sync_error || "";
 
-            await callApi("save_settings", state.providers, state.settings);
+            if (activeProv.id === "gemini") {
+              syncSearchModelsWithGeminiFetch(fetchedIds);
+            }
+
+            await callApi("save_settings", state.providers, state.settings, state.webSearchModels);
             if (state.settingsSnapshot) {
               state.settingsSnapshot.providers = JSON.parse(JSON.stringify(state.providers));
+              state.settingsSnapshot.webSearchModels = JSON.parse(JSON.stringify(state.webSearchModels));
             }
             renderSettingsContent();
-            el.panesContainer.querySelectorAll(".chat-pane").forEach((paneEl) => {
-              const tabId = paneEl.dataset.tabId;
-              const targetTab = state.tabs.find((t) => t.id === tabId);
-              if (targetTab) {
-                updatePaneModelDropdown(paneEl, targetTab);
-              }
-            });
+            syncAllPaneModelDropdowns();
             showNoticeDialog(`Synced ${activeProv.models.length} models for ${activeProv.name}!`);
           } else {
-            activeProv.models = [];
-            activeProv.fetched_model_ids = [];
             activeProv.is_accessible = false;
-            await callApi("save_settings", state.providers, state.settings);
+            activeProv.fetched_model_ids = [];
+            activeProv.sync_status = res?.sync_status || "error";
+            activeProv.sync_error = res?.sync_error || "FETCH ERROR";
+            syncAllPaneWebSearchButtons();
             renderSettingsContent();
-            el.panesContainer.querySelectorAll(".chat-pane").forEach((paneEl) => {
-              const tabId = paneEl.dataset.tabId;
-              const targetTab = state.tabs.find((t) => t.id === tabId);
-              if (targetTab) {
-                updatePaneModelDropdown(paneEl, targetTab);
-              }
-            });
             showNoticeDialog(`Could not fetch models: ${res?.error || "Endpoint unreachable or invalid API key"}`);
           }
         };
@@ -2430,6 +3159,27 @@
     }
 
     lucide.createIcons();
+
+    el.settingsTabContent.dataset.renderedTab = state.masterSettingsTab;
+    el.settingsTabContent.dataset.renderedProvId =
+      state.masterSettingsTab === "providers" ? (state.activeProviderId || state.providers[0]?.id || "") : "";
+
+    const restoreScrollPositions = () => {
+      if (modalBody && (sameProviderView || sameGeneralView || sameWebSearchView || (prevTab === "providers" && state.masterSettingsTab === "providers"))) {
+        modalBody.scrollTop = prevModalScroll;
+      }
+      const newSubNav = el.settingsTabContent.querySelector(".providers-sub-nav");
+      if (newSubNav && prevSubNavScroll > 0 && state.masterSettingsTab === "providers") {
+        newSubNav.scrollTop = prevSubNavScroll;
+      }
+      const newModelsList = document.getElementById("prov-models-list") || document.getElementById("ws-models-list");
+      if (newModelsList && (sameProviderView || sameWebSearchView) && prevModelsScroll > 0) {
+        newModelsList.scrollTop = prevModelsScroll;
+      }
+    };
+
+    restoreScrollPositions();
+    requestAnimationFrame(restoreScrollPositions);
   }
 
   function saveGeneralTabInputs() {
@@ -2439,6 +3189,11 @@
 
       const defProv = document.getElementById("setting-default-provider");
       if (defProv) state.settings.default_provider = defProv.value;
+
+      const defThink = document.getElementById("setting-default-thinking");
+      if (defThink && VALID_THINKING_LEVELS.has(defThink.value)) {
+        state.settings.default_thinking = defThink.value;
+      }
 
       const themeSelect = document.getElementById("setting-theme");
       if (themeSelect) applyTheme(themeSelect.value);
@@ -2486,7 +3241,7 @@
       return;
     }
 
-    const res = await callApi("save_settings", state.providers, state.settings);
+    const res = await callApi("save_settings", state.providers, state.settings, state.webSearchModels);
     if (res && res.error) {
       showNoticeDialog(res.error);
       return;
@@ -2499,8 +3254,20 @@
         delete p.clear_api_key;
       });
     }
+    if (res && Array.isArray(res.web_search_models)) {
+      state.webSearchModels = normalizeWebSearchModelsClient(res.web_search_models);
+    }
     closeSettingsModal(true);
     for (const tab of state.tabs) {
+      if (!tab.conversationId) {
+        if (!tab._userSelectedModel) {
+          tab._preferredProviderId = state.settings.default_provider || "";
+          tab._preferredModelId = state.settings.default_model || "";
+        }
+        if (!tab._userSelectedThinking) {
+          tab._preferredThinkingLevel = getDefaultThinkingLevel();
+        }
+      }
       if (tab.conversationId) {
         try {
           const stats = await callApi("get_conversation_token_stats", tab.conversationId);
@@ -2756,6 +3523,12 @@
           return;
         }
       }
+
+      const mdLink = e.target.closest(".assistant-markdown-content a[href]");
+      if (mdLink) {
+        isPageUnloading = true;
+        persistTabsState();
+      }
     });
 
     // Master Settings Tabs
@@ -2772,6 +3545,16 @@
       updateMasterTabsUI();
       renderSettingsContent();
     };
+
+    if (el.masterTabWebSearch) {
+      el.masterTabWebSearch.onclick = () => {
+        saveGeneralTabInputs();
+        saveActiveProviderInputs();
+        state.masterSettingsTab = "websearch";
+        updateMasterTabsUI();
+        renderSettingsContent();
+      };
+    }
 
     el.saveSettingsBtn.onclick = saveSettingsFromModal;
     document.querySelectorAll(".close-modal-btn").forEach((btn) => {
