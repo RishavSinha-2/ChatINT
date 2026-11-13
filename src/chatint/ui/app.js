@@ -68,9 +68,9 @@
     activeTabId: null,
     // Up to 5 side-by-side split tab IDs
     splitTabIds: [],
-    masterSettingsTab: "general", // 'general' or 'providers'
+    masterSettingsTab: "general", // 'general', 'providers', or 'websearch'
     activeProviderId: null,
-    activeConvSettingsId: null,
+    activeConvSettingsTabId: null,
     activeExportConvId: null,
     googleSearchTotals: { month: "", monthly: 0, all_time: 0 },
     settingsBuffer: null,
@@ -146,22 +146,42 @@
     }
   }
 
-  // Single-Space Dark/Light Theme Aware Custom Dialogs (replaces browser alert/confirm/prompt)
+  // Single-Space Dark/Light Theme Aware Custom Dialogs (FIFO queued so concurrent calls never clobber)
   let activeDialogResolve = null;
+  const dialogQueue = [];
+
+  function _drainDialogQueue() {
+    if (activeDialogResolve || dialogQueue.length === 0 || !el.appDialogModal) return;
+    const next = dialogQueue.shift();
+    activeDialogResolve = next.resolve;
+    next.openFn();
+  }
+
+  function _enqueueDialog(openFn) {
+    return new Promise((resolve) => {
+      dialogQueue.push({ openFn, resolve });
+      _drainDialogQueue();
+    });
+  }
 
   function closeAppDialog(result) {
     if (!el.appDialogModal) return;
     el.appDialogModal.classList.remove("open");
+    if (el.appDialogInput) el.appDialogInput.onkeydown = null;
+    if (el.appDialogCancelBtn) el.appDialogCancelBtn.onclick = null;
+    if (el.appDialogOkBtn) el.appDialogOkBtn.onclick = null;
     if (activeDialogResolve) {
       const resolve = activeDialogResolve;
       activeDialogResolve = null;
       resolve(result);
     }
+    if (dialogQueue.length > 0) {
+      setTimeout(_drainDialogQueue, 10);
+    }
   }
 
   function showNoticeDialog(message) {
-    return new Promise((resolve) => {
-      activeDialogResolve = resolve;
+    return _enqueueDialog(() => {
       el.appDialogMessage.textContent = message;
       el.appDialogInput.style.display = "none";
       el.appDialogInput.onkeydown = null;
@@ -177,8 +197,7 @@
   }
 
   function showConfirmDialog(message, confirmLabel = "Delete", isDanger = true) {
-    return new Promise((resolve) => {
-      activeDialogResolve = resolve;
+    return _enqueueDialog(() => {
       el.appDialogMessage.textContent = message;
       el.appDialogInput.style.display = "none";
       el.appDialogInput.onkeydown = null;
@@ -195,8 +214,7 @@
   }
 
   function showPromptDialog(message, defaultValue = "", placeholder = "") {
-    return new Promise((resolve) => {
-      activeDialogResolve = resolve;
+    return _enqueueDialog(() => {
       el.appDialogMessage.textContent = message;
       el.appDialogInput.style.display = "block";
       el.appDialogInput.value = defaultValue || "";
@@ -292,33 +310,58 @@
     });
   }
 
-  // Event Poller for real-time events from Python bridge (chunks, naming, model updates)
+  // Event Poller for real-time events from Python bridge (adaptive cadence: fast while active, gentle while idle)
   let isPollingEvents = false;
   let isPageUnloading = false;
-  window.addEventListener("beforeunload", () => {
-    isPageUnloading = true;
-  });
+  let eventPollTimer = null;
 
-  function startEventPolling() {
-    setInterval(async () => {
-      if (isPollingEvents || isPageUnloading) return;
-      isPollingEvents = true;
-      try {
-        const events = await callApi("get_pending_events");
-        if (isPageUnloading) return;
-        if (Array.isArray(events) && events.length > 0) {
-          for (const ev of events) {
-            if (window.ChatIntUI && window.ChatIntUI.onStreamEvent) {
-              window.ChatIntUI.onStreamEvent(ev);
-            }
+  function generateClientStreamId() {
+    return "stream_" + Date.now() + "_" + Math.random().toString(36).slice(2, 10);
+  }
+
+  function isAppActivelyBusy() {
+    if (state.tabs.some((t) => t.isStreaming)) return true;
+    if (state.providers.some((p) => p.sync_status === "checking")) return true;
+    return false;
+  }
+
+  function scheduleNextEventPoll(delayMs = null) {
+    if (isPageUnloading) return;
+    if (eventPollTimer) {
+      clearTimeout(eventPollTimer);
+      eventPollTimer = null;
+    }
+    const nextDelay = typeof delayMs === "number" ? delayMs : (isAppActivelyBusy() ? 35 : 250);
+    eventPollTimer = setTimeout(pollPendingEventsOnce, nextDelay);
+  }
+
+  async function pollPendingEventsOnce() {
+    eventPollTimer = null;
+    if (isPollingEvents || isPageUnloading) {
+      scheduleNextEventPoll();
+      return;
+    }
+    isPollingEvents = true;
+    try {
+      const events = await callApi("get_pending_events");
+      if (isPageUnloading) return;
+      if (Array.isArray(events) && events.length > 0) {
+        for (const ev of events) {
+          if (window.ChatIntUI && window.ChatIntUI.onStreamEvent) {
+            window.ChatIntUI.onStreamEvent(ev);
           }
         }
-      } catch (err) {
-        // Throttled or window closing
-      } finally {
-        isPollingEvents = false;
       }
-    }, 45);
+    } catch (err) {
+      // Throttled or window closing
+    } finally {
+      isPollingEvents = false;
+      scheduleNextEventPoll();
+    }
+  }
+
+  function startEventPolling() {
+    scheduleNextEventPoll(35);
   }
 
   // Initialize App
@@ -406,9 +449,11 @@
     callApi("set_theme", nextTheme);
   }
 
-  // Tab State Persistence
-  function persistTabsState() {
-    const serialized = {
+  // Tab State Persistence (debounced to reduce SQLite write chatter on rapid tab/split clicks)
+  let persistTabsTimer = null;
+
+  function serializeTabsState() {
+    return {
       tabs: state.tabs.map((t) => ({
         id: t.id,
         conversationId: t.conversationId,
@@ -425,8 +470,33 @@
       activeTabId: state.activeTabId,
       splitTabIds: state.splitTabIds,
     };
-    callApi("save_tabs_state", serialized);
   }
+
+  function flushTabsState() {
+    if (persistTabsTimer) {
+      clearTimeout(persistTabsTimer);
+      persistTabsTimer = null;
+    }
+    if (!state.tabs || state.tabs.length === 0) return;
+    callApi("save_tabs_state", serializeTabsState()).catch(() => {});
+  }
+
+  function persistTabsState() {
+    if (persistTabsTimer) {
+      clearTimeout(persistTabsTimer);
+    }
+    persistTabsTimer = setTimeout(() => {
+      persistTabsTimer = null;
+      if (!isPageUnloading) {
+        callApi("save_tabs_state", serializeTabsState()).catch(() => {});
+      }
+    }, 180);
+  }
+
+  window.addEventListener("beforeunload", () => {
+    isPageUnloading = true;
+    flushTabsState();
+  });
 
   function getVerifiedProviderModels(prov, limit = null) {
     if (!prov || !Array.isArray(prov.models)) return [];
@@ -508,6 +578,8 @@
       _usingTempFallback: false,
       webSearchEnabled: Boolean(overrides.webSearchEnabled),
       isStreaming: false,
+      activeStreamId: null,
+      lastStreamError: null,
       streamingContent: "",
       streamingThinking: "",
       hasAutoCollapsedThinking: false,
@@ -555,13 +627,15 @@
     const index = state.tabs.findIndex((t) => t.id === tabId);
     if (index === -1) return;
 
-    if (state.tabs[index].isStreaming) {
-      callApi("stop_streaming", tabId);
+    const closedTab = state.tabs[index];
+    if (closedTab.isStreaming) {
+      callApi("stop_streaming", tabId, closedTab.activeStreamId || null).catch(() => {});
+      closedTab.isStreaming = false;
+      closedTab.activeStreamId = null;
     }
 
-    const closedTab = state.tabs[index];
     if (closedTab && closedTab.conversationId && !state.conversations.some((c) => c.id === closedTab.conversationId)) {
-      callApi("delete_conversation", closedTab.conversationId);
+      callApi("delete_conversation", closedTab.conversationId, true).catch(() => {});
     }
 
     state.tabs.splice(index, 1);
@@ -829,6 +903,7 @@
 
       tabEl.innerHTML = `
         <span class="tab-title">${escapeHtml(title)}</span>
+        ${tab.lastStreamError ? '<span class="tab-error-dot" title="Stream error occurred in this tab"></span>' : ""}
         <button class="tab-close-btn" title="Close Tab">
           <i data-lucide="x" style="width: 13px; height: 13px;"></i>
         </button>
@@ -868,6 +943,12 @@
 
   // Render Active Panes (1 to 5 Equal Sized Columns)
   function renderActivePanes() {
+    el.panesContainer.querySelectorAll(".chat-pane").forEach((oldPane) => {
+      if (oldPane._resizeObserver) {
+        oldPane._resizeObserver.disconnect();
+        oldPane._resizeObserver = null;
+      }
+    });
     el.panesContainer.innerHTML = "";
     sanitizeSplitTabIds();
 
@@ -1015,6 +1096,7 @@
         }
       });
       ro.observe(pane);
+      pane._resizeObserver = ro;
     }
 
     return pane;
@@ -1288,19 +1370,193 @@
     }
     if (tab.streamingContent) {
       const contentDiv = liveRow.querySelector(`#live-content-${tab.id}`);
-      if (contentDiv) contentDiv.innerHTML = renderMarkdownWithEnhancements(tab.streamingContent);
+      if (contentDiv) contentDiv.innerHTML = renderMarkdownWithEnhancements(tab.streamingContent, { isStreaming: true });
     }
 
     return liveRow;
   }
 
+  const pendingStreamRenderTabs = new Set();
+  let streamRenderRaf = null;
+
+  function applyLiveStreamRender(tabId) {
+    const tab = state.tabs.find((t) => t.id === tabId);
+    if (!tab) return;
+    const pane = el.panesContainer.querySelector(`.chat-pane[data-tab-id="${tab.id}"]`);
+    const messagesContainer = pane ? pane.querySelector(`#messages-${tab.id}`) : null;
+    if (!pane || !messagesContainer) return;
+
+    const thinkAcc = document.getElementById(`live-thinking-${tab.id}`);
+    const thinkBody = document.getElementById(`live-thinking-body-${tab.id}`);
+    if (thinkAcc && thinkBody && tab.streamingThinking) {
+      thinkAcc.style.display = "block";
+      thinkBody.textContent = tab.streamingThinking;
+    }
+
+    if (tab.streamingContent) {
+      if (thinkAcc && !tab.hasAutoCollapsedThinking) {
+        tab.hasAutoCollapsedThinking = true;
+        thinkAcc.classList.add("collapsed");
+        const titleSpan = thinkAcc.querySelector(".thinking-title-left span");
+        if (titleSpan) titleSpan.textContent = "Thought Process (Complete)";
+        const pulse = thinkAcc.querySelector(".thinking-pulse");
+        if (pulse) pulse.remove();
+      }
+      const contentDiv = document.getElementById(`live-content-${tab.id}`);
+      if (contentDiv) {
+        contentDiv.innerHTML = renderMarkdownWithEnhancements(tab.streamingContent, { isStreaming: true });
+        renderIcons(contentDiv);
+      }
+    }
+
+    const isNearBottom = messagesContainer.scrollHeight - messagesContainer.scrollTop - messagesContainer.clientHeight < 120;
+    if (isNearBottom) {
+      messagesContainer.scrollTop = messagesContainer.scrollHeight;
+    }
+  }
+
+  function flushPendingStreamRenders() {
+    streamRenderRaf = null;
+    const tabIds = Array.from(pendingStreamRenderTabs);
+    pendingStreamRenderTabs.clear();
+    for (const tabId of tabIds) {
+      applyLiveStreamRender(tabId);
+    }
+  }
+
+  function scheduleStreamRender(tabId) {
+    pendingStreamRenderTabs.add(tabId);
+    if (streamRenderRaf !== null) return;
+    if (typeof requestAnimationFrame === "function") {
+      streamRenderRaf = requestAnimationFrame(flushPendingStreamRenders);
+    } else {
+      flushPendingStreamRenders();
+    }
+  }
+
   function setTabStreamingUI(pane, tab, streaming) {
     tab.isStreaming = Boolean(streaming);
+    if (streaming) {
+      scheduleNextEventPoll(20);
+    }
     if (!pane) return;
     const sendBtn = pane.querySelector(`#send-btn-${tab.id}`);
     const stopBtn = pane.querySelector(`#stop-btn-${tab.id}`);
     if (sendBtn) sendBtn.style.display = streaming ? "none" : "flex";
     if (stopBtn) stopBtn.style.display = streaming ? "flex" : "none";
+  }
+
+  function appendStreamErrorBanner(tab, pane, messagesContainer, errorText, existingRow = null) {
+    let targetRow = existingRow;
+    if (!targetRow) {
+      targetRow = document.createElement("div");
+      targetRow.className = "message-row assistant-message-row";
+      messagesContainer.appendChild(targetRow);
+    }
+
+    const errBox = document.createElement("div");
+    errBox.className = "stream-error-banner";
+    errBox.innerHTML = `
+      <div><strong>Error:</strong> ${escapeHtml(errorText || "Unknown error")}</div>
+      <button class="btn-secondary stream-error-retry-btn">Retry</button>
+    `;
+    targetRow.appendChild(errBox);
+
+    const retryBtn = errBox.querySelector(".stream-error-retry-btn");
+    if (retryBtn) {
+      retryBtn.onclick = async () => {
+        if (tab.isStreaming) return;
+        if (!tab.modelId || !tab.providerId) {
+          showNoticeDialog("Please configure a valid provider & model in Settings (Ctrl+,) first.");
+          return;
+        }
+        tab.lastStreamError = null;
+        renderTabs();
+
+        let prevRow = targetRow.previousElementSibling;
+        while (prevRow && !prevRow.classList.contains("user-message-row")) {
+          prevRow = prevRow.previousElementSibling;
+        }
+        const prevMsgId = prevRow ? prevRow.dataset.msgId : null;
+        const prevBubble = prevRow ? prevRow.querySelector(".user-bubble") : null;
+        const prevText =
+          prevRow && typeof prevRow._rawContent === "string"
+            ? prevRow._rawContent
+            : (prevBubble ? prevBubble.textContent : "");
+
+        if (!prevRow || !prevText) {
+          showNoticeDialog("Unable to retry: could not find the prompt message to resend.");
+          return;
+        }
+
+        const clientStreamId = generateClientStreamId();
+        tab.activeStreamId = clientStreamId;
+        targetRow.remove();
+        setTabStreamingUI(pane, tab, true);
+        const useWebSearch = Boolean(tab.webSearchEnabled && getWebSearchAvailability().available);
+
+        try {
+          let res = null;
+          if (tab.conversationId && prevMsgId && !prevMsgId.startsWith("user_temp_")) {
+            res = await callApi(
+              "edit_message",
+              tab.id,
+              tab.conversationId,
+              prevMsgId,
+              prevText,
+              tab.providerId,
+              tab.modelId,
+              tab.thinkingLevel,
+              useWebSearch,
+              clientStreamId
+            );
+          } else {
+            res = await callApi(
+              "send_message",
+              tab.id,
+              tab.conversationId,
+              prevText,
+              tab.providerId,
+              tab.modelId,
+              tab.thinkingLevel,
+              tab.title || "New Chat",
+              tab.systemPrompt || "",
+              tab.maxContextMessages || 30,
+              useWebSearch,
+              clientStreamId
+            );
+          }
+          if (!res || res.error) {
+            if (tab.activeStreamId === clientStreamId) {
+              tab.activeStreamId = null;
+              setTabStreamingUI(pane, tab, false);
+            }
+            showNoticeDialog((res && res.error) || "Failed to retry message.");
+            return;
+          }
+          if (res.conversation_id) {
+            tab.conversationId = res.conversation_id;
+          }
+          if (res.user_message && res.user_message.id && prevRow) {
+            prevRow.dataset.msgId = res.user_message.id;
+          }
+          if (res.stream_id) {
+            tab.activeStreamId = res.stream_id;
+          }
+          if (res.token_stats) {
+            tab.tokenStats = res.token_stats;
+            renderTokenStats(pane, tab.id, res.token_stats);
+          }
+        } catch (err) {
+          if (tab.activeStreamId === clientStreamId) {
+            tab.activeStreamId = null;
+            setTabStreamingUI(pane, tab, false);
+          }
+          showNoticeDialog(`Failed to retry message: ${err.message || err}`);
+        }
+      };
+    }
+    return targetRow;
   }
 
   // Populate Pane Content & Attach Handlers
@@ -1361,16 +1617,20 @@
     };
 
     sendBtn.onclick = () => sendMessageFromPane(pane, tab);
-    stopBtn.onclick = () => callApi("stop_streaming", tab.id);
+    stopBtn.onclick = () => callApi("stop_streaming", tab.id, tab.activeStreamId || null).catch(() => {});
     setTabStreamingUI(pane, tab, tab.isStreaming);
 
     // 2. Load Messages (or Draft Empty View)
     if (!tab.conversationId) {
-      renderWelcomePlaceholder();
       if (tab.isStreaming) {
         messagesContainer.innerHTML = "";
         messagesContainer.appendChild(createLiveStreamingRow(tab));
         renderIcons(messagesContainer);
+      } else {
+        renderWelcomePlaceholder();
+        if (tab.lastStreamError) {
+          appendStreamErrorBanner(tab, pane, messagesContainer, tab.lastStreamError);
+        }
       }
     } else {
       const expectedConvId = tab.conversationId;
@@ -1407,6 +1667,8 @@
           if (!existingLive) {
             messagesContainer.appendChild(createLiveStreamingRow(tab));
           }
+        } else if (tab.lastStreamError) {
+          appendStreamErrorBanner(tab, pane, messagesContainer, tab.lastStreamError);
         }
         renderIcons(messagesContainer);
         messagesContainer.scrollTop = messagesContainer.scrollHeight;
@@ -1498,6 +1760,10 @@
         }
         row.remove();
 
+        const clientStreamId = generateClientStreamId();
+        tab.activeStreamId = clientStreamId;
+        tab.lastStreamError = null;
+        renderTabs();
         setTabStreamingUI(pane, tab, true);
         const realMsgId = row.dataset.msgId || msg.id;
         const useWebSearch = Boolean(tab.webSearchEnabled && getWebSearchAvailability().available);
@@ -1510,19 +1776,29 @@
             tab.providerId,
             tab.modelId,
             tab.thinkingLevel,
-            useWebSearch
+            useWebSearch,
+            clientStreamId
           );
           if (!res || res.error) {
-            setTabStreamingUI(pane, tab, false);
+            if (tab.activeStreamId === clientStreamId) {
+              tab.activeStreamId = null;
+              setTabStreamingUI(pane, tab, false);
+            }
             showNoticeDialog((res && res.error) || "Failed to regenerate response.");
             return;
+          }
+          if (res.stream_id) {
+            tab.activeStreamId = res.stream_id;
           }
           if (res.token_stats) {
             tab.tokenStats = res.token_stats;
             renderTokenStats(pane, tab.id, res.token_stats);
           }
         } catch (err) {
-          setTabStreamingUI(pane, tab, false);
+          if (tab.activeStreamId === clientStreamId) {
+            tab.activeStreamId = null;
+            setTabStreamingUI(pane, tab, false);
+          }
           showNoticeDialog(`Failed to regenerate response: ${err.message || err}`);
         }
       };
@@ -1531,28 +1807,122 @@
     return row;
   }
 
+  const ALLOWED_MARKDOWN_TAGS = new Set([
+    "a", "p", "br", "hr", "h1", "h2", "h3", "h4", "h5", "h6",
+    "blockquote", "pre", "code", "em", "strong", "b", "i", "u", "s",
+    "del", "ins", "sub", "sup", "mark", "small", "ul", "ol", "li",
+    "dl", "dt", "dd", "table", "thead", "tbody", "tfoot", "tr", "th", "td",
+    "div", "span", "img", "details", "summary",
+    // KaTeX / MathML / inline SVG fraction/radical primitives
+    "math", "semantics", "mrow", "mi", "mo", "mn", "ms", "mtext", "mspace",
+    "msup", "msub", "msubsup", "mfrac", "msqrt", "mroot", "mover", "munder",
+    "munderover", "mtable", "mtr", "mtd", "mpadded", "mphantom", "annotation",
+    "svg", "path", "line", "rect", "g",
+  ]);
+
+  const ALLOWED_MARKDOWN_ATTRS = new Set([
+    "class", "href", "src", "alt", "title", "width", "height",
+    "colspan", "rowspan", "align", "open", "start", "type", "checked", "disabled",
+    "style", "aria-hidden", "role",
+    "viewbox", "d", "x1", "y1", "x2", "y2", "x", "y", "fill", "stroke", "stroke-width",
+    "preserveaspectratio", "xmlns", "encoding", "mathvariant", "stretchy", "fence",
+    "separator", "lspace", "rspace", "accent", "columnalign", "rowalign",
+    "columnspacing", "rowspacing", "displaystyle", "scriptlevel",
+  ]);
+
+  const ALLOWED_STYLE_PROPS = new Set([
+    "color", "background-color", "text-align", "vertical-align",
+    "margin", "margin-top", "margin-right", "margin-bottom", "margin-left",
+    "padding", "padding-top", "padding-right", "padding-bottom", "padding-left",
+    "top", "left", "right", "bottom",
+    "width", "height", "min-width", "max-width",
+    "font-size", "font-weight", "font-style", "font-family",
+    "border", "border-bottom", "border-top", "border-left", "border-right", "border-color", "border-style", "border-width",
+    "display", "position",
+  ]);
+
+  function _sanitizeCssStyle(rawStyle) {
+    if (!rawStyle) return "";
+    const lower = rawStyle.toLowerCase();
+    if (/expression\s*\(|javascript:|vbscript:|url\s*\(|@import|behavior\s*:|-moz-binding/.test(lower)) {
+      return "";
+    }
+    const cleanDecls = [];
+    for (const decl of rawStyle.split(";")) {
+      const colonIdx = decl.indexOf(":");
+      if (colonIdx === -1) continue;
+      const prop = decl.slice(0, colonIdx).trim().toLowerCase();
+      const val = decl.slice(colonIdx + 1).trim();
+      if (!ALLOWED_STYLE_PROPS.has(prop) || !val) continue;
+      if (/[<>]/.test(val)) continue;
+      cleanDecls.push(`${prop}: ${val}`);
+    }
+    return cleanDecls.join("; ");
+  }
+
+  function _isSafeUrl(rawUrl, allowMailtoAndHash = false) {
+    const trimmed = String(rawUrl || "").trim();
+    if (!trimmed) return false;
+    if (allowMailtoAndHash && trimmed.startsWith("#")) return true;
+    try {
+      const parsed = new URL(trimmed, "https://chatint.local");
+      const proto = parsed.protocol.toLowerCase();
+      if (proto === "https:" || proto === "http:") return true;
+      if (allowMailtoAndHash && proto === "mailto:") return true;
+      return false;
+    } catch (e) {
+      return false;
+    }
+  }
+
   function sanitizeMarkdownDom(container) {
     if (!container) return;
-    container.querySelectorAll("script, style, iframe, object, embed, form, meta, base, link").forEach((node) => node.remove());
-    container.querySelectorAll("*").forEach((node) => {
+    // Remove high-risk subtrees completely (tag AND inner text/children)
+    container.querySelectorAll("script, style, iframe, object, embed, form, meta, base, link, textarea, input, button, select").forEach((node) => node.remove());
+
+    const nodes = Array.from(container.querySelectorAll("*"));
+    for (const node of nodes) {
+      if (!node.isConnected && !container.contains(node)) continue;
+      const tag = node.tagName.toLowerCase();
+      if (!ALLOWED_MARKDOWN_TAGS.has(tag)) {
+        node.remove();
+        continue;
+      }
+
       for (const attr of Array.from(node.attributes)) {
         const name = attr.name.toLowerCase();
-        const val = (attr.value || "").trim().toLowerCase();
-        if (name.startsWith("on")) {
+        if (name.startsWith("on") || !ALLOWED_MARKDOWN_ATTRS.has(name)) {
           node.removeAttribute(attr.name);
-        } else if (
-          (name === "href" || name === "src" || name === "xlink:href" || name === "formaction") &&
-          (val.startsWith("javascript:") || val.startsWith("vbscript:") || val.startsWith("data:text/html"))
-        ) {
-          node.removeAttribute(attr.name);
+          continue;
+        }
+        if (name === "href") {
+          if (!_isSafeUrl(attr.value, true)) {
+            node.removeAttribute(attr.name);
+          }
+        } else if (name === "src") {
+          if (!_isSafeUrl(attr.value, false)) {
+            node.removeAttribute(attr.name);
+          }
+        } else if (name === "style") {
+          const safeStyle = _sanitizeCssStyle(attr.value);
+          if (safeStyle) {
+            node.setAttribute("style", safeStyle);
+          } else {
+            node.removeAttribute("style");
+          }
         }
       }
-    });
+
+      if (tag === "a" && node.hasAttribute("href")) {
+        node.setAttribute("rel", "noopener noreferrer");
+      }
+    }
   }
 
   // Render Markdown with Code Highlighting, Copy Buttons & Protected KaTeX Math
-  function renderMarkdownWithEnhancements(markdownText) {
+  function renderMarkdownWithEnhancements(markdownText, options = {}) {
     if (!markdownText || typeof markdownText !== "string") return "";
+    const isStreaming = Boolean(options && options.isStreaming);
 
     const nonce = Math.random().toString(36).slice(2, 10);
 
@@ -1610,16 +1980,49 @@
     const parser = new DOMParser();
     const doc = parser.parseFromString(`<div>${html}</div>`, "text/html");
     const rootContainer = doc.body.firstElementChild;
-    sanitizeMarkdownDom(rootContainer);
 
     if (rootContainer) {
-      let cleanHtml = rootContainer.innerHTML;
-      // 4. Restore trusted rendered KaTeX math tokens AFTER DOM sanitization
-      if (mathTokens.length > 0) {
-        const mathRestoreRe = new RegExp(`@@CIT_${nonce}_MATH_(\\d+)@@`, "g");
-        cleanHtml = cleanHtml.replace(mathRestoreRe, (_, idx) => mathTokens[Number(idx)]);
-        rootContainer.innerHTML = cleanHtml;
+      // 4. Expand KaTeX placeholder tokens into DOM nodes BEFORE running sanitizeMarkdownDom
+      if (mathTokens.length > 0 && typeof doc.createTreeWalker === "function") {
+        const mathTokenPattern = new RegExp(`@@CIT_${nonce}_MATH_(\\d+)@@`, "g");
+        const walker = doc.createTreeWalker(rootContainer, NodeFilter.SHOW_TEXT);
+        const textNodesToReplace = [];
+        let curNode = walker.nextNode();
+        while (curNode) {
+          if (curNode.nodeValue && curNode.nodeValue.includes(`@@CIT_${nonce}_MATH_`)) {
+            textNodesToReplace.push(curNode);
+          }
+          curNode = walker.nextNode();
+        }
+        for (const textNode of textNodesToReplace) {
+          const val = textNode.nodeValue;
+          const frag = doc.createDocumentFragment();
+          let lastIdx = 0;
+          mathTokenPattern.lastIndex = 0;
+          let m;
+          while ((m = mathTokenPattern.exec(val)) !== null) {
+            if (m.index > lastIdx) {
+              frag.appendChild(doc.createTextNode(val.slice(lastIdx, m.index)));
+            }
+            const tokenHtml = mathTokens[Number(m[1])] || "";
+            const mathDoc = parser.parseFromString(`<div>${tokenHtml}</div>`, "text/html");
+            const mathWrapper = mathDoc.body.firstElementChild;
+            if (mathWrapper) {
+              while (mathWrapper.firstChild) {
+                frag.appendChild(doc.adoptNode(mathWrapper.firstChild));
+              }
+            }
+            lastIdx = mathTokenPattern.lastIndex;
+          }
+          if (lastIdx < val.length) {
+            frag.appendChild(doc.createTextNode(val.slice(lastIdx)));
+          }
+          textNode.parentNode.replaceChild(frag, textNode);
+        }
       }
+
+      // 5. Sanitize ALL Markdown + KaTeX nodes via strict allowlist
+      sanitizeMarkdownDom(rootContainer);
 
       rootContainer.querySelectorAll("pre").forEach((pre) => {
         const code = pre.querySelector("code");
@@ -1634,10 +2037,11 @@
           try {
             if (lang && lang !== "code" && hljs.getLanguage(lang)) {
               code.innerHTML = hljs.highlight(rawCode, { language: lang, ignoreIllegals: true }).value;
-            } else {
+              code.classList.add("hljs");
+            } else if (!isStreaming) {
               code.innerHTML = hljs.highlightAuto(rawCode).value;
+              code.classList.add("hljs");
             }
-            code.classList.add("hljs");
           } catch (e) {}
         }
 
@@ -1660,7 +2064,7 @@
       return rootContainer.innerHTML;
     }
 
-    return html;
+    return escapeHtml(markdownText);
   }
 
   // Inline User Message Editing
@@ -1706,6 +2110,10 @@
         row.nextElementSibling.remove();
       }
 
+      const clientStreamId = generateClientStreamId();
+      tab.activeStreamId = clientStreamId;
+      tab.lastStreamError = null;
+      renderTabs();
       setTabStreamingUI(pane, tab, true);
       const realMsgId = row.dataset.msgId || msg.id;
       msg.id = realMsgId;
@@ -1722,19 +2130,29 @@
           tab.providerId,
           tab.modelId,
           tab.thinkingLevel,
-          useWebSearch
+          useWebSearch,
+          clientStreamId
         );
         if (!res || res.error) {
-          setTabStreamingUI(pane, tab, false);
+          if (tab.activeStreamId === clientStreamId) {
+            tab.activeStreamId = null;
+            setTabStreamingUI(pane, tab, false);
+          }
           showNoticeDialog((res && res.error) || "Failed to resend edited message.");
           return;
+        }
+        if (res.stream_id) {
+          tab.activeStreamId = res.stream_id;
         }
         if (res.token_stats) {
           tab.tokenStats = res.token_stats;
           renderTokenStats(pane, tab.id, res.token_stats);
         }
       } catch (err) {
-        setTabStreamingUI(pane, tab, false);
+        if (tab.activeStreamId === clientStreamId) {
+          tab.activeStreamId = null;
+          setTabStreamingUI(pane, tab, false);
+        }
         showNoticeDialog(`Failed to resend edited message: ${err.message || err}`);
       }
     };
@@ -1775,6 +2193,10 @@
     messagesContainer.scrollTop = messagesContainer.scrollHeight;
 
     // Toggle button state to streaming & lock selected model/thinking
+    const clientStreamId = generateClientStreamId();
+    tab.activeStreamId = clientStreamId;
+    tab.lastStreamError = null;
+    renderTabs();
     setTabStreamingUI(pane, tab, true);
     tab._userSelectedModel = true;
     tab._userSelectedThinking = true;
@@ -1797,12 +2219,19 @@
         tab.title || "New Chat",
         tab.systemPrompt || "",
         tab.maxContextMessages || 30,
-        useWebSearch
+        useWebSearch,
+        clientStreamId
       );
       if (!res || res.error) {
-        setTabStreamingUI(pane, tab, false);
+        if (tab.activeStreamId === clientStreamId) {
+          tab.activeStreamId = null;
+          setTabStreamingUI(pane, tab, false);
+        }
         showNoticeDialog((res && res.error) || "Failed to send message.");
         return;
+      }
+      if (res.stream_id) {
+        tab.activeStreamId = res.stream_id;
       }
       if (res.conversation_id) {
         tab.conversationId = res.conversation_id;
@@ -1812,7 +2241,10 @@
         userRow.dataset.msgId = res.user_message.id;
       }
     } catch (err) {
-      setTabStreamingUI(pane, tab, false);
+      if (tab.activeStreamId === clientStreamId) {
+        tab.activeStreamId = null;
+        setTabStreamingUI(pane, tab, false);
+      }
       showNoticeDialog(`Failed to send message: ${err.message || err}`);
     }
   }
@@ -1954,6 +2386,7 @@
           const bufProv = state.settingsBuffer.providers.find((p) => p.id === updated.id);
           if (bufProv) {
             bufProv.has_api_key = Boolean(updated.has_api_key);
+            bufProv.api_key_mask = updated.api_key_mask || "";
             bufProv.sync_status = updated.sync_status || "";
             bufProv.sync_error = updated.sync_error || "";
             if (Array.isArray(updated.fetched_model_ids) && updated.fetched_model_ids.length > 0) {
@@ -1974,19 +2407,10 @@
         return;
       }
 
-      const tab = state.tabs.find((t) => t.id === event.tab_id);
-      if (!tab) return;
-
-      const pane = el.panesContainer.querySelector(`.chat-pane[data-tab-id="${tab.id}"]`);
-      const messagesContainer = pane ? pane.querySelector(`#messages-${tab.id}`) : null;
-
       if (event.type === "chat_named") {
-        // Auto-naming triggered when first response streams!
-        tab.title = event.title;
-        tab.conversationId = event.conversation_id;
-
-        // Ensure in state.conversations
+        // Handle chat_named even if the user already closed or switched the tab
         let conv = state.conversations.find((c) => c.id === event.conversation_id);
+        const matchingTab = state.tabs.find((t) => t.id === event.tab_id);
         if (conv) {
           conv.title = event.title;
           conv.updated_at = Date.now() / 1000;
@@ -1994,22 +2418,54 @@
           state.conversations.unshift({
             id: event.conversation_id,
             title: event.title,
-            system_prompt: tab.systemPrompt || "",
-            max_context_messages: tab.maxContextMessages || 30,
+            system_prompt: matchingTab ? (matchingTab.systemPrompt || "") : "",
+            max_context_messages: matchingTab ? (matchingTab.maxContextMessages || 30) : 30,
             updated_at: Date.now() / 1000,
           });
+        }
+
+        if (matchingTab && (!matchingTab.conversationId || matchingTab.conversationId === event.conversation_id)) {
+          matchingTab.title = event.title;
+          matchingTab.conversationId = event.conversation_id;
+          if (event.token_stats) {
+            matchingTab.tokenStats = event.token_stats;
+          }
+          const matchingPane = el.panesContainer.querySelector(`.chat-pane[data-tab-id="${matchingTab.id}"]`);
+          if (event.token_stats && matchingPane) {
+            renderTokenStats(matchingPane, matchingTab.id, event.token_stats);
+          }
         }
 
         persistTabsState();
         renderConversationsList();
         renderTabs();
+        return;
+      }
 
-        if (event.token_stats && pane) {
-          tab.tokenStats = event.token_stats;
-          renderTokenStats(pane, tab.id, event.token_stats);
+      const tab = state.tabs.find((t) => t.id === event.tab_id);
+      if (!tab) return;
+
+      // Drop stale or cross-stream events belonging to another stream or conversation
+      if (event.stream_id && tab.activeStreamId && event.stream_id !== tab.activeStreamId) {
+        return;
+      }
+      if (event.type !== "start" && event.stream_id && !tab.activeStreamId) {
+        return;
+      }
+      if (event.conversation_id && tab.conversationId && event.conversation_id !== tab.conversationId) {
+        return;
+      }
+
+      const pane = el.panesContainer.querySelector(`.chat-pane[data-tab-id="${tab.id}"]`);
+      const messagesContainer = pane ? pane.querySelector(`#messages-${tab.id}`) : null;
+
+      if (event.type === "start") {
+        if (event.conversation_id && !tab.conversationId) {
+          tab.conversationId = event.conversation_id;
         }
-      } else if (event.type === "start") {
         tab.isStreaming = true;
+        tab.activeStreamId = event.stream_id || tab.activeStreamId || null;
+        tab.lastStreamError = null;
         tab.streamingContent = "";
         tab.streamingThinking = "";
         tab.hasAutoCollapsedThinking = false;
@@ -2019,6 +2475,8 @@
           ? event.thinking_level
           : "none";
         tab.streamingStartTime = Date.now();
+        scheduleNextEventPoll(20);
+        renderTabs();
 
         if (pane && messagesContainer) {
           const sendBtn = pane.querySelector(`#send-btn-${tab.id}`);
@@ -2080,42 +2538,27 @@
       } else if (event.type === "thinking_chunk") {
         tab.streamingThinking += event.chunk;
         if (pane && messagesContainer) {
-          const thinkAcc = document.getElementById(`live-thinking-${tab.id}`);
-          const thinkBody = document.getElementById(`live-thinking-body-${tab.id}`);
-          if (thinkAcc && thinkBody) {
-            thinkAcc.style.display = "block";
-            thinkBody.textContent = tab.streamingThinking;
-            const isNearBottom = messagesContainer.scrollHeight - messagesContainer.scrollTop - messagesContainer.clientHeight < 120;
-            if (isNearBottom) {
-              messagesContainer.scrollTop = messagesContainer.scrollHeight;
-            }
-          }
+          scheduleStreamRender(tab.id);
         }
       } else if (event.type === "content_chunk") {
         tab.streamingContent += event.chunk;
         if (pane && messagesContainer) {
-          const thinkAcc = document.getElementById(`live-thinking-${tab.id}`);
-          if (thinkAcc && !tab.hasAutoCollapsedThinking) {
-            tab.hasAutoCollapsedThinking = true;
-            thinkAcc.classList.add("collapsed");
-            const titleSpan = thinkAcc.querySelector(".thinking-title-left span");
-            if (titleSpan) titleSpan.textContent = "Thought Process (Complete)";
-            const pulse = thinkAcc.querySelector(".thinking-pulse");
-            if (pulse) pulse.remove();
-          }
-
-          const contentDiv = document.getElementById(`live-content-${tab.id}`);
-          if (contentDiv) {
-            contentDiv.innerHTML = renderMarkdownWithEnhancements(tab.streamingContent);
-            renderIcons(contentDiv);
-            const isNearBottom = messagesContainer.scrollHeight - messagesContainer.scrollTop - messagesContainer.clientHeight < 120;
-            if (isNearBottom) {
-              messagesContainer.scrollTop = messagesContainer.scrollHeight;
-            }
-          }
+          scheduleStreamRender(tab.id);
         }
       } else if (event.type === "done") {
+        pendingStreamRenderTabs.delete(tab.id);
         tab.isStreaming = false;
+        tab.activeStreamId = null;
+        tab.lastStreamError = null;
+
+        // Always persist tokenStats & global Search totals even if the tab pane is not currently mounted
+        if (event.token_stats) {
+          tab.tokenStats = event.token_stats;
+          if (event.token_stats.google_search_totals) {
+            state.googleSearchTotals = event.token_stats.google_search_totals;
+          }
+        }
+
         if (pane && messagesContainer) {
           const sendBtn = pane.querySelector(`#send-btn-${tab.id}`);
           const stopBtn = pane.querySelector(`#stop-btn-${tab.id}`);
@@ -2137,99 +2580,49 @@
           }
 
           if (event.token_stats) {
-            tab.tokenStats = event.token_stats;
-            if (event.token_stats.google_search_totals) {
-              state.googleSearchTotals = event.token_stats.google_search_totals;
-            }
             renderTokenStats(pane, tab.id, event.token_stats);
-            // Keep Google Search Requests count updated across any other open split panes
-            el.panesContainer.querySelectorAll(".chat-pane").forEach((otherPane) => {
-              const otherId = otherPane.dataset.tabId;
-              if (otherId && otherId !== tab.id) {
-                const otherTab = state.tabs.find((t) => t.id === otherId);
-                if (otherTab) {
-                  renderTokenStats(otherPane, otherId, otherTab.tokenStats || null);
-                }
-              }
-            });
           }
         }
+
+        if (event.token_stats) {
+          // Keep Google Search Requests count updated across any other open split panes
+          el.panesContainer.querySelectorAll(".chat-pane").forEach((otherPane) => {
+            const otherId = otherPane.dataset.tabId;
+            if (otherId && otherId !== tab.id) {
+              const otherTab = state.tabs.find((t) => t.id === otherId);
+              if (otherTab) {
+                renderTokenStats(otherPane, otherId, otherTab.tokenStats || null);
+              }
+            }
+          });
+        }
+        renderTabs();
       } else if (event.type === "error") {
+        pendingStreamRenderTabs.delete(tab.id);
         tab.isStreaming = false;
+        tab.activeStreamId = null;
         if (pane && messagesContainer) {
+          if (tab.streamingThinking || tab.streamingContent) {
+            applyLiveStreamRender(tab.id);
+          }
           const sendBtn = pane.querySelector(`#send-btn-${tab.id}`);
           const stopBtn = pane.querySelector(`#stop-btn-${tab.id}`);
           if (sendBtn) sendBtn.style.display = "flex";
           if (stopBtn) stopBtn.style.display = "none";
 
           let targetRow = document.getElementById(`live-msg-${tab.id}`);
-          if (!targetRow) {
-            targetRow = document.createElement("div");
-            targetRow.className = "message-row assistant-message-row";
-            messagesContainer.appendChild(targetRow);
-          } else {
+          if (targetRow) {
             // Strip live streaming IDs so subsequent streams never collide with this error row
             targetRow.removeAttribute("id");
             targetRow.classList.remove("live-streaming-row");
             targetRow.querySelectorAll("[id]").forEach((elWithId) => elWithId.removeAttribute("id"));
           }
 
-          const errBox = document.createElement("div");
-          errBox.style.cssText =
-            "background: rgba(229, 57, 53, 0.1); border: 1px solid #e53935; border-radius: 8px; padding: 10px 14px; color: #ff8a80; font-size: 13px; margin-top: 8px; display: flex; align-items: center; justify-content: space-between; gap: 12px;";
-          errBox.innerHTML = `
-            <div><strong>Error:</strong> ${escapeHtml(event.error)}</div>
-            <button class="btn-secondary retry-error-btn" style="padding: 4px 10px; font-size: 11.5px; white-space: nowrap; flex-shrink: 0;">Retry</button>
-          `;
-          targetRow.appendChild(errBox);
-
-          const retryBtn = errBox.querySelector(".retry-error-btn");
-          if (retryBtn) {
-            retryBtn.onclick = async () => {
-              if (tab.isStreaming) return;
-              if (!tab.modelId || !tab.providerId) {
-                showNoticeDialog("Please configure a valid provider & model in Settings (Ctrl+,) first.");
-                return;
-              }
-              const prevRow = targetRow.previousElementSibling;
-              const prevMsgId = prevRow ? prevRow.dataset.msgId : null;
-              const prevBubble = prevRow ? prevRow.querySelector(".user-bubble") : null;
-              const prevText =
-                prevRow && typeof prevRow._rawContent === "string"
-                  ? prevRow._rawContent
-                  : (prevBubble ? prevBubble.textContent : "");
-
-              if (!prevMsgId || !tab.conversationId) {
-                showNoticeDialog("Unable to retry: the previous message has not finished saving yet.");
-                return;
-              }
-
-              targetRow.remove();
-              setTabStreamingUI(pane, tab, true);
-              const useWebSearch = Boolean(tab.webSearchEnabled && getWebSearchAvailability().available);
-              try {
-                const res = await callApi(
-                  "edit_message",
-                  tab.id,
-                  tab.conversationId,
-                  prevMsgId,
-                  prevText,
-                  tab.providerId,
-                  tab.modelId,
-                  tab.thinkingLevel,
-                  useWebSearch
-                );
-                if (!res || res.error) {
-                  setTabStreamingUI(pane, tab, false);
-                  showNoticeDialog((res && res.error) || "Failed to retry message.");
-                }
-              } catch (err) {
-                setTabStreamingUI(pane, tab, false);
-                showNoticeDialog(`Failed to retry message: ${err.message || err}`);
-              }
-            };
-          }
+          appendStreamErrorBanner(tab, pane, messagesContainer, event.error, targetRow);
           messagesContainer.scrollTop = messagesContainer.scrollHeight;
+        } else {
+          tab.lastStreamError = event.error || "Streaming error";
+          renderTabs();
         }
       }
     },
@@ -2330,14 +2723,16 @@
           e.stopPropagation();
           const confirmed = await showConfirmDialog(`Delete chat "${conv.title}"?`);
           if (confirmed) {
-            callApi("delete_conversation", conv.id);
+            callApi("delete_conversation", conv.id, false).catch(() => {});
             state.conversations = state.conversations.filter((c) => c.id !== conv.id);
             state.tabs.forEach((t) => {
               if (t.conversationId === conv.id) {
                 if (t.isStreaming) {
-                  callApi("stop_streaming", t.id);
+                  callApi("stop_streaming", t.id, t.activeStreamId || null).catch(() => {});
                   t.isStreaming = false;
                 }
+                t.activeStreamId = null;
+                t.lastStreamError = null;
                 t.conversationId = null;
                 t.title = "New Chat";
                 t.systemPrompt = "";
@@ -2365,9 +2760,11 @@
             const activeTab = state.tabs.find((t) => t.id === state.activeTabId);
             if (activeTab) {
               if (activeTab.isStreaming && activeTab.conversationId !== conv.id) {
-                callApi("stop_streaming", activeTab.id);
+                callApi("stop_streaming", activeTab.id, activeTab.activeStreamId || null).catch(() => {});
                 activeTab.isStreaming = false;
               }
+              activeTab.activeStreamId = null;
+              activeTab.lastStreamError = null;
               activeTab.conversationId = conv.id;
               activeTab.title = conv.title;
               activeTab.systemPrompt = conv.system_prompt || "";
@@ -2723,7 +3120,7 @@
       const { available: wsAvail, reason: wsReason } = getWebSearchAvailability(geminiProv, buf.webSearchModels);
       const wsStatusLine = wsAvail
         ? '<span style="color: #34a853; font-weight: 600;">Ready</span> · Using your Gemini provider API key.'
-        : `<span style="color: #ff8a80; font-weight: 600;">Unavailable (${escapeHtml(wsReason)})</span> · Configure Gemini in Providers.`;
+        : `<span style="color: var(--danger-text); font-weight: 600;">Unavailable (${escapeHtml(wsReason)})</span> · Configure Gemini in Providers.`;
 
       const wsModels = buf.webSearchModels;
       const totalWs = wsModels.length;
@@ -2915,7 +3312,9 @@
           ["anthropic", "gemini"].includes(sanitizeProviderNameAlpha(activeProv.name).toLowerCase());
         const envKeyName = `${sanitizeProviderNameAlpha(activeProv.name).toUpperCase() || "PROVIDER"}_API_KEY`;
         const keyPlaceholder = activeProv.has_api_key && !activeProv.clear_api_key
-          ? `Saved in .env (${envKeyName}) — type to replace or click eye to view`
+          ? (activeProv.api_key_mask
+              ? `Saved (${activeProv.api_key_mask}) — type a new key to replace`
+              : `Saved in .env (${envKeyName}) — type a new key to replace`)
           : `Saved in .env as ${envKeyName}...`;
 
         const provModelsVisible = canShowProviderModels(activeProv);
@@ -3070,6 +3469,7 @@
       if (clearKeyBtn && activeProv) {
         clearKeyBtn.onclick = () => {
           activeProv.api_key = "";
+          activeProv.api_key_mask = "";
           activeProv.clear_api_key = true;
           activeProv.has_api_key = false;
           activeProv.sync_status = "no_key";
@@ -3080,22 +3480,15 @@
         };
       }
 
-      // Password visibility toggle (fetches from .env on demand if not yet loaded into input)
+      // Password visibility toggle for newly typed input only (stored keys remain write-only masked for security)
       const keyInput = document.getElementById("prov-api-key-input");
       const toggleBtn = el.settingsTabContent.querySelector(".toggle-key-visibility");
       if (toggleBtn && keyInput && activeProv) {
-        toggleBtn.onclick = async () => {
-          if (keyInput.type === "password") {
-            if (!keyInput.value && activeProv.has_api_key && !activeProv.clear_api_key) {
-              const res = await callApi("get_provider_api_key", activeProv.name);
-              if (res && res.api_key) {
-                keyInput.value = res.api_key;
-              }
-            }
-            keyInput.type = "text";
-          } else {
-            keyInput.type = "password";
-          }
+        toggleBtn.title = activeProv.has_api_key && !activeProv.clear_api_key && !keyInput.value
+          ? "Show/Hide typed key (stored keys remain masked)"
+          : "Show/Hide typed key";
+        toggleBtn.onclick = () => {
+          keyInput.type = keyInput.type === "password" ? "text" : "password";
         };
       }
 
@@ -3735,9 +4128,16 @@
         }
       }
 
-      const mdLink = e.target.closest(".assistant-markdown-content a[href]");
+      const mdLink = e.target.closest(".assistant-markdown-content a[href], .user-bubble a[href]");
       if (mdLink) {
-        persistTabsState();
+        const href = (mdLink.getAttribute("href") || "").trim();
+        if (/^https?:\/\//i.test(href)) {
+          e.preventDefault();
+          callApi("open_external_url", href).catch(() => {});
+        } else if (href && !href.startsWith("#")) {
+          e.preventDefault();
+        }
+        return;
       }
     });
 

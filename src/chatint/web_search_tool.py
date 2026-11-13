@@ -368,31 +368,34 @@ def execute_web_search(query: str, conversation_id: Optional[str] = None) -> Dic
     last_exc: Optional[Exception] = None
     auth_or_net_fatal = False
 
-    for candidate_model in candidates_to_try:
-        attempt_configs = _build_search_configs(genai_types, candidate_model, search_sys_prompt, search_tool)
-        for cfg in attempt_configs:
-            try:
-                response = client.models.generate_content(
-                    model=candidate_model,
-                    contents=f"Google Search: {clean_query}",
-                    config=cfg,
-                )
-                used_model_id = candidate_model
-                last_exc = None
+    try:
+        for candidate_model in candidates_to_try:
+            attempt_configs = _build_search_configs(genai_types, candidate_model, search_sys_prompt, search_tool)
+            for cfg in attempt_configs:
+                try:
+                    response = client.models.generate_content(
+                        model=candidate_model,
+                        contents=f"Google Search: {clean_query}",
+                        config=cfg,
+                    )
+                    used_model_id = candidate_model
+                    last_exc = None
+                    break
+                except Exception as exc:
+                    last_exc = exc
+                    low = str(exc).lower()
+                    if _is_network_exception_text(low) or _is_auth_exception_text(low):
+                        auth_or_net_fatal = True
+                        break
+                    # Retry thinking config fallback only when the request rejected thinking settings for this model
+                    is_thinking_arg_err = ("400" in low or "invalid_argument" in low) and "thinking" in low
+                    if not is_thinking_arg_err:
+                        # Model missing/unavailable/quota/unsupported -> try next priority model in configured list
+                        break
+            if response is not None or auth_or_net_fatal:
                 break
-            except Exception as exc:
-                last_exc = exc
-                low = str(exc).lower()
-                if _is_network_exception_text(low) or _is_auth_exception_text(low):
-                    auth_or_net_fatal = True
-                    break
-                # Retry thinking config fallback only when the request rejected thinking settings for this model
-                is_thinking_arg_err = ("400" in low or "invalid_argument" in low) and "thinking" in low
-                if not is_thinking_arg_err:
-                    # Model missing/unavailable/quota/unsupported -> try next priority model in configured list
-                    break
-        if response is not None or auth_or_net_fatal:
-            break
+    finally:
+        ClientManager.close_client(client)
 
     if response is None or not used_model_id:
         err_msg = str(last_exc or "No configured web search model available on Gemini endpoint.")

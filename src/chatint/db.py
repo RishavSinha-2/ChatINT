@@ -1,5 +1,6 @@
 import contextlib
 import json
+import os
 import re
 import sqlite3
 import threading
@@ -7,8 +8,22 @@ import time
 import uuid
 from typing import Any, Dict, List, Optional
 from chatint.config import DB_PATH, DEFAULT_PROVIDERS, ENV_PATH
+from chatint.logging_setup import get_logger
 
 _ENV_LOCK = threading.RLock()
+_logger = get_logger("chatint.db")
+
+
+def mask_api_key(api_key: str) -> str:
+    """Return a non-sensitive masked display hint for a saved API key."""
+    key = (api_key or "").strip()
+    if not key:
+        return ""
+    if len(key) <= 4:
+        return "•" * len(key)
+    if len(key) <= 10:
+        return f"{key[:2]}••••{key[-2:]}"
+    return f"{key[:4]}••••••{key[-4:]}"
 
 
 def strip_model_prefix(model_id: str) -> str:
@@ -34,33 +49,111 @@ def provider_env_key(provider_name: str) -> str:
     return f"{clean.upper()}_API_KEY"
 
 
+def _parse_env_value(raw_val: str) -> str:
+    val = (raw_val or "").strip()
+    if not val:
+        return ""
+    if len(val) >= 2 and val[0] == '"' and val[-1] == '"':
+        inner = val[1:-1]
+        out: List[str] = []
+        i = 0
+        while i < len(inner):
+            ch = inner[i]
+            if ch == "\\" and i + 1 < len(inner):
+                nxt = inner[i + 1]
+                if nxt == "n":
+                    out.append("\n")
+                elif nxt == "r":
+                    out.append("\r")
+                elif nxt == "t":
+                    out.append("\t")
+                elif nxt in ('"', "\\"):
+                    out.append(nxt)
+                else:
+                    out.append("\\" + nxt)
+                i += 2
+                continue
+            out.append(ch)
+            i += 1
+        return "".join(out)
+    if len(val) >= 2 and val[0] == "'" and val[-1] == "'":
+        return val[1:-1]
+    # Unquoted value: strip trailing inline comment if preceded by whitespace
+    comment_match = re.search(r"\s+#", val)
+    if comment_match:
+        val = val[: comment_match.start()].rstrip()
+    return val
+
+
+def _format_env_value(value: Any) -> str:
+    val = "" if value is None else str(value).replace("\r\n", "\n")
+    if val == "":
+        return ""
+    needs_quotes = (
+        any(ch.isspace() for ch in val)
+        or any(ch in val for ch in ('#', '"', "'", "=", "\\"))
+    )
+    if not needs_quotes:
+        return val
+    escaped = (
+        val.replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("\r", "\\r")
+        .replace("\n", "\\n")
+    )
+    return f'"{escaped}"'
+
+
+def _atomic_write_env(content: str):
+    ENV_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = ENV_PATH.parent / f".{ENV_PATH.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+    try:
+        with open(tmp_path, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(content)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_path, ENV_PATH)
+        try:
+            os.chmod(ENV_PATH, 0o600)
+        except OSError:
+            pass
+    except Exception:
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except OSError:
+            pass
+        raise
+
+
 def ensure_env_file():
-    if not ENV_PATH.exists() or ENV_PATH.read_text(encoding="utf-8").strip() == "":
-        lines = []
-        for p in DEFAULT_PROVIDERS:
-            clean = sanitize_provider_name(p.get("name", ""))
-            if clean:
-                default_val = "ollama" if clean.lower() == "ollama" else (p.get("api_key") or "")
-                lines.append(f"{clean.upper()}_API_KEY={default_val}")
-        ENV_PATH.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    else:
-        raw_text = ENV_PATH.read_text(encoding="utf-8")
-        existing_keys = set()
-        for line in raw_text.splitlines():
-            s = line.strip()
-            if s and not s.startswith("#") and "=" in s:
-                existing_keys.add(s.split("=", 1)[0].strip().upper())
-        appended = []
-        for p in DEFAULT_PROVIDERS:
-            clean = sanitize_provider_name(p.get("name", ""))
-            if clean:
-                env_k = f"{clean.upper()}_API_KEY"
-                if env_k not in existing_keys:
+    with _ENV_LOCK:
+        if not ENV_PATH.exists() or ENV_PATH.read_text(encoding="utf-8").strip() == "":
+            lines = []
+            for p in DEFAULT_PROVIDERS:
+                clean = sanitize_provider_name(p.get("name", ""))
+                if clean:
                     default_val = "ollama" if clean.lower() == "ollama" else (p.get("api_key") or "")
-                    appended.append(f"{env_k}={default_val}")
-        if appended:
-            prefix = raw_text if raw_text.endswith("\n") else (raw_text + "\n")
-            ENV_PATH.write_text(prefix + "\n".join(appended) + "\n", encoding="utf-8")
+                    lines.append(f"{clean.upper()}_API_KEY={_format_env_value(default_val)}")
+            _atomic_write_env("\n".join(lines) + ("\n" if lines else ""))
+        else:
+            raw_text = ENV_PATH.read_text(encoding="utf-8")
+            existing_keys = set()
+            for line in raw_text.splitlines():
+                s = line.strip()
+                if s and not s.startswith("#") and "=" in s:
+                    existing_keys.add(s.split("=", 1)[0].strip().upper())
+            appended = []
+            for p in DEFAULT_PROVIDERS:
+                clean = sanitize_provider_name(p.get("name", ""))
+                if clean:
+                    env_k = f"{clean.upper()}_API_KEY"
+                    if env_k not in existing_keys:
+                        default_val = "ollama" if clean.lower() == "ollama" else (p.get("api_key") or "")
+                        appended.append(f"{env_k}={_format_env_value(default_val)}")
+            if appended:
+                prefix = raw_text if raw_text.endswith("\n") else (raw_text + "\n")
+                _atomic_write_env(prefix + "\n".join(appended) + "\n")
 
 
 def read_env_dict() -> Dict[str, str]:
@@ -73,19 +166,38 @@ def read_env_dict() -> Dict[str, str]:
                 continue
             k, v = stripped.split("=", 1)
             k = k.strip()
-            v = v.strip()
-            if len(v) >= 2 and ((v[0] == '"' and v[-1] == '"') or (v[0] == "'" and v[-1] == "'")):
-                v = v[1:-1]
-            env_map[k] = v
+            if not k:
+                continue
+            env_map[k] = _parse_env_value(v)
         return env_map
 
 
 def write_env_dict(env_map: Dict[str, str]):
     with _ENV_LOCK:
         ensure_env_file()
-        lines = [f"{k}={v}" for k, v in env_map.items()]
-        content = "\n".join(lines) + ("\n" if lines else "")
-        ENV_PATH.write_text(content, encoding="utf-8")
+        existing_lines = ENV_PATH.read_text(encoding="utf-8").splitlines() if ENV_PATH.exists() else []
+        remaining = dict(env_map)
+        out_lines: List[str] = []
+        seen_keys = set()
+
+        for raw_line in existing_lines:
+            stripped = raw_line.strip()
+            if not stripped or stripped.startswith("#") or "=" not in stripped:
+                out_lines.append(raw_line)
+                continue
+            k, _ = stripped.split("=", 1)
+            k_clean = k.strip()
+            if k_clean in remaining:
+                if k_clean not in seen_keys:
+                    out_lines.append(f"{k_clean}={_format_env_value(remaining.pop(k_clean))}")
+                    seen_keys.add(k_clean)
+            # Deleted keys are omitted cleanly while preserving comments and blank lines
+
+        for k, v in remaining.items():
+            out_lines.append(f"{k}={_format_env_value(v)}")
+
+        content = "\n".join(out_lines) + ("\n" if out_lines else "")
+        _atomic_write_env(content)
 
 
 def get_api_key_from_env(provider_name: str) -> str:
@@ -122,7 +234,6 @@ def remove_api_key_from_env(provider_name: str):
 def get_connection() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, timeout=30.0)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA foreign_keys=ON;")
     conn.execute("PRAGMA busy_timeout=10000;")
     return conn
@@ -133,16 +244,28 @@ def open_db():
     conn = get_connection()
     try:
         yield conn
+    except Exception:
+        try:
+            conn.rollback()
+        except sqlite3.Error:
+            pass
+        raise
     finally:
         conn.close()
 
 
 PRIMARY_WEB_SEARCH_MODEL = "gemini-3.1-flash-lite"
+SCHEMA_VERSION = 1
 
 
 def init_db():
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     with open_db() as conn:
         cursor = conn.cursor()
+        try:
+            cursor.execute("PRAGMA journal_mode=WAL;")
+        except sqlite3.Error as exc:
+            _logger.warning("Could not enable SQLite WAL mode: %s", exc)
 
         cursor.execute("""
         CREATE TABLE IF NOT EXISTS providers (
@@ -249,7 +372,15 @@ def init_db():
             """)
 
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(conversation_id)")
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_messages_conv_role_created ON messages(conversation_id, role, created_at)"
+        )
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_token_ledger_conv ON token_ledger(conversation_id)")
+
+        cur_ver_row = cursor.execute("PRAGMA user_version").fetchone()
+        cur_ver = int(cur_ver_row[0]) if cur_ver_row else 0
+        if cur_ver < SCHEMA_VERSION:
+            cursor.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
         # Clean up legacy 'custom' provider if present from earlier runs
         cursor.execute("DELETE FROM providers WHERE id = 'custom'")
@@ -449,6 +580,7 @@ def get_providers() -> List[Dict[str, Any]]:
         rows = list(cursor.fetchall())
 
     rows.sort(key=lambda r: (_BUILTIN_PROVIDER_ORDER.get(r["id"], 999), r["rowid"]))
+    env_map = read_env_dict()
 
     providers = []
     for r in rows:
@@ -456,7 +588,9 @@ def get_providers() -> List[Dict[str, Any]]:
         pname = sanitize_provider_name(r["name"]) or "Provider"
         raw_models = json.loads(r["models_json"] or "[]")
         models = [_normalize_model_entry(m) for m in raw_models if m.get("id")]
-        has_api_key = bool(get_api_key_from_env(pname))
+        env_key_name = provider_env_key(pname)
+        raw_env_key = "" if env_key_name == "_API_KEY" else env_map.get(env_key_name, "")
+        has_api_key = bool(raw_env_key)
         is_enabled = bool(r["is_enabled"])
         is_verified = BackgroundModelSyncer.is_provider_verified(pid) if has_api_key else False
         verified_ids = BackgroundModelSyncer.get_verified_model_ids(pid) if is_verified else set()
@@ -466,6 +600,7 @@ def get_providers() -> List[Dict[str, Any]]:
             "name": pname,
             "base_url": r["base_url"],
             "has_api_key": has_api_key,
+            "api_key_mask": mask_api_key(raw_env_key) if has_api_key else "",
             "is_enabled": is_enabled,
             "models": models,
             "fetched_model_ids": sorted(list(verified_ids)),
@@ -776,6 +911,7 @@ def create_conversation(
     title: str = "New Chat", system_prompt: str = "", max_context: int = 30
 ) -> Dict[str, Any]:
     with open_db() as conn:
+        conn.execute("BEGIN IMMEDIATE")
         title = get_unique_conversation_title(title, conn=conn)
         cursor = conn.cursor()
         conv_id = str(uuid.uuid4())
@@ -889,15 +1025,22 @@ def get_conversation(conv_id: str) -> Optional[Dict[str, Any]]:
 _ALLOWED_CONV_COLUMNS = {"title", "system_prompt", "max_context_messages", "is_imported"}
 
 
-def update_conversation(conv_id: str, **kwargs) -> Optional[str]:
+def update_conversation(conv_id: str, only_if_default: bool = False, **kwargs) -> Optional[str]:
     invalid_keys = [k for k in kwargs if k not in _ALLOWED_CONV_COLUMNS]
     if invalid_keys:
         raise ValueError(f"Unsupported conversation update column(s): {', '.join(invalid_keys)}")
 
     with open_db() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        cursor = conn.cursor()
+        if only_if_default:
+            row = cursor.execute("SELECT title FROM conversations WHERE id = ?", (conv_id,)).fetchone()
+            if not row or (row["title"] or "").strip().lower() not in ("new chat", ""):
+                conn.rollback()
+                return None
+
         if "title" in kwargs and kwargs["title"]:
             kwargs["title"] = get_unique_conversation_title(kwargs["title"], exclude_conv_id=conv_id, conn=conn)
-        cursor = conn.cursor()
         fields = [f"{k} = ?" for k in kwargs]
         values = list(kwargs.values())
         values.append(time.time())
@@ -920,6 +1063,7 @@ def duplicate_conversation(conv_id: str) -> Optional[Dict[str, Any]]:
         return None
 
     with open_db() as conn:
+        conn.execute("BEGIN IMMEDIATE")
         cursor = conn.cursor()
         new_conv_id = str(uuid.uuid4())
         branch_title = get_branch_title(conv["title"], conn=conn)
@@ -981,6 +1125,7 @@ def import_conversation_data(
     Starts with 0 in token ledger so bottom analytics start clean.
     """
     with open_db() as conn:
+        conn.execute("BEGIN IMMEDIATE")
         cursor = conn.cursor()
         unique_title = get_unique_conversation_title(title or "Imported Chat", conn=conn)
         new_conv_id = str(uuid.uuid4())
@@ -995,7 +1140,7 @@ def import_conversation_data(
                 new_conv_id,
                 unique_title,
                 system_prompt or "",
-                int(max_context or 30),
+                max(1, min(500, int(max_context or 30))),
                 now,
                 now,
             ),
@@ -1004,7 +1149,13 @@ def import_conversation_data(
         if messages:
             for idx, m in enumerate(messages):
                 new_msg_id = str(uuid.uuid4())
-                msg_time = now + (idx * 0.001)
+                raw_role = str(m.get("role", "user") or "user").strip().lower()
+                role = raw_role if raw_role in ("user", "assistant", "system") else "user"
+                raw_ts = m.get("created_at")
+                if isinstance(raw_ts, (int, float)) and raw_ts > 0:
+                    msg_time = float(raw_ts)
+                else:
+                    msg_time = now + (idx * 0.001)
                 cursor.execute(
                     """
                     INSERT INTO messages (
@@ -1016,7 +1167,7 @@ def import_conversation_data(
                     (
                         new_msg_id,
                         new_conv_id,
-                        m.get("role", "user"),
+                        role,
                         m.get("content", ""),
                         m.get("thinking_content", ""),
                         m.get("provider_id", ""),
@@ -1030,13 +1181,48 @@ def import_conversation_data(
     return get_conversation(new_conv_id)
 
 
-def delete_conversation(conv_id: str):
+def delete_conversation(conv_id: str, only_if_empty: bool = False) -> bool:
+    if not conv_id:
+        return False
     with open_db() as conn:
+        conn.execute("BEGIN IMMEDIATE")
         cursor = conn.cursor()
+        if only_if_empty:
+            conv_row = cursor.execute(
+                "SELECT is_imported FROM conversations WHERE id = ?",
+                (conv_id,),
+            ).fetchone()
+            if not conv_row:
+                conn.rollback()
+                return False
+            if conv_row["is_imported"]:
+                has_msgs = cursor.execute(
+                    "SELECT 1 FROM messages WHERE conversation_id = ? LIMIT 1",
+                    (conv_id,),
+                ).fetchone()
+                if has_msgs:
+                    conn.rollback()
+                    return False
+            else:
+                has_reply = cursor.execute(
+                    """
+                    SELECT 1 FROM messages
+                    WHERE conversation_id = ? AND role = 'assistant'
+                      AND (LENGTH(TRIM(content)) > 0 OR LENGTH(TRIM(thinking_content)) > 0)
+                    LIMIT 1
+                    """,
+                    (conv_id,),
+                ).fetchone()
+                if has_reply:
+                    conn.rollback()
+                    return False
+
         cursor.execute("DELETE FROM messages WHERE conversation_id = ?", (conv_id,))
         cursor.execute("DELETE FROM token_ledger WHERE conversation_id = ?", (conv_id,))
         cursor.execute("DELETE FROM conversations WHERE id = ?", (conv_id,))
+        deleted = cursor.rowcount > 0
         conn.commit()
+        return deleted
 
 
 def record_google_search_requests(query_count: int):
@@ -1086,32 +1272,39 @@ def record_token_usage(
     completion_tokens: int,
     cached_tokens: int = 0,
     google_search_requests: int = 0,
-):
+) -> bool:
     search_cnt = max(0, int(google_search_requests or 0))
     if not conversation_id or (prompt_tokens == 0 and completion_tokens == 0 and cached_tokens == 0 and search_cnt == 0):
-        return
-    with open_db() as conn:
-        cursor = conn.cursor()
-        now = time.time()
-        cursor.execute(
-            """
-            INSERT INTO token_ledger (
-                conversation_id, provider_id, model_id,
-                prompt_tokens, completion_tokens, cached_tokens, google_search_requests, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                conversation_id,
-                provider_id or "",
-                model_id or "",
-                prompt_tokens,
-                completion_tokens,
-                cached_tokens,
-                search_cnt,
-                now,
-            ),
-        )
-        conn.commit()
+        return False
+    try:
+        with open_db() as conn:
+            cursor = conn.cursor()
+            if not cursor.execute("SELECT 1 FROM conversations WHERE id = ?", (conversation_id,)).fetchone():
+                return False
+            now = time.time()
+            cursor.execute(
+                """
+                INSERT INTO token_ledger (
+                    conversation_id, provider_id, model_id,
+                    prompt_tokens, completion_tokens, cached_tokens, google_search_requests, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    conversation_id,
+                    provider_id or "",
+                    model_id or "",
+                    prompt_tokens,
+                    completion_tokens,
+                    cached_tokens,
+                    search_cnt,
+                    now,
+                ),
+            )
+            conn.commit()
+            return True
+    except sqlite3.IntegrityError:
+        _logger.debug("Skipped token_ledger insert; conversation %s was deleted", conversation_id)
+        return False
 
 
 def add_message(
@@ -1126,52 +1319,37 @@ def add_message(
     completion_tokens: int = 0,
     cached_tokens: int = 0,
     msg_id: Optional[str] = None,
-) -> Dict[str, Any]:
+) -> Optional[Dict[str, Any]]:
+    if not conversation_id:
+        return None
     if not msg_id:
         msg_id = str(uuid.uuid4())
     now = time.time()
 
-    with open_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            """
-            INSERT INTO messages (
-                id, conversation_id, role, content, thinking_content,
-                provider_id, model_id, thinking_level,
-                prompt_tokens, completion_tokens, cached_tokens, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-            (
-                msg_id,
-                conversation_id,
-                role,
-                content,
-                thinking_content,
-                provider_id,
-                model_id,
-                thinking_level,
-                prompt_tokens,
-                completion_tokens,
-                cached_tokens,
-                now,
-            ),
-        )
+    try:
+        with open_db() as conn:
+            cursor = conn.cursor()
+            if not cursor.execute("SELECT 1 FROM conversations WHERE id = ?", (conversation_id,)).fetchone():
+                _logger.debug("Skipped add_message; conversation %s no longer exists", conversation_id)
+                return None
 
-        # Touch conversation updated_at
-        cursor.execute("UPDATE conversations SET updated_at = ? WHERE id = ?", (now, conversation_id))
-
-        if prompt_tokens > 0 or completion_tokens > 0 or cached_tokens > 0:
             cursor.execute(
                 """
-                INSERT INTO token_ledger (
-                    conversation_id, provider_id, model_id,
+                INSERT INTO messages (
+                    id, conversation_id, role, content, thinking_content,
+                    provider_id, model_id, thinking_level,
                     prompt_tokens, completion_tokens, cached_tokens, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
                 (
+                    msg_id,
                     conversation_id,
-                    provider_id or "",
-                    model_id or "",
+                    role,
+                    content,
+                    thinking_content,
+                    provider_id,
+                    model_id,
+                    thinking_level,
                     prompt_tokens,
                     completion_tokens,
                     cached_tokens,
@@ -1179,7 +1357,32 @@ def add_message(
                 ),
             )
 
-        conn.commit()
+            # Touch conversation updated_at
+            cursor.execute("UPDATE conversations SET updated_at = ? WHERE id = ?", (now, conversation_id))
+
+            if prompt_tokens > 0 or completion_tokens > 0 or cached_tokens > 0:
+                cursor.execute(
+                    """
+                    INSERT INTO token_ledger (
+                        conversation_id, provider_id, model_id,
+                        prompt_tokens, completion_tokens, cached_tokens, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        conversation_id,
+                        provider_id or "",
+                        model_id or "",
+                        prompt_tokens,
+                        completion_tokens,
+                        cached_tokens,
+                        now,
+                    ),
+                )
+
+            conn.commit()
+    except sqlite3.IntegrityError:
+        _logger.debug("Skipped add_message due to foreign key delete race on conversation %s", conversation_id)
+        return None
 
     return {
         "id": msg_id,

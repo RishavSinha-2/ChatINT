@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import concurrent.futures
 import json
+import os
 import re
 import socket
 import threading
 import time
+import urllib.parse
 from typing import Any, Dict, Iterable, List, Optional, Set
 import warnings
 
@@ -21,6 +23,9 @@ from chatint.db import (
     strip_model_prefix,
     update_provider_models,
 )
+from chatint.logging_setup import get_logger
+
+_logger = get_logger("chatint.client_manager")
 
 
 def is_gemini_3_or_newer(model_id: str) -> bool:
@@ -94,26 +99,87 @@ def sort_models_newer_first(models: List[Dict[str, Any]]) -> List[Dict[str, Any]
     return sorted(models, key=model_recency_key, reverse=True)
 
 
-def _is_network_available() -> bool:
+def _is_network_available(base_urls: Optional[Iterable[str]] = None) -> bool:
     """
-    Fast check if internet connectivity is available.
+    Fast check whether local/proxy/internet connectivity is available without leaking sockets.
     """
+    for raw_url in base_urls or ():
+        url = (raw_url or "").strip()
+        if not url:
+            continue
+        try:
+            parsed = urllib.parse.urlparse(url if "://" in url else f"https://{url}")
+            host = parsed.hostname
+            if not host:
+                continue
+            port = parsed.port or (443 if parsed.scheme == "https" else 80)
+            with socket.create_connection((host, port), timeout=1.5):
+                return True
+        except OSError:
+            pass
+
+    for proxy_var in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"):
+        proxy_val = (os.environ.get(proxy_var) or "").strip()
+        if not proxy_val:
+            continue
+        try:
+            parsed = urllib.parse.urlparse(proxy_val if "://" in proxy_val else f"http://{proxy_val}")
+            if parsed.hostname and parsed.port:
+                with socket.create_connection((parsed.hostname, parsed.port), timeout=1.5):
+                    return True
+        except OSError:
+            pass
+
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(2.0)
-        s.connect(("1.1.1.1", 53))
-        s.close()
-        return True
-    except Exception:
+        with socket.create_connection(("1.1.1.1", 53), timeout=2.0):
+            return True
+    except OSError:
         pass
     try:
         socket.gethostbyname("api.openai.com")
         return True
-    except Exception:
+    except OSError:
         return False
 
 
+def _is_transport_exception(exc: Exception) -> bool:
+    """Determine if an exception represents a transport/network/timeout error from SDK classes or text."""
+    for mod_name, cls_names in (
+        ("httpx", ("TransportError", "ConnectError", "TimeoutException")),
+        ("httpx2", ("TransportError", "ConnectError", "TimeoutException")),
+        ("openai", ("APIConnectionError", "APITimeoutError")),
+        ("anthropic", ("APIConnectionError", "APITimeoutError")),
+    ):
+        try:
+            mod = __import__(mod_name)
+            for cname in cls_names:
+                cls_obj = getattr(mod, cname, None)
+                if cls_obj and isinstance(exc, cls_obj):
+                    return True
+        except Exception:
+            pass
+
+    err_str = str(exc).lower()
+    err_type = type(exc).__name__.lower()
+    return (
+        "connection" in err_type
+        or "timeout" in err_type
+        or "transport" in err_type
+        or any(k in err_str for k in ("connect", "dns", "no such host", "network", "timeout", "timed out", "unreachable", "refused", "reset"))
+    )
+
+
 class ClientManager:
+    @staticmethod
+    def close_client(client: Any) -> None:
+        if client is None:
+            return
+        try:
+            close_fn = getattr(client, "close", None)
+            if callable(close_fn):
+                close_fn()
+        except Exception:
+            pass
     @classmethod
     def get_provider(cls, provider_id: str) -> Optional[Dict[str, Any]]:
         providers = get_providers()
@@ -189,7 +255,7 @@ class ClientManager:
 
         client = anthropic.Anthropic(
             api_key=key,
-            timeout=httpx2.Timeout(timeout, connect=min(15.0, timeout)),
+            timeout=httpx2.Timeout(timeout, connect=min(10.0, timeout)),
             max_retries=0,
         )
         return client, None
@@ -252,7 +318,7 @@ class ClientManager:
         client = openai.OpenAI(
             base_url=base_url_val,
             api_key=key,
-            timeout=httpx.Timeout(timeout, connect=min(15.0, timeout)),
+            timeout=httpx.Timeout(timeout, connect=min(10.0, timeout)),
             max_retries=0,
         )
         return client, None
@@ -392,11 +458,7 @@ class ClientManager:
             executor.shutdown(wait=False)
             err_str = str(e).lower()
             err_type = type(e).__name__.lower()
-            is_net = (
-                "connection" in err_type
-                or "timeout" in err_type
-                or any(k in err_str for k in ["connect", "dns", "no such host", "network", "timeout", "unreachable", "refused", "reset"])
-            )
+            is_net = _is_transport_exception(e)
             is_timeout = "timeout" in err_type or "timed out" in err_str
             msg = f"Request timed out after {int(timeout)}s" if is_timeout else str(e)
             if update_sync_state:
@@ -404,6 +466,8 @@ class ClientManager:
                 status, brief = BackgroundModelSyncer.classify_sync_error(msg, is_net)
                 BackgroundModelSyncer.set_sync_status(provider_id, status, brief)
             return [], msg, is_net
+        finally:
+            cls.close_client(client)
 
 
 class BackgroundModelSyncer:
@@ -697,8 +761,15 @@ class BackgroundModelSyncer:
                 if not due:
                     continue
 
-                if _is_network_available():
+                base_urls = []
+                try:
+                    due_set = set(due)
+                    base_urls = [p.get("base_url", "") for p in get_providers() if p.get("id") in due_set and p.get("base_url")]
+                except Exception:
+                    pass
+
+                if _is_network_available(base_urls=base_urls):
                     for pid in due:
                         threading.Thread(target=cls._sync_single_provider, args=(pid,), daemon=True).start()
             except Exception as e:
-                print(f"[Watcher Exception] {e}")
+                _logger.warning("Watcher loop exception: %s", e)

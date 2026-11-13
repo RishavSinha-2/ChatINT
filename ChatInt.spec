@@ -5,15 +5,15 @@ datas = [('src/chatint/ui', 'chatint/ui')]
 binaries = []
 hiddenimports = ['chatint.web_search_tool', 'ctypes', 'ctypes.wintypes', 'sqlite3']
 
-for pkg in ('webview', 'anthropic', 'openai', 'google.genai', 'google.auth', 'httpx2', 'httpx'):
+for pkg in ('webview', 'anthropic', 'openai', 'google.genai', 'google.auth', 'httpx2', 'httpx', 'certifi'):
     try:
         tmp_ret = collect_all(pkg)
-        # Filter datas: do not extract thousands of python source files, docs, or tests to disk.
-        # Python modules belong in the internal pyz bytecode archive (via hiddenimports).
+        # Filter datas using the bundle destination path (item[1]) rather than the host source path (item[0])
+        # so directory names on the build machine (e.g. "latest", "testing") never drop required package assets.
         clean_datas = [
             item for item in tmp_ret[0]
             if not item[0].lower().endswith(('.py', '.pyc', '.pyi', '.md', '.txt', '.rst', '.keep', 'license', 'notice'))
-            and 'test' not in item[0].lower()
+            and not any(part in ('test', 'tests', '__pycache__') for part in item[1].replace('\\', '/').lower().split('/'))
         ]
         datas += clean_datas
         binaries += tmp_ret[1]
@@ -62,6 +62,6 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=['logo.ico'],
+    icon=['src/chatint/ui/assets/logo.ico'],
 )
 

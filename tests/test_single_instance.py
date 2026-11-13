@@ -1,28 +1,50 @@
-import sys
+import ctypes
 import os
 import subprocess
+import sys
+import unittest
 
 sys.path.insert(0, os.path.abspath("src"))
 
-from chatint.main import _ensure_single_instance
 import chatint.main as main_mod
+from chatint.main import _ensure_single_instance
 
-print("Testing Single-Instance Mutex Enforcement...")
 
-# In the current process:
-res1 = _ensure_single_instance()
-print(f"First instance check result: {res1} (Expected: True)")
-assert res1 is True, "First instance must succeed"
+@unittest.skipUnless(sys.platform == "win32", "Windows single-instance mutex test requires win32")
+class TestSingleInstanceMutex(unittest.TestCase):
+    def tearDown(self):
+        if getattr(main_mod, "_MUTEX_HANDLE", None):
+            try:
+                ctypes.windll.kernel32.CloseHandle(main_mod._MUTEX_HANDLE)
+            except Exception:
+                pass
+            main_mod._MUTEX_HANDLE = None
 
-# Now run a second Python process invoking _ensure_single_instance() via uv run
-test_cmd = [
-    "uv", "run", "python", "-c",
-    "import sys; sys.path.insert(0, 'src'); from chatint.main import _ensure_single_instance; res = _ensure_single_instance(); print('Second process result:', res); sys.exit(0 if res is False else 1)"
-]
+    def test_mutex_prevents_second_instance(self):
+        first = _ensure_single_instance()
+        self.assertTrue(first, "First instance must acquire the single-instance mutex")
 
-proc = subprocess.run(test_cmd, capture_output=True, text=True)
-print(f"Second process output: {proc.stdout.strip()}")
-print(f"Second process return code: {proc.returncode} (Expected: 0)")
-assert proc.returncode == 0, "Second instance must detect running mutex and return False"
+        proc = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import sys; sys.path.insert(0, 'src'); "
+                    "from chatint.main import _ensure_single_instance; "
+                    "res = _ensure_single_instance(); "
+                    "sys.exit(0 if res is False else 1)"
+                ),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        self.assertEqual(
+            proc.returncode,
+            0,
+            f"Second instance must return False (stdout={proc.stdout!r}, stderr={proc.stderr!r})",
+        )
 
-print("\nSINGLE INSTANCE MUTEX TEST PASSED SUCCESSFULLY!")
+
+if __name__ == "__main__":
+    unittest.main()

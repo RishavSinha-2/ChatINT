@@ -1,20 +1,99 @@
 import ctypes
+from ctypes import wintypes
 import sys
 import threading
+from typing import Any
 from urllib.parse import urlparse
 import webview
 from chatint.bridge import DesktopBridge
 from chatint.config import UI_DIR
 from chatint.db import init_db
+from chatint.logging_setup import configure_logging, get_logger
 
 # Windows Single-Instance Mutex
 _MUTEX_HANDLE = None
+_logger = get_logger("chatint.main")
+
+
+def _find_existing_chatint_hwnd(user32: Any, kernel32: Any) -> int:
+    """Enumerate visible top-level ChatInt windows while ignoring Explorer folders or unrelated apps."""
+    EnumWindowsProc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    user32.EnumWindows.argtypes = [EnumWindowsProc, wintypes.LPARAM]
+    user32.EnumWindows.restype = wintypes.BOOL
+    user32.IsWindowVisible.argtypes = [wintypes.HWND]
+    user32.IsWindowVisible.restype = wintypes.BOOL
+    user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
+    user32.GetWindowTextLengthW.restype = ctypes.c_int
+    user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    user32.GetWindowTextW.restype = ctypes.c_int
+    user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    user32.GetClassNameW.restype = ctypes.c_int
+    user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.QueryFullProcessImageNameW.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        wintypes.LPWSTR,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    matched_hwnd = 0
+
+    def _callback(hwnd: int, _lparam: int) -> bool:
+        nonlocal matched_hwnd
+        if not user32.IsWindowVisible(hwnd):
+            return True
+        length = user32.GetWindowTextLengthW(hwnd)
+        if length != len("ChatInt"):
+            return True
+        title_buf = ctypes.create_unicode_buffer(length + 1)
+        user32.GetWindowTextW(hwnd, title_buf, length + 1)
+        if title_buf.value != "ChatInt":
+            return True
+
+        cls_buf = ctypes.create_unicode_buffer(256)
+        user32.GetClassNameW(hwnd, cls_buf, 256)
+        cls_name = cls_buf.value
+        if cls_name in ("CabinetWClass", "ExploreWClass"):
+            return True
+
+        pid = wintypes.DWORD(0)
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        proc_ok = False
+        if pid.value:
+            proc_handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid.value)
+            if proc_handle:
+                try:
+                    exe_buf = ctypes.create_unicode_buffer(1024)
+                    exe_len = wintypes.DWORD(len(exe_buf))
+                    if kernel32.QueryFullProcessImageNameW(proc_handle, 0, exe_buf, ctypes.byref(exe_len)):
+                        exe_low = exe_buf.value.lower()
+                        if exe_low.endswith(("chatint.exe", "python.exe", "pythonw.exe")):
+                            proc_ok = True
+                finally:
+                    kernel32.CloseHandle(proc_handle)
+
+        if proc_ok or cls_name.startswith("WindowsForms10"):
+            matched_hwnd = int(hwnd)
+            return False
+        return True
+
+    cb = EnumWindowsProc(_callback)
+    user32.EnumWindows(cb, 0)
+    return matched_hwnd
 
 
 def _ensure_single_instance() -> bool:
     """
     Enforces a single running instance of ChatInt on Windows.
-    If another instance is already running, restores and brings its window
+    If another instance is already running, restores (only if minimized) and brings its window
     to the foreground, then exits this instance cleanly.
     """
     global _MUTEX_HANDLE
@@ -24,18 +103,31 @@ def _ensure_single_instance() -> bool:
     try:
         kernel32 = ctypes.windll.kernel32
         user32 = ctypes.windll.user32
-        mutex_name = "ChatInt_SingleInstance_Mutex_Local"
 
+        kernel32.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
+        kernel32.CreateMutexW.restype = wintypes.HANDLE
+        kernel32.GetLastError.argtypes = []
+        kernel32.GetLastError.restype = wintypes.DWORD
+
+        user32.IsIconic.argtypes = [wintypes.HWND]
+        user32.IsIconic.restype = wintypes.BOOL
+        user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+        user32.ShowWindow.restype = wintypes.BOOL
+        user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+        user32.SetForegroundWindow.restype = wintypes.BOOL
+
+        mutex_name = "ChatInt_SingleInstance_Mutex_Local"
         _MUTEX_HANDLE = kernel32.CreateMutexW(None, True, mutex_name)
         # ERROR_ALREADY_EXISTS = 183
         if kernel32.GetLastError() == 183:
-            hwnd = user32.FindWindowW(None, "ChatInt")
+            hwnd = _find_existing_chatint_hwnd(user32, kernel32)
             if hwnd:
-                user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+                if user32.IsIconic(hwnd):
+                    user32.ShowWindow(hwnd, 9)  # SW_RESTORE only if minimized
                 user32.SetForegroundWindow(hwnd)
             return False
-    except Exception:
-        pass
+    except Exception as exc:
+        _logger.warning("Single-instance check skipped: %s", exc)
     return True
 
 
@@ -59,116 +151,10 @@ def _prewarm_sdks():
         pass
 
 
-_EXTERNAL_NAV_BAR_JS = r"""
-(() => {
-  if (document.getElementById('app-container') && document.getElementById('panes-container')) return;
-  if (document.getElementById('chatint-ext-nav-host')) return;
-  const host = document.createElement('div');
-  host.id = 'chatint-ext-nav-host';
-  host.style.cssText = 'position:fixed;top:12px;right:16px;z-index:2147483647;pointer-events:auto;';
-  const shadow = host.attachShadow({ mode: 'open' });
-  const domain = (() => {
-    try { return new URL(window.location.href).hostname || 'Web Page'; }
-    catch { return 'Web Page'; }
-  })();
-  const style = document.createElement('style');
-  style.textContent = `
-    .bar {
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      padding: 5px 8px;
-      border-radius: 999px;
-      background: rgba(19, 19, 20, 0.92);
-      border: 1px solid rgba(255, 255, 255, 0.16);
-      box-shadow: 0 6px 20px rgba(0, 0, 0, 0.45);
-      backdrop-filter: blur(8px);
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-      color: #f0f4f9;
-      font-size: 12px;
-    }
-    .domain {
-      max-width: 150px;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-      color: #9aa0a6;
-      padding: 0 4px;
-      font-size: 11px;
-    }
-    button {
-      display: inline-flex;
-      align-items: center;
-      gap: 5px;
-      border: 1px solid rgba(255, 255, 255, 0.14);
-      background: #282a2c;
-      color: #f0f4f9;
-      border-radius: 999px;
-      padding: 4px 10px;
-      font-size: 11.5px;
-      font-weight: 500;
-      font-family: inherit;
-      cursor: pointer;
-      transition: background 0.14s, border-color 0.14s;
-    }
-    button:hover {
-      background: #333538;
-      border-color: #60b8ff;
-    }
-    .back-btn {
-      background: rgba(96, 184, 255, 0.16);
-      border-color: rgba(96, 184, 255, 0.45);
-      color: #8fd0ff;
-    }
-    .back-btn:hover {
-      background: rgba(96, 184, 255, 0.26);
-    }
-  `;
-
-  const bar = document.createElement('div');
-  bar.className = 'bar';
-
-  const backBtn = document.createElement('button');
-  backBtn.type = 'button';
-  backBtn.className = 'back-btn';
-  backBtn.title = 'Back to Chat';
-  backBtn.textContent = '\u2190 Back to Chat';
-
-  const domainSpan = document.createElement('span');
-  domainSpan.className = 'domain';
-  domainSpan.textContent = domain;
-
-  const extBtn = document.createElement('button');
-  extBtn.type = 'button';
-  extBtn.title = 'Open in Default Browser';
-  extBtn.textContent = 'Open in Browser \u2197';
-
-  bar.appendChild(backBtn);
-  bar.appendChild(domainSpan);
-  bar.appendChild(extBtn);
-  shadow.appendChild(style);
-  shadow.appendChild(bar);
-
-  const callBridge = async (method, ...args) => {
-    for (let i = 0; i < 30; i++) {
-      if (window.pywebview && window.pywebview.api && typeof window.pywebview.api[method] === 'function') {
-        return window.pywebview.api[method](...args);
-      }
-      await new Promise((r) => setTimeout(r, 35));
-    }
-    return null;
-  };
-
-  backBtn.onclick = () => callBridge('return_to_chat');
-  extBtn.onclick = () => callBridge('open_external_url', window.location.href);
-  (document.body || document.documentElement).appendChild(host);
-})();
-"""
-
-
-def _attach_external_navigation_overlay(window: webview.Window, bridge: DesktopBridge, index_html_path):
-    """Inject a floating Back + Open in Browser toolbar only when an external web page opens inside the app."""
+def _attach_origin_guard(window: webview.Window, bridge: DesktopBridge, index_html_path):
+    """Pin the bridge to the exact local app origin and never leave the privileged window on external URLs."""
     app_origin: list[tuple[str, str] | None] = [None]
+    app_url: list[str] = [index_html_path.resolve().as_uri()]
 
     def _on_loaded():
         try:
@@ -181,7 +167,6 @@ def _attach_external_navigation_overlay(window: webview.Window, bridge: DesktopB
         parsed = urlparse(current_url)
         origin = (parsed.scheme.lower(), parsed.netloc.lower())
 
-        # Capture the actual local pywebview server URL/origin (e.g. http://127.0.0.1:<port>) on first load
         if app_origin[0] is None:
             is_local_app = (
                 parsed.scheme.lower() == "file"
@@ -192,25 +177,35 @@ def _attach_external_navigation_overlay(window: webview.Window, bridge: DesktopB
             )
             if is_local_app:
                 app_origin[0] = origin
-                bridge.attach_window(window, current_url)
+                app_url[0] = current_url
+                bridge.attach_window(window, current_url, allowed_origin=origin)
+                bridge.set_origin_trusted(True)
                 return
 
         if app_origin[0] is not None and origin == app_origin[0]:
+            bridge.set_origin_trusted(True)
             return
 
-        if parsed.scheme.lower() in ("http", "https"):
-            try:
-                window.evaluate_js(_EXTERNAL_NAV_BAR_JS)
-            except Exception as e:
-                print(f"[External Nav Overlay Error] {e}")
+        # Unexpected navigation away from local app origin -> revoke RPC trust and restore app URL
+        bridge.set_origin_trusted(False)
+        _logger.warning("Blocked navigation to external/untrusted URL: %s", current_url)
+        threading.Timer(0.01, window.load_url, args=(app_url[0],)).start()
 
     window.events.loaded += _on_loaded
 
 
 def main():
+    configure_logging()
+
     # Enforce single instance: if another window is already open, focus it and exit
     if not _ensure_single_instance():
         sys.exit(0)
+
+    # Ensure pywebview routes any external target=_blank/link clicks to the OS browser
+    try:
+        webview.settings["OPEN_EXTERNAL_LINKS_IN_BROWSER"] = True
+    except Exception:
+        pass
 
     # Start SDK background pre-warming thread immediately
     threading.Thread(target=_prewarm_sdks, daemon=True, name="sdk-prewarm").start()
@@ -223,7 +218,7 @@ def main():
 
     index_html = UI_DIR / "index.html"
     if not index_html.exists():
-        print(f"Error: UI file not found at {index_html}")
+        _logger.error("UI file not found at %s", index_html)
         sys.exit(1)
 
     # Create native standalone window
@@ -237,7 +232,7 @@ def main():
         background_color="#131314",
     )
     bridge.attach_window(window, index_html.resolve().as_uri())
-    _attach_external_navigation_overlay(window, bridge, index_html)
+    _attach_origin_guard(window, bridge, index_html)
 
     # Launch desktop application loop
     icon_path = UI_DIR / "assets" / "logo.ico"

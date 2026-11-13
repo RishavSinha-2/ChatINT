@@ -39,10 +39,19 @@ from chatint.db import (
     remove_model_resolved_thinking,
     get_api_key_from_env,
     set_api_key_in_env,
+    read_env_dict,
+    write_env_dict,
+    mask_api_key,
     get_app_settings,
 )
 from chatint.bridge import parse_chat_file_content, DesktopBridge
-from chatint.client_manager import BackgroundModelSyncer, ClientManager, is_gemini_3_or_newer
+from chatint.client_manager import (
+    BackgroundModelSyncer,
+    ClientManager,
+    is_gemini_3_or_newer,
+    _is_network_available,
+    _is_transport_exception,
+)
 from chatint.naming import generate_chat_title
 from chatint.web_search_tool import (
     IMAGE_SEARCH_TOOL_NAME,
@@ -56,10 +65,14 @@ from chatint.web_search_tool import (
     execute_web_search,
 )
 from chatint.streamer import (
+    StreamManager,
+    stream_chat_completion,
     _run_web_search_tool_call,
     _flush_think_buffer,
     _stream_anthropic,
     _stream_gemini,
+    _is_openai_retryable_param_error,
+    _clamp_openai_effort,
     clear_resolved_thinking_cache,
 )
 
@@ -614,6 +627,270 @@ Gradient descent minimizes the loss function step by step.
         self.assertEqual(tin, 15)
         self.assertEqual(tout, 5)
         self.assertIn("max_completion_tokens", fake_openai.chat.completions.create.call_args.kwargs)
+
+    # ------------------------------------------------------------------
+    # Regression tests for security, concurrency, integrity & edge-case fixes
+    # ------------------------------------------------------------------
+
+    def test_c1_origin_guard_and_external_url_validation(self):
+        bridge = DesktopBridge()
+        dummy_window = MagicMock()
+        dummy_window.get_current_url.return_value = "file:///C:/app/ui/index.html"
+        bridge.attach_window(dummy_window, index_url="file:///C:/app/ui/index.html")
+
+        # Exact allowed local URL works cleanly
+        self.assertTrue(bridge.set_theme("dark")["success"])
+
+        # Navigating to untrusted remote origin blocks RPC even before URL changes via set_origin_trusted
+        dummy_window.get_current_url.return_value = "https://evil.example/payload.html"
+        with self.assertRaises(PermissionError):
+            bridge.set_theme("light")
+
+        # Restoring local URL allows RPC again
+        dummy_window.get_current_url.return_value = "file:///C:/app/ui/index.html"
+        self.assertTrue(bridge.set_theme("dark")["success"])
+
+        # External URL validation rejects dangerous schemes / whitespace
+        with patch("chatint.bridge.webbrowser.open") as mock_open:
+            self.assertFalse(bridge.open_external_url("javascript:alert(1)")["success"])
+            self.assertFalse(bridge.open_external_url("file:///C:/Windows/System32/calc.exe")["success"])
+            self.assertFalse(bridge.open_external_url("https://example.com\nhttps://evil.com")["success"])
+            mock_open.assert_not_called()
+
+            res_ok = bridge.open_external_url("https://example.com/docs?q=1")
+            self.assertTrue(res_ok["success"])
+            mock_open.assert_called_once_with("https://example.com/docs?q=1")
+
+    def test_c2_get_provider_api_key_returns_masked_only(self):
+        set_api_key_in_env("OpenAI", "sk-super-secret-value-9876")
+        bridge = DesktopBridge()
+        res = bridge.get_provider_api_key("OpenAI")
+        self.assertTrue(res["has_api_key"])
+        self.assertNotIn("api_key", res)
+        self.assertNotIn("super-secret", res["masked_hint"])
+        self.assertTrue(res["masked_hint"].startswith("sk-s"))
+        self.assertTrue(res["masked_hint"].endswith("9876"))
+
+        # Short keys are masked completely without leaking secret bytes
+        self.assertEqual(mask_api_key("tiny"), "••••")
+
+    def test_h1_stream_manager_isolation_and_event_coalescing(self):
+        bridge = DesktopBridge()
+        s1_ev = StreamManager.register_stream("tab_a", stream_id="s1", conversation_id="conv_1")
+        self.assertEqual(StreamManager._streams_by_tab["tab_a"][0], "s1")
+
+        # Registering newer stream on same tab aborts prior stream; unregistering s1 later must NOT remove s2
+        s2_ev = StreamManager.register_stream("tab_a", stream_id="s2", conversation_id="conv_2")
+        self.assertTrue(s1_ev.is_set())
+        StreamManager.unregister_stream("tab_a", stream_id="s1")
+        self.assertEqual(StreamManager._streams_by_tab["tab_a"][0], "s2")
+        self.assertFalse(s2_ev.is_set())
+
+        # Aborting by conversation_id aborts only matching streams
+        StreamManager.abort_conversation("conv_2")
+        self.assertTrue(s2_ev.is_set())
+        StreamManager.unregister_stream("tab_a", stream_id="s2")
+
+        # Event coalescing must NOT merge chunks across different stream_ids or conversation_ids
+        bridge.push_event({"type": "content_chunk", "tab_id": "t1", "conversation_id": "c1", "stream_id": "s1", "chunk": "hello "})
+        bridge.push_event({"type": "content_chunk", "tab_id": "t1", "conversation_id": "c1", "stream_id": "s1", "chunk": "world"})
+        bridge.push_event({"type": "content_chunk", "tab_id": "t1", "conversation_id": "c1", "stream_id": "s2", "chunk": "next"})
+        events = bridge.get_pending_events()
+        self.assertEqual(len(events), 2)
+        self.assertEqual(events[0]["chunk"], "hello world")
+        self.assertEqual(events[0]["stream_id"], "s1")
+        self.assertEqual(events[1]["chunk"], "next")
+        self.assertEqual(events[1]["stream_id"], "s2")
+
+    def test_h2_fk_safety_on_deleted_chat_and_delete_conversation_only_if_empty(self):
+        # Draft with only a user prompt (no assistant reply yet) IS deleted by only_if_empty=True
+        draft = create_conversation("Failed Draft")
+        add_message(draft["id"], "user", "hi")
+        self.assertTrue(delete_conversation(draft["id"], only_if_empty=True))
+        self.assertIsNone(get_conversation(draft["id"]))
+
+        # Conversation WITH an assistant reply must NOT be deleted by only_if_empty=True
+        conv = create_conversation("Ephemeral")
+        add_message(conv["id"], "user", "hi")
+        add_message(conv["id"], "assistant", "hello there")
+        self.assertFalse(delete_conversation(conv["id"], only_if_empty=True))
+        self.assertIsNotNone(get_conversation(conv["id"]))
+
+        # Actual delete removes conversation cleanly
+        self.assertTrue(delete_conversation(conv["id"], only_if_empty=False))
+        # Subsequent FK writes must return None / False rather than crashing with IntegrityError
+        self.assertIsNone(add_message(conv["id"], "assistant", "orphan reply"))
+        self.assertFalse(record_token_usage(conv["id"], "openai", "gpt-4o", 10, 5))
+
+        # Completely empty conversation is deleted by only_if_empty=True
+        empty_conv = create_conversation("Empty Draft")
+        self.assertTrue(delete_conversation(empty_conv["id"], only_if_empty=True))
+        self.assertIsNone(get_conversation(empty_conv["id"]))
+
+    def test_h4_env_atomic_write_preserves_comments_and_quotes_special_values(self):
+        env_path = cfg_mod.ENV_PATH
+        env_path.write_text("# Header comment\nOTHER_VAR=keep_me\n\n# Key comment\nOPENAI_API_KEY=old\n", encoding="utf-8")
+
+        secret_with_specials = 'sk-#hash "quoted"\nline2'
+        set_api_key_in_env("OpenAI", secret_with_specials)
+        raw_text = env_path.read_text(encoding="utf-8")
+        self.assertIn("# Header comment", raw_text)
+        self.assertIn("# Key comment", raw_text)
+        self.assertIn("OTHER_VAR=keep_me", raw_text)
+        self.assertEqual(get_api_key_from_env("OpenAI"), secret_with_specials)
+
+        # Updating a second key leaves the special-character key & comments intact
+        set_api_key_in_env("Gemini", "AIza-123")
+        self.assertEqual(get_api_key_from_env("OpenAI"), secret_with_specials)
+        self.assertEqual(get_api_key_from_env("Gemini"), "AIza-123")
+        self.assertIn("# Header comment", env_path.read_text(encoding="utf-8"))
+
+    def test_h5_only_if_default_title_and_post_save_auto_naming(self):
+        conv = create_conversation("New Chat")
+        # Manual rename
+        update_conversation(conv["id"], title="User Custom Title")
+        # Auto-naming passing only_if_default=True must NOT clobber user's manual title
+        res_skipped = update_conversation(conv["id"], title="Auto Generated Title", only_if_default=True)
+        self.assertIsNone(res_skipped)
+        self.assertEqual(get_conversation(conv["id"])["title"], "User Custom Title")
+
+        # Default title IS updated when only_if_default=True
+        conv2 = create_conversation("New Chat")
+        res_applied = update_conversation(conv2["id"], title="Auto Generated Title", only_if_default=True)
+        self.assertEqual(res_applied, "Auto Generated Title")
+        self.assertEqual(get_conversation(conv2["id"])["title"], "Auto Generated Title")
+
+        # Verify stream_chat_completion triggers auto-naming AFTER add_message succeeds (on still-unnamed New Chat)
+        conv3 = create_conversation("New Chat")
+        add_message(conv3["id"], "user", "Explain gravity")
+        with (
+            patch.dict("chatint.streamer._SDK_STREAMERS", {"anthropic": MagicMock(return_value=(["Gravity bends spacetime."], [], 10, 5, 0, False, "none"))}),
+            patch("chatint.streamer._trigger_auto_naming") as mock_auto_name,
+        ):
+            events = []
+            bridge = DesktopBridge()
+            bridge.push_event = events.append
+            stream_chat_completion(
+                bridge=bridge,
+                tab_id="tab1",
+                conversation_id=conv3["id"],
+                messages=[{"role": "user", "content": "Explain gravity"}],
+                provider_id="anthropic",
+                model_id="claude-sonnet-4-5",
+                thinking_level="none",
+                stream_id="s-name",
+            )
+            mock_auto_name.assert_called_once()
+            self.assertEqual(events[-1]["type"], "done")
+            self.assertEqual(events[-1]["stream_id"], "s-name")
+
+    def test_m4_openai_param_retry_guard_and_effort_clamping(self):
+        self.assertEqual(_clamp_openai_effort("openai", "o3-mini", "minimal"), "low")
+        self.assertEqual(_clamp_openai_effort("openai", "o1", "xhigh"), "high")
+        self.assertEqual(_clamp_openai_effort("openai", "o4-mini", "max"), "high")
+        self.assertEqual(_clamp_openai_effort("openai", "gpt-5", "xhigh"), "xhigh")
+        self.assertEqual(_clamp_openai_effort("openai", "o3", "medium"), "medium")
+
+        class _AuthErr(Exception):
+            status_code = 401
+
+        class _BadParamErr(Exception):
+            status_code = 400
+
+        self.assertFalse(_is_openai_retryable_param_error(_AuthErr("invalid_api_key")))
+        self.assertTrue(_is_openai_retryable_param_error(_BadParamErr("Unsupported parameter: reasoning_effort")))
+
+    def test_m5_m6_network_check_socket_cleanup_and_client_close(self):
+        # Mocked socket ensures context manager closes cleanly
+        fake_sock = MagicMock()
+        fake_cm = MagicMock()
+        fake_cm.__enter__.return_value = fake_sock
+        fake_cm.__exit__.return_value = False
+        with patch("chatint.client_manager.socket.create_connection", return_value=fake_cm):
+            self.assertTrue(_is_network_available())
+            fake_cm.__exit__.assert_called_once()
+
+        # Localhost base_url bypasses external DNS/TCP reachability check
+        self.assertTrue(_is_network_available(base_urls=["http://127.0.0.1:11434/v1"]))
+
+        # Client close happens cleanly in fetch_remote_models
+        set_api_key_in_env("OpenAI", "sk-test-close")
+        fake_openai = MagicMock()
+        fake_openai.models.list.return_value = MagicMock(data=[MagicMock(id="gpt-4o")])
+        with patch.object(ClientManager, "get_client", return_value=(fake_openai, None)):
+            models, err, is_auth_err = ClientManager.fetch_remote_models("openai")
+        self.assertIsNone(err)
+        self.assertFalse(is_auth_err)
+        self.assertEqual([m["id"] for m in models], ["gpt-4o"])
+        fake_openai.close.assert_called_once()
+
+        # Transport exception detection works cleanly
+        class _TransportErr(Exception):
+            pass
+
+        self.assertTrue(_is_transport_exception(_TransportErr("Connection reset by peer")))
+
+    def test_m7_context_retains_thinking_only_assistant_turns(self):
+        bridge = DesktopBridge()
+        conv = create_conversation("Thinking Only Turn")
+        add_message(conv["id"], "user", "First question")
+        add_message(conv["id"], "assistant", "", thinking_content="I reasoned halfway before stopping")
+        add_message(conv["id"], "user", "Follow up")
+
+        ctx = bridge._build_context_messages(get_conversation(conv["id"]))
+        # Default system prompt may be first; check the 3 conversation turns
+        non_sys = [m for m in ctx if m["role"] != "system"]
+        self.assertEqual(len(non_sys), 3)
+        self.assertEqual(non_sys[0], {"role": "user", "content": "First question"})
+        self.assertEqual(non_sys[1]["role"], "assistant")
+        self.assertEqual(non_sys[1]["content"], "[Response stopped]")
+        self.assertEqual(non_sys[2], {"role": "user", "content": "Follow up"})
+
+    def test_m8_markdown_import_preserves_multiline_system_prompt_and_code_headings(self):
+        conv = create_conversation("Complex Export", system_prompt="System Line 1\nSystem Line 2")
+        add_message(
+            conv["id"],
+            "user",
+            "Look at this template:\n```markdown\n### User\nFake heading inside code block\n### Assistant (gpt-4o)\nFake\n```",
+        )
+        add_message(
+            conv["id"],
+            "assistant",
+            "Here is the answer.",
+            thinking_content="Line A\n\nLine B",
+            model_id="gpt-4o (preview)",
+        )
+        exported = DesktopBridge().export_conversation(conv["id"], "markdown")
+        parsed = parse_chat_file_content(exported["content"], "complex.md")
+        self.assertEqual(parsed["title"], "Complex Export")
+        self.assertEqual(parsed["system_prompt"], "System Line 1\nSystem Line 2")
+        self.assertEqual(len(parsed["messages"]), 2)
+        self.assertIn("### Assistant (gpt-4o)", parsed["messages"][0]["content"])
+        self.assertEqual(parsed["messages"][1]["model_id"], "gpt-4o (preview)")
+        self.assertEqual(parsed["messages"][1]["thinking_content"], "Line A\n\nLine B")
+        self.assertEqual(parsed["messages"][1]["content"], "Here is the answer.")
+
+    def test_m11_schema_user_version_and_chatint_spec_filter(self):
+        with open_db() as conn:
+            ver = conn.execute("PRAGMA user_version").fetchone()[0]
+            self.assertGreaterEqual(ver, 1)
+
+        # Verify ChatInt.spec filters datas by destination path (item[1]), not host path (item[0])
+        spec_text = Path("ChatInt.spec").read_text(encoding="utf-8")
+        self.assertIn("item[1]", spec_text)
+        self.assertIn("'certifi'", spec_text)
+        self.assertIn("'httpx2'", spec_text)
+        self.assertIn("src/chatint/ui/assets/logo.ico", spec_text)
+
+        # Verify CSP & local assets exist cleanly (C3 / M2 / L1 / L4)
+        index_html = Path("src/chatint/ui/index.html").read_text(encoding="utf-8")
+        self.assertIn("Content-Security-Policy", index_html)
+        katex_css = Path("src/chatint/ui/assets/katex.min.css").read_text(encoding="utf-8")
+        self.assertNotIn("https://cdn.jsdelivr.net", katex_css)
+        app_js = Path("src/chatint/ui/app.js").read_text(encoding="utf-8")
+        self.assertNotIn("get_provider_api_key", app_js)
+        self.assertIn("open_external_url", app_js)
+        self.assertIn("_resizeObserver", app_js)
 
 
 if __name__ == "__main__":

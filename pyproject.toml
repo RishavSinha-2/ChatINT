@@ -1,7 +1,7 @@
 [project]
 name = "chatint"
 version = "0.4.0"
-description = "Add your description here"
+description = "Multi-tab, multi-provider desktop AI chat client built with Python and pywebview."
 readme = "README.md"
 authors = [
     { name = "Rishav Sinha", email = "rishavsinha2302@gmail.com" }

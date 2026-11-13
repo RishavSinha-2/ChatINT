@@ -3,6 +3,9 @@ from __future__ import annotations
 import re
 from typing import Optional
 from chatint.client_manager import ClientManager, is_gemini_3_or_newer
+from chatint.logging_setup import get_logger
+
+_logger = get_logger("chatint.naming")
 
 _NAMING_SYSTEM_INSTRUCTION = (
     "Generate a concise 2 to 5 word title for this conversation based on the user's message. "
@@ -54,112 +57,121 @@ def generate_chat_title(
             if sdk_type == "anthropic":
                 client, err = ClientManager.get_anthropic_client(provider_id, timeout=10.0)
                 if client and not err:
-                    resp = client.messages.create(
-                        model=model_id,
-                        system=_NAMING_SYSTEM_INSTRUCTION,
-                        messages=[{"role": "user", "content": user_snippet}],
-                        max_tokens=25,
-                    )
-                    if resp and getattr(resp, "content", None):
-                        text_blocks = [
-                            getattr(b, "text", "")
-                            for b in resp.content
-                            if getattr(b, "type", "") == "text"
-                        ]
-                        cleaned = _clean_generated_title(" ".join(text_blocks))
-                        if cleaned:
-                            usage = getattr(resp, "usage", None)
-                            return _finalize_title_usage(
-                                cleaned,
-                                user_snippet,
-                                getattr(usage, "input_tokens", 0) or 0,
-                                getattr(usage, "output_tokens", 0) or 0,
-                                getattr(usage, "cache_read_input_tokens", 0) or 0,
-                            )
+                    try:
+                        resp = client.messages.create(
+                            model=model_id,
+                            system=_NAMING_SYSTEM_INSTRUCTION,
+                            messages=[{"role": "user", "content": user_snippet}],
+                            max_tokens=25,
+                        )
+                        if resp and getattr(resp, "content", None):
+                            text_blocks = [
+                                getattr(b, "text", "")
+                                for b in resp.content
+                                if getattr(b, "type", "") == "text"
+                            ]
+                            cleaned = _clean_generated_title(" ".join(text_blocks))
+                            if cleaned:
+                                usage = getattr(resp, "usage", None)
+                                return _finalize_title_usage(
+                                    cleaned,
+                                    user_snippet,
+                                    getattr(usage, "input_tokens", 0) or 0,
+                                    getattr(usage, "output_tokens", 0) or 0,
+                                    getattr(usage, "cache_read_input_tokens", 0) or 0,
+                                )
+                    finally:
+                        ClientManager.close_client(client)
 
             elif sdk_type == "gemini":
                 from google.genai import types as genai_types
 
                 client, err = ClientManager.get_gemini_client(provider_id, timeout=10.0)
                 if client and not err:
-                    level_cfg = genai_types.GenerateContentConfig(
-                        system_instruction=_NAMING_SYSTEM_INSTRUCTION,
-                        max_output_tokens=60,
-                        thinking_config=genai_types.ThinkingConfig(thinking_level="MINIMAL"),
-                    )
-                    budget_cfg = genai_types.GenerateContentConfig(
-                        system_instruction=_NAMING_SYSTEM_INSTRUCTION,
-                        max_output_tokens=40,
-                        thinking_config=genai_types.ThinkingConfig(thinking_budget=0),
-                    )
-                    plain_cfg = genai_types.GenerateContentConfig(
-                        system_instruction=_NAMING_SYSTEM_INSTRUCTION,
-                        max_output_tokens=120,
-                    )
-                    configs = (
-                        [level_cfg, budget_cfg, plain_cfg]
-                        if is_gemini_3_or_newer(model_id)
-                        else [budget_cfg, level_cfg, plain_cfg]
-                    )
-                    resp = None
-                    for cfg in configs:
-                        try:
-                            resp = client.models.generate_content(
-                                model=model_id,
-                                contents=user_snippet,
-                                config=cfg,
-                            )
-                            if (getattr(resp, "text", "") or "").strip():
-                                break
-                        except Exception:
-                            resp = None
+                    try:
+                        level_cfg = genai_types.GenerateContentConfig(
+                            system_instruction=_NAMING_SYSTEM_INSTRUCTION,
+                            max_output_tokens=60,
+                            thinking_config=genai_types.ThinkingConfig(thinking_level="MINIMAL"),
+                        )
+                        budget_cfg = genai_types.GenerateContentConfig(
+                            system_instruction=_NAMING_SYSTEM_INSTRUCTION,
+                            max_output_tokens=40,
+                            thinking_config=genai_types.ThinkingConfig(thinking_budget=0),
+                        )
+                        plain_cfg = genai_types.GenerateContentConfig(
+                            system_instruction=_NAMING_SYSTEM_INSTRUCTION,
+                            max_output_tokens=120,
+                        )
+                        configs = (
+                            [level_cfg, budget_cfg, plain_cfg]
+                            if is_gemini_3_or_newer(model_id)
+                            else [budget_cfg, level_cfg, plain_cfg]
+                        )
+                        resp = None
+                        for cfg in configs:
+                            try:
+                                resp = client.models.generate_content(
+                                    model=model_id,
+                                    contents=user_snippet,
+                                    config=cfg,
+                                )
+                                if (getattr(resp, "text", "") or "").strip():
+                                    break
+                            except Exception:
+                                resp = None
 
-                    if resp:
-                        cleaned = _clean_generated_title((getattr(resp, "text", "") or "").strip())
-                        if cleaned:
-                            usage = getattr(resp, "usage_metadata", None)
-                            return _finalize_title_usage(
-                                cleaned,
-                                user_snippet,
-                                getattr(usage, "prompt_token_count", 0) or 0,
-                                getattr(usage, "candidates_token_count", 0) or 0,
-                                getattr(usage, "cached_content_token_count", 0) or 0,
-                            )
+                        if resp:
+                            cleaned = _clean_generated_title((getattr(resp, "text", "") or "").strip())
+                            if cleaned:
+                                usage = getattr(resp, "usage_metadata", None)
+                                return _finalize_title_usage(
+                                    cleaned,
+                                    user_snippet,
+                                    getattr(usage, "prompt_token_count", 0) or 0,
+                                    getattr(usage, "candidates_token_count", 0) or 0,
+                                    getattr(usage, "cached_content_token_count", 0) or 0,
+                                )
+                    finally:
+                        ClientManager.close_client(client)
 
             else:
                 client, err = ClientManager.get_client(provider_id, timeout=10.0)
                 if client and not err:
-                    base_msgs = [
-                        {"role": "system", "content": _NAMING_SYSTEM_INSTRUCTION},
-                        {"role": "user", "content": user_snippet},
-                    ]
-                    resp = None
-                    for tok_kw in ({"max_completion_tokens": 60}, {"max_tokens": 40}):
-                        try:
-                            resp = client.chat.completions.create(
-                                model=model_id,
-                                messages=base_msgs,
-                                stream=False,
-                                **tok_kw,
-                            )
-                            break
-                        except Exception:
-                            resp = None
+                    try:
+                        base_msgs = [
+                            {"role": "system", "content": _NAMING_SYSTEM_INSTRUCTION},
+                            {"role": "user", "content": user_snippet},
+                        ]
+                        resp = None
+                        for tok_kw in ({"max_completion_tokens": 60}, {"max_tokens": 40}):
+                            try:
+                                resp = client.chat.completions.create(
+                                    model=model_id,
+                                    messages=base_msgs,
+                                    stream=False,
+                                    **tok_kw,
+                                )
+                                break
+                            except Exception:
+                                resp = None
 
-                    if resp and resp.choices and resp.choices[0].message:
-                        cleaned = _clean_generated_title((resp.choices[0].message.content or "").strip())
-                        if cleaned:
-                            usage = getattr(resp, "usage", None)
-                            details = getattr(usage, "prompt_tokens_details", None)
-                            return _finalize_title_usage(
-                                cleaned,
-                                user_snippet,
-                                getattr(usage, "prompt_tokens", 0) or 0,
-                                getattr(usage, "completion_tokens", 0) or 0,
-                                getattr(details, "cached_tokens", 0) if details else 0,
-                            )
-        except Exception:
-            pass
+                        if resp and resp.choices and resp.choices[0].message:
+                            cleaned = _clean_generated_title((resp.choices[0].message.content or "").strip())
+                            if cleaned:
+                                usage = getattr(resp, "usage", None)
+                                details = getattr(usage, "prompt_tokens_details", None)
+                                return _finalize_title_usage(
+                                    cleaned,
+                                    user_snippet,
+                                    getattr(usage, "prompt_tokens", 0) or 0,
+                                    getattr(usage, "completion_tokens", 0) or 0,
+                                    getattr(details, "cached_tokens", 0) if details else 0,
+                                )
+                    finally:
+                        ClientManager.close_client(client)
+        except Exception as exc:
+            _logger.debug("Chat title generation fell back to heuristic: %s", exc)
 
     return _offline_heuristic_title(prompt), 0, 0, 0
 
