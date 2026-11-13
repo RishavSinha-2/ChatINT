@@ -136,6 +136,14 @@ async function runE2eChecks() {
 
     assert(window.__cspViolations.length === 0, `Unexpected CSP violations: ${window.__cspViolations.join(", ")}`);
 
+    // 0. Verify ZERO unrendered <i data-lucide> icons remain in the document & theme icon toggles cleanly
+    const unrenderedIcons = document.querySelectorAll("i[data-lucide]");
+    assert(unrenderedIcons.length === 0, `Expected 0 unrendered <i data-lucide> icons, found ${unrenderedIcons.length}`);
+    document.getElementById("theme-toggle-btn").click();
+    assert(Boolean(document.querySelector("#theme-toggle-btn svg.lucide-sun")), "Theme toggle to light must render sun SVG");
+    document.getElementById("theme-toggle-btn").click();
+    assert(Boolean(document.querySelector("#theme-toggle-btn svg.lucide-moon")), "Theme toggle back to dark must render moon SVG");
+
     // 1. NEW-L2: Duplicate conversationId in tabs_state was deduplicated to 1 tab
     const dupTabs = window.ChatInt.state.tabs.filter((t) => t.conversationId === "conv_dup_1");
     assert(dupTabs.length === 1, `Expected 1 deduplicated tab for conv_dup_1, got ${dupTabs.length}`);

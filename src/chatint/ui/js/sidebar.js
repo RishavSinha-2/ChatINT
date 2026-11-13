@@ -237,6 +237,7 @@ export async function openConvSettingsModal(tabOrId) {
   };
 
   el.convSettingsModal.classList.add("open");
+  renderIcons(el.convSettingsModal);
   setTimeout(() => el.convTitleInput.focus(), 50);
 }
 

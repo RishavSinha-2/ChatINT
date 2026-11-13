@@ -858,7 +858,10 @@ export function renderSettingsContent(options = {}) {
           ? "Show/Hide typed key (stored keys remain masked)"
           : "Show/Hide typed key";
       toggleBtn.onclick = () => {
-        keyInput.type = keyInput.type === "password" ? "text" : "password";
+        const reveal = keyInput.type === "password";
+        keyInput.type = reveal ? "text" : "password";
+        toggleBtn.innerHTML = `<i data-lucide="${reveal ? "eye-off" : "eye"}" style="width: 14px; height: 14px;"></i>`;
+        renderIcons(toggleBtn);
       };
     }
 

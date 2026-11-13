@@ -206,6 +206,7 @@ async function bootstrapData() {
     renderConversationsList();
     renderTabs();
     renderActivePanes();
+    renderIcons(document);
   } catch (e) {
     console.error("[Bootstrap Error]", e);
   }
@@ -502,6 +503,7 @@ function setupEventListeners() {
 }
 
 async function initApp() {
+  renderIcons(document);
   setupEventListeners();
   await waitForPyWebView();
   await bootstrapData();

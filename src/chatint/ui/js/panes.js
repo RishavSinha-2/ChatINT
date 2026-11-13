@@ -1135,6 +1135,7 @@ export async function populatePaneContent(pane, tab) {
         <div style="font-size: 12.5px; max-width: 320px; text-align: center;">Ask any question. The conversation will be automatically named and saved once generation begins.</div>
       </div>
     `;
+    renderIcons(messagesContainer);
     renderTokenStats(pane, tab.id, null);
   };
 

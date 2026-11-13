@@ -108,9 +108,13 @@ export function applyTheme(theme, { persistState = true } = {}) {
   if (hljsThemeLink) {
     hljsThemeLink.href = theme === "light" ? "assets/github.min.css" : "assets/github-dark.min.css";
   }
-  if (el.themeIcon) {
+  if (el.themeToggleBtn) {
+    const iconName = theme === "light" ? "sun" : "moon";
+    el.themeToggleBtn.innerHTML = `<i data-lucide="${iconName}" id="theme-icon" style="width: 16px; height: 16px;"></i>`;
+    renderIcons(el.themeToggleBtn);
+  } else if (el.themeIcon) {
     el.themeIcon.setAttribute("data-lucide", theme === "light" ? "sun" : "moon");
-    renderIcons(el.themeToggleBtn || document);
+    renderIcons(document);
   }
 }
 

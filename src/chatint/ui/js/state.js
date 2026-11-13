@@ -96,11 +96,15 @@ export function generateClientStreamId() {
 
 export function renderIcons(root = document) {
   if (!window.lucide || !root) return;
-  if (root !== document && (!root.querySelector || !root.querySelector("[data-lucide]"))) {
+  let targetRoot = root;
+  if (targetRoot !== document && targetRoot.matches && targetRoot.matches("[data-lucide]")) {
+    targetRoot = targetRoot.parentElement || document;
+  }
+  if (targetRoot !== document && (!targetRoot.querySelector || !targetRoot.querySelector("i[data-lucide], [data-lucide]"))) {
     return;
   }
   try {
-    window.lucide.createIcons({ root });
+    window.lucide.createIcons({ root: targetRoot });
   } catch (e) {
     window.lucide.createIcons();
   }
