@@ -198,7 +198,7 @@ def make_public_bridge_api(bridge: DesktopBridge) -> Any:
         return list(PUBLIC_RPC_METHODS)
 
     def _getattribute(self, name: str) -> Any:
-        if name in allowed_set:
+        if name in allowed_set or name == "__class__":
             return object.__getattribute__(self, name)
         raise AttributeError(f"RPC attribute '{name}' is not exposed.")
 
@@ -207,6 +207,36 @@ def make_public_bridge_api(bridge: DesktopBridge) -> Any:
 
     SealedBridgeApi = type("PublicBridgeApi", (object,), namespace)
     return SealedBridgeApi()
+
+
+def read_window_current_url(window: Any) -> str:
+    """
+    Read a pywebview Window's current URL without blocking on `window.events.loaded.wait(20)`.
+    In pywebview, `Window.get_current_url()` is decorated with `@_loaded_call`, which deadlocks
+    the WinForms STA UI thread if invoked during `before_load` or before `loaded` is set.
+    """
+    if window is None:
+        return ""
+    if isinstance(window, webview.Window):
+        gui = getattr(window, "gui", None)
+        uid = getattr(window, "uid", None)
+        if gui is not None and isinstance(uid, str) and hasattr(gui, "get_current_url"):
+            try:
+                url = gui.get_current_url(uid)
+                if isinstance(url, str) and url.strip():
+                    return url.strip()
+            except Exception:
+                pass
+        events = getattr(window, "events", None)
+        loaded_ev = getattr(events, "loaded", None) if events is not None else None
+        if loaded_ev is not None and hasattr(loaded_ev, "is_set") and not loaded_ev.is_set():
+            real_url = getattr(window, "real_url", None)
+            return real_url.strip() if isinstance(real_url, str) else ""
+    try:
+        raw = window.get_current_url()
+        return str(raw).strip() if raw else ""
+    except Exception:
+        return ""
 
 
 class DesktopBridge:
@@ -307,10 +337,7 @@ class DesktopBridge:
             return
         if not self._origin_trusted:
             raise PermissionError("Blocked RPC call from untrusted window state.")
-        try:
-            current_url = str(self._window.get_current_url() or "").strip()
-        except Exception:
-            current_url = ""
+        current_url = read_window_current_url(self._window)
         # Fail CLOSED on empty/missing URL or origin mismatch (fixes C1 fail-open bug)
         if not current_url or not self._is_url_trusted(current_url):
             _logger.warning("Blocked RPC from untrusted or empty URL: %r", current_url)

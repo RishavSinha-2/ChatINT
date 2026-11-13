@@ -10,7 +10,7 @@ from urllib.parse import urlparse
 
 import webview
 
-from chatint.bridge import DesktopBridge, _normalize_file_uri_key
+from chatint.bridge import DesktopBridge, _normalize_file_uri_key, read_window_current_url
 from chatint.config import UI_DIR
 from chatint.db import init_db
 from chatint.logging_setup import configure_logging, get_logger
@@ -213,15 +213,19 @@ def _attach_origin_guard(window: webview.Window, bridge: DesktopBridge, index_ht
             bridge._set_origin_trusted(True)
 
     nav_guard_attached = [False]
+    nav_handler_refs: list[Any] = []
 
     def _ensure_wv2_nav_guard() -> None:
         if nav_guard_attached[0]:
             return
         try:
-            from webview.platforms import edgechromium  # type: ignore
+            from webview.platforms import winforms  # type: ignore
 
-            view_instance = edgechromium.BrowserView.instances.get(window.uid)
+            view_instance = winforms.BrowserView.instances.get(window.uid)
             wv2_ctrl = getattr(view_instance, "webview", None)
+            if wv2_ctrl is None and view_instance is not None:
+                browser_obj = getattr(view_instance, "browser", None)
+                wv2_ctrl = getattr(browser_obj, "webview", None)
             if wv2_ctrl is not None and hasattr(wv2_ctrl, "NavigationStarting"):
 
                 def _on_nav_starting(_sender, nav_args):
@@ -237,6 +241,7 @@ def _attach_origin_guard(window: webview.Window, bridge: DesktopBridge, index_ht
                     except Exception as nav_exc:
                         _logger.debug("NavigationStarting check error: %s", nav_exc)
 
+                nav_handler_refs.append(_on_nav_starting)
                 wv2_ctrl.NavigationStarting += _on_nav_starting
                 nav_guard_attached[0] = True
         except Exception as guard_exc:
@@ -253,11 +258,7 @@ def _attach_origin_guard(window: webview.Window, bridge: DesktopBridge, index_ht
     def _verify_current_url() -> None:
         _pin_from_real_url()
         _ensure_wv2_nav_guard()
-        try:
-            current_url = str(window.get_current_url() or "").strip()
-        except Exception:
-            bridge._set_origin_trusted(False)
-            return
+        current_url = read_window_current_url(window)
         if not current_url:
             return
 
@@ -280,7 +281,8 @@ def _attach_origin_guard(window: webview.Window, bridge: DesktopBridge, index_ht
 
     window.events.initialized += _on_initialized
     window.events.shown += _on_shown
-    window.events.before_load += _verify_current_url
+    # Never attach `_verify_current_url` to `before_load`: pywebview fires `before_load` synchronously
+    # on the WinForms STA UI thread before `loaded` is set. `NavigationStarting` + `loaded` cover both pre/post load.
     window.events.loaded += _verify_current_url
     window.events.closing += bridge.flush_tabs_state
 

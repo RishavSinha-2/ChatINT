@@ -64,6 +64,8 @@ class TestDistExecutable(unittest.TestCase):
         user32.FindWindowW.restype = wintypes.HWND
         user32.IsWindowVisible.argtypes = [wintypes.HWND]
         user32.IsWindowVisible.restype = wintypes.BOOL
+        user32.IsHungAppWindow.argtypes = [wintypes.HWND]
+        user32.IsHungAppWindow.restype = wintypes.BOOL
 
         existing = user32.FindWindowW(None, "ChatInt")
         if existing and user32.IsWindowVisible(existing):
@@ -83,6 +85,11 @@ class TestDistExecutable(unittest.TestCase):
                 time.sleep(0.05)
 
             self.assertIsNotNone(hwnd, "First executable instance must show a visible window")
+            # Allow WebView2 NavigationCompleted + inject_pywebview + ES module bootstrap to complete,
+            # then verify the WinForms STA UI thread is responsive (not hung).
+            time.sleep(1.5)
+            self.assertIsNone(proc1.poll(), "Executable must stay alive after WebView2 page load")
+            self.assertFalse(bool(user32.IsHungAppWindow(hwnd)), "ChatInt window must remain responsive after WebView2 load")
             self.assertTrue(dist_db.exists(), "Launching ChatInt.exe must initialize data/chatint.db even on a fresh build")
 
             with contextlib.closing(sqlite3.connect(dist_db)) as conn:

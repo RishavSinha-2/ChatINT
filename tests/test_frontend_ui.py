@@ -54,9 +54,11 @@ window.__cspViolations = [];
 document.addEventListener("securitypolicyviolation", (e) => {
   window.__cspViolations.push(`${e.violatedDirective}:${e.blockedURI}`);
 });
+// Mirror pywebview's webview/js/api.js `_createApi`, which uses `new Function(...)` to build `window.pywebview.api.*`
+const __pywebviewFactory = new Function("fn", "return function() { return fn.apply(this, arguments); };");
 window.pywebview = {
   api: {
-    get_initial_data: async () => ({
+    get_initial_data: __pywebviewFactory(async () => ({
       ok: true,
       error: null,
       data: {
@@ -94,8 +96,8 @@ window.pywebview = {
         google_search_totals: { month: "2026-11", monthly: 0, all_time: 0 },
         web_search_models: [{ id: "gemini-3.1-flash-lite", name: "gemini-3.1-flash-lite", input_price: 0, cached_input_price: 0, output_price: 0 }],
       },
-    }),
-    get_conversation: async (convId) => ({
+    })),
+    get_conversation: __pywebviewFactory(async (convId) => ({
       ok: true,
       error: null,
       data: {
@@ -106,10 +108,10 @@ window.pywebview = {
         messages: [{ id: "m1", role: "user", content: "Hello" }, { id: "m2", role: "assistant", content: "![Ext](https://untrusted.example/pic.png)" }],
         token_stats: { models: [], grand_total: { prompt_tokens: 0, completion_tokens: 0, cached_tokens: 0, total_tokens: 0, total_cost: 0 } },
       },
-    }),
-    get_pending_events: async () => ({ ok: true, error: null, data: [] }),
-    save_tabs_state: async () => ({ ok: true, error: null, data: { success: true } }),
-    open_external_url: async () => ({ ok: true, error: null, data: { success: true } }),
+    })),
+    get_pending_events: __pywebviewFactory(async () => ({ ok: true, error: null, data: [] })),
+    save_tabs_state: __pywebviewFactory(async () => ({ ok: true, error: null, data: { success: true } })),
+    open_external_url: __pywebviewFactory(async () => ({ ok: true, error: null, data: { success: true } })),
   },
 };
 """
