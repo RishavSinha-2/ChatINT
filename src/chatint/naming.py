@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from typing import Optional
-from chatint.client_manager import ClientManager
+from chatint.client_manager import ClientManager, is_gemini_3_or_newer
 
 _NAMING_SYSTEM_INSTRUCTION = (
     "Generate a concise 2 to 5 word title for this conversation based on the user's message. "
@@ -79,30 +79,38 @@ def generate_chat_title(
 
             elif sdk_type == "gemini":
                 from google.genai import types as genai_types
+
                 client, err = ClientManager.get_gemini_client(provider_id, timeout=10.0)
                 if client and not err:
-                    # Disable thinking for concise title generation to prevent thinking budget from truncating title text
+                    level_cfg = genai_types.GenerateContentConfig(
+                        system_instruction=_NAMING_SYSTEM_INSTRUCTION,
+                        max_output_tokens=60,
+                        thinking_config=genai_types.ThinkingConfig(thinking_level="MINIMAL"),
+                    )
+                    budget_cfg = genai_types.GenerateContentConfig(
+                        system_instruction=_NAMING_SYSTEM_INSTRUCTION,
+                        max_output_tokens=40,
+                        thinking_config=genai_types.ThinkingConfig(thinking_budget=0),
+                    )
+                    plain_cfg = genai_types.GenerateContentConfig(
+                        system_instruction=_NAMING_SYSTEM_INSTRUCTION,
+                        max_output_tokens=120,
+                    )
+                    configs = (
+                        [level_cfg, budget_cfg, plain_cfg]
+                        if is_gemini_3_or_newer(model_id)
+                        else [budget_cfg, level_cfg, plain_cfg]
+                    )
                     resp = None
-                    try:
-                        resp = client.models.generate_content(
-                            model=model_id,
-                            contents=user_snippet,
-                            config=genai_types.GenerateContentConfig(
-                                system_instruction=_NAMING_SYSTEM_INSTRUCTION,
-                                max_output_tokens=40,
-                                thinking_config=genai_types.ThinkingConfig(thinking_budget=0),
-                            ),
-                        )
-                    except Exception:
+                    for cfg in configs:
                         try:
                             resp = client.models.generate_content(
                                 model=model_id,
                                 contents=user_snippet,
-                                config=genai_types.GenerateContentConfig(
-                                    system_instruction=_NAMING_SYSTEM_INSTRUCTION,
-                                    max_output_tokens=60,
-                                ),
+                                config=cfg,
                             )
+                            if (getattr(resp, "text", "") or "").strip():
+                                break
                         except Exception:
                             resp = None
 
@@ -121,15 +129,23 @@ def generate_chat_title(
             else:
                 client, err = ClientManager.get_client(provider_id, timeout=10.0)
                 if client and not err:
-                    resp = client.chat.completions.create(
-                        model=model_id,
-                        messages=[
-                            {"role": "system", "content": _NAMING_SYSTEM_INSTRUCTION},
-                            {"role": "user", "content": user_snippet},
-                        ],
-                        max_tokens=20,
-                        stream=False,
-                    )
+                    base_msgs = [
+                        {"role": "system", "content": _NAMING_SYSTEM_INSTRUCTION},
+                        {"role": "user", "content": user_snippet},
+                    ]
+                    resp = None
+                    for tok_kw in ({"max_completion_tokens": 60}, {"max_tokens": 40}):
+                        try:
+                            resp = client.chat.completions.create(
+                                model=model_id,
+                                messages=base_msgs,
+                                stream=False,
+                                **tok_kw,
+                            )
+                            break
+                        except Exception:
+                            resp = None
+
                     if resp and resp.choices and resp.choices[0].message:
                         cleaned = _clean_generated_title((resp.choices[0].message.content or "").strip())
                         if cleaned:

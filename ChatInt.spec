@@ -3,9 +3,9 @@ from PyInstaller.utils.hooks import collect_all, collect_submodules, copy_metada
 
 datas = [('src/chatint/ui', 'chatint/ui')]
 binaries = []
-hiddenimports = ['chatint.web_search_tool']
+hiddenimports = ['chatint.web_search_tool', 'ctypes', 'ctypes.wintypes', 'sqlite3']
 
-for pkg in ('webview', 'anthropic', 'openai', 'google.genai', 'google.auth', 'httpx2'):
+for pkg in ('webview', 'anthropic', 'openai', 'google.genai', 'google.auth', 'httpx2', 'httpx'):
     try:
         tmp_ret = collect_all(pkg)
         # Filter datas: do not extract thousands of python source files, docs, or tests to disk.
@@ -21,7 +21,7 @@ for pkg in ('webview', 'anthropic', 'openai', 'google.genai', 'google.auth', 'ht
     except Exception:
         hiddenimports += collect_submodules(pkg)
 
-for dist_name in ('anthropic', 'google-genai', 'google-auth', 'openai', 'httpx', 'httpx2', 'pydantic'):
+for dist_name in ('anthropic', 'google-genai', 'google-auth', 'openai', 'httpx', 'httpx2', 'pydantic', 'certifi'):
     try:
         datas += copy_metadata(dist_name)
     except Exception:

@@ -73,6 +73,7 @@
     activeConvSettingsId: null,
     activeExportConvId: null,
     googleSearchTotals: { month: "", monthly: 0, all_time: 0 },
+    settingsBuffer: null,
   };
 
   // Configure marked for Markdown rendering
@@ -90,6 +91,8 @@
     newChatBtn: document.getElementById("new-chat-btn"),
     convSearchInput: document.getElementById("conv-search-input"),
     conversationsList: document.getElementById("conversations-list"),
+    uploadChatBtn: document.getElementById("upload-chat-btn"),
+    uploadChatFileInput: document.getElementById("upload-chat-file-input"),
     themeToggleBtn: document.getElementById("theme-toggle-btn"),
     themeIcon: document.getElementById("theme-icon"),
     globalSettingsBtn: document.getElementById("global-settings-btn"),
@@ -131,6 +134,18 @@
     appDialogOkBtn: document.getElementById("app-dialog-ok-btn"),
   };
 
+  function renderIcons(root = document) {
+    if (!window.lucide || !root) return;
+    if (root !== document && (!root.querySelector || !root.querySelector("[data-lucide]"))) {
+      return;
+    }
+    try {
+      window.lucide.createIcons({ root });
+    } catch (e) {
+      window.lucide.createIcons();
+    }
+  }
+
   // Single-Space Dark/Light Theme Aware Custom Dialogs (replaces browser alert/confirm/prompt)
   let activeDialogResolve = null;
 
@@ -149,7 +164,9 @@
       activeDialogResolve = resolve;
       el.appDialogMessage.textContent = message;
       el.appDialogInput.style.display = "none";
+      el.appDialogInput.onkeydown = null;
       el.appDialogCancelBtn.style.display = "none";
+      el.appDialogCancelBtn.onclick = () => closeAppDialog(true);
       el.appDialogOkBtn.textContent = "OK";
       el.appDialogOkBtn.className = "btn-primary";
       el.appDialogModal.classList.add("open");
@@ -164,6 +181,7 @@
       activeDialogResolve = resolve;
       el.appDialogMessage.textContent = message;
       el.appDialogInput.style.display = "none";
+      el.appDialogInput.onkeydown = null;
       el.appDialogCancelBtn.style.display = "inline-flex";
       el.appDialogCancelBtn.textContent = "Cancel";
       el.appDialogOkBtn.textContent = confirmLabel;
@@ -360,7 +378,6 @@
         renderConversationsList();
         renderTabs();
         renderActivePanes();
-        lucide.createIcons();
       }
     } catch (e) {
       console.error("[Bootstrap Error]", e);
@@ -368,8 +385,10 @@
   }
 
   // Theme Management
-  function applyTheme(theme) {
-    state.settings.theme = theme;
+  function applyTheme(theme, { persistState = true } = {}) {
+    if (persistState) {
+      state.settings.theme = theme;
+    }
     document.documentElement.setAttribute("data-theme", theme);
     const hljsThemeLink = document.getElementById("hljs-theme");
     if (hljsThemeLink) {
@@ -377,14 +396,14 @@
     }
     if (el.themeIcon) {
       el.themeIcon.setAttribute("data-lucide", theme === "light" ? "sun" : "moon");
-      lucide.createIcons();
+      renderIcons(el.themeToggleBtn || document);
     }
   }
 
   function toggleTheme() {
     const nextTheme = state.settings.theme === "dark" ? "light" : "dark";
     applyTheme(nextTheme);
-    callApi("save_settings", state.providers, state.settings);
+    callApi("set_theme", nextTheme);
   }
 
   // Tab State Persistence
@@ -409,16 +428,24 @@
     callApi("save_tabs_state", serialized);
   }
 
+  function getVerifiedProviderModels(prov, limit = null) {
+    if (!prov || !Array.isArray(prov.models)) return [];
+    const fetchedClean = Array.isArray(prov.fetched_model_ids)
+      ? new Set(prov.fetched_model_ids.map((id) => stripModelPrefix(id).toLowerCase()))
+      : null;
+    const filtered = prov.models.filter(
+      (m) => m && m.id && (!fetchedClean || fetchedClean.has(stripModelPrefix(m.id).toLowerCase()))
+    );
+    return typeof limit === "number" ? filtered.slice(0, limit) : filtered;
+  }
+
   // Get accessible/configured providers for dropdown (Strict: ONLY if enabled, has API key in .env, and models successfully fetched)
   function getDropdownProviders() {
     return state.providers.filter((p) => {
       if (!p.is_enabled) return false;
       const hasKey = Boolean(p.has_api_key || (p.api_key && p.api_key.trim()));
       if (!hasKey) return false;
-      const fetchedIds = Array.isArray(p.fetched_model_ids) ? new Set(p.fetched_model_ids) : null;
-      const validModels = Array.isArray(p.models)
-        ? p.models.filter((m) => !fetchedIds || fetchedIds.has(m.id))
-        : [];
+      const validModels = getVerifiedProviderModels(p);
       return p.is_accessible === true && validModels.length > 0;
     });
   }
@@ -522,7 +549,6 @@
     renderTabs();
     renderConversationsList();
     renderActivePanes();
-    lucide.createIcons();
   }
 
   function closeTab(tabId) {
@@ -558,7 +584,6 @@
     renderTabs();
     renderConversationsList();
     renderActivePanes();
-    lucide.createIcons();
   }
 
   // Ensure splitTabIds has no duplicates and never exceeds 5 panes
@@ -603,7 +628,6 @@
     renderTabs();
     renderConversationsList();
     renderActivePanes();
-    lucide.createIcons();
   }
 
   function switchActiveTab(tabId, targetSlotIndex = null) {
@@ -633,7 +657,6 @@
       renderTabs();
       renderConversationsList();
       renderActivePanes();
-      lucide.createIcons();
     } else if (state.splitTabIds.length > 1 && activeSlotIdx !== -1 && existingIdx !== activeSlotIdx) {
       // If user selects a tab that is already open in another split pane, exchange the tabs!
       assignTabToPaneSlot(activeSlotIdx, tabId);
@@ -697,6 +720,59 @@
     renderActivePanes();
   }
 
+  // Branch / Duplicate Active Tab into a Split Pane (Ctrl+Shift+=)
+  async function branchActiveTabToSplitPane() {
+    const activeTab = state.tabs.find((t) => t.id === state.activeTabId);
+    if (!activeTab) return;
+    if (!activeTab.conversationId) {
+      showNoticeDialog("Cannot branch an empty chat. Send a message first.");
+      return;
+    }
+
+    const res = await callApi("duplicate_conversation", activeTab.conversationId);
+    if (!res || !res.conversation) {
+      showNoticeDialog(res && res.error ? res.error : "Failed to branch conversation.");
+      return;
+    }
+
+    const newConv = res.conversation;
+    if (!state.conversations.some((c) => c.id === newConv.id)) {
+      state.conversations.unshift(newConv);
+    }
+
+    const newTab = createTabObject({
+      conversationId: newConv.id,
+      title: newConv.title,
+      systemPrompt: newConv.system_prompt || activeTab.systemPrompt || "",
+      maxContextMessages: newConv.max_context_messages || activeTab.maxContextMessages || 30,
+      providerId: activeTab._preferredProviderId || activeTab.providerId,
+      modelId: activeTab._preferredModelId || activeTab.modelId,
+      thinkingLevel: activeTab._preferredThinkingLevel || activeTab.thinkingLevel,
+      webSearchEnabled: activeTab.webSearchEnabled,
+      userSelectedModel: activeTab._userSelectedModel,
+      userSelectedThinking: activeTab._userSelectedThinking,
+    });
+    state.tabs.push(newTab);
+
+    // Add to split view (up to 5 panels)
+    if (state.splitTabIds.length < 5) {
+      state.splitTabIds.push(newTab.id);
+    } else {
+      // If 5 panels are already open, replace another pane (the one furthest from active)
+      const replaceIdx =
+        state.splitTabIds[state.splitTabIds.length - 1] === activeTab.id
+          ? 0
+          : state.splitTabIds.length - 1;
+      state.splitTabIds[replaceIdx] = newTab.id;
+    }
+
+    state.activeTabId = newTab.id;
+    persistTabsState();
+    renderTabs();
+    renderConversationsList();
+    renderActivePanes();
+  }
+
   // Render All-Tabs Scrollable Popover List
   function renderAllTabsPopover() {
     if (!el.allTabsPopover) return;
@@ -709,7 +785,7 @@
       const isActive = tab.id === state.activeTabId;
 
       const row = document.createElement("div");
-      row.className = "all-tabs-popover-item" + (isActive ? " active" : "") + (isInSplit && state.splitTabIds.length > 1 ? " in-split" : "");
+      row.className = "all-tabs-popover-item" + (isActive ? " active" : "") + (isInSplit && state.splitTabIds.length > 1 ? " split-active" : "");
       row.innerHTML = `
         <span class="all-tabs-idx">${idx + 1}.</span>
         <span class="all-tabs-title">${escapeHtml(title)}</span>
@@ -732,7 +808,7 @@
       el.allTabsPopover.appendChild(row);
     });
 
-    lucide.createIcons();
+    renderIcons(el.allTabsPopover);
   }
 
   // Render Top Tab Bar
@@ -787,7 +863,7 @@
       el.splitViewBtn.title = "Add Split Pane (up to 5 panes side-by-side, Ctrl+\\)";
     }
 
-    lucide.createIcons();
+    renderIcons(el.tabsScrollArea);
   }
 
   // Render Active Panes (1 to 5 Equal Sized Columns)
@@ -804,7 +880,7 @@
       populatePaneContent(paneEl, tab);
     });
 
-    lucide.createIcons();
+    renderIcons(el.panesContainer);
   }
 
   // Create Individual Pane Shell
@@ -980,10 +1056,7 @@
       return;
     }
 
-    const getVerifiedModels = (prov) => {
-      const fetchedIds = Array.isArray(prov?.fetched_model_ids) ? new Set(prov.fetched_model_ids) : null;
-      return (prov?.models || []).filter((m) => !fetchedIds || fetchedIds.has(m.id)).slice(0, 5);
-    };
+    const getVerifiedModels = (prov) => getVerifiedProviderModels(prov, 5);
 
     const desiredProvId = tab.isStreaming
       ? (tab.providerId || state.settings.default_provider)
@@ -1095,9 +1168,10 @@
     };
   }
 
-  function getWebSearchAvailability() {
-    const gemini = state.providers.find((p) => p.id === "gemini");
-    if (!gemini || !gemini.has_api_key) {
+  function getWebSearchAvailability(geminiProvider = null, wsModelsList = null) {
+    const gemini = geminiProvider || state.providers.find((p) => p.id === "gemini");
+    const hasKey = gemini && !gemini.clear_api_key && Boolean(gemini.has_api_key || (gemini.api_key && gemini.api_key.trim()));
+    if (!gemini || !hasKey) {
       return { available: false, reason: "NO API KEY" };
     }
     if (!gemini.is_enabled) {
@@ -1119,9 +1193,10 @@
     if (status === "error") {
       return { available: false, reason: gemini.sync_error || "FETCH ERROR" };
     }
+    const modelsSource = wsModelsList || state.webSearchModels;
     if ((Array.isArray(gemini.fetched_model_ids) && gemini.fetched_model_ids.length > 0) || status === "ready") {
       const fetchedClean = new Set((gemini.fetched_model_ids || []).map((id) => stripModelPrefix(id).toLowerCase()));
-      const wsIds = normalizeWebSearchModelsClient(state.webSearchModels).map((m) => stripModelPrefix(m.id).toLowerCase());
+      const wsIds = normalizeWebSearchModelsClient(modelsSource).map((m) => stripModelPrefix(m.id).toLowerCase());
       const hasAnySearchModel = wsIds.some((id) => fetchedClean.has(id));
       if (!hasAnySearchModel) {
         return { available: false, reason: "INVALID MODEL" };
@@ -1171,54 +1246,6 @@
     syncAllPaneWebSearchButtons();
   }
 
-  function getModelRecencyScore(m) {
-    const mid = (m && m.id ? m.id : String(m || "")).toLowerCase();
-    const created = typeof m.created === "number" ? m.created : 0;
-
-    let dateVal = 0;
-    const mDate = mid.match(/(202\d)[-_]?([01]\d)[-_]?([0-3]\d)/);
-    if (mDate) {
-      dateVal = parseInt(mDate[1] + mDate[2] + mDate[3], 10) || 0;
-    }
-
-    let verVal = 0;
-    const mDec = mid.match(/[-_v]?(\d+\.\d+)/);
-    if (mDec) {
-      verVal = parseFloat(mDec[1]) || 0;
-    } else {
-      const mDash = mid.match(/[-_](\d+)[-_](\d+)(?:[-_]|$)/);
-      if (mDash && parseInt(mDash[1], 10) <= 10) {
-        verVal = parseFloat(`${mDash[1]}.${mDash[2]}`) || 0;
-      } else {
-        const mSingle = mid.match(/(?:gpt|gemini|claude|llama|deepseek|qwen|v)[-_]?(\d+)/);
-        if (mSingle) {
-          verVal = parseFloat(mSingle[1]) || 0;
-        }
-      }
-    }
-
-    let bonus = 0;
-    if (/o3|o1|r1|reasoner/i.test(mid)) bonus += 50;
-    if (/4o|4\.5|argon|carbon/i.test(mid)) bonus += 40;
-    if (/latest|preview/i.test(mid)) bonus += 20;
-    if (/deprecated|legacy|0301|0314|0613/i.test(mid)) bonus -= 100;
-    if (/embedding|moderation|tts|whisper|audio|realtime/i.test(mid)) bonus -= 500;
-
-    return { created, dateVal, verVal, bonus };
-  }
-
-  function sortModelsNewerFirst(models) {
-    return [...models].sort((a, b) => {
-      const scoreA = getModelRecencyScore(a);
-      const scoreB = getModelRecencyScore(b);
-      if (scoreB.created !== scoreA.created) return scoreB.created - scoreA.created;
-      if (scoreB.dateVal !== scoreA.dateVal) return scoreB.dateVal - scoreA.dateVal;
-      if (scoreB.verVal !== scoreA.verVal) return scoreB.verVal - scoreA.verVal;
-      if (scoreB.bonus !== scoreA.bonus) return scoreB.bonus - scoreA.bonus;
-      return (a.id || "").localeCompare(b.id || "");
-    });
-  }
-
   // Build Live Streaming Row Element for Active Streams
   function createLiveStreamingRow(tab) {
     const liveRow = document.createElement("div");
@@ -1227,7 +1254,9 @@
 
     const provTag = (tab.streamingProviderId || tab.providerId || "API").toUpperCase();
     const modelTag = tab.streamingModelId || tab.modelId || "Model";
-    const thinkLvl = tab.streamingThinkingLevel || tab.thinkingLevel;
+    const thinkLvl = (tab.streamingThinkingLevel !== undefined && tab.streamingThinkingLevel !== null)
+      ? tab.streamingThinkingLevel
+      : (tab.thinkingLevel || "none");
     const thinkBadge = thinkLvl && thinkLvl !== "none" ? ` · ${thinkLvl.toUpperCase()} THINK` : "";
 
     const hasThinking = Boolean(tab.streamingThinking);
@@ -1263,6 +1292,15 @@
     }
 
     return liveRow;
+  }
+
+  function setTabStreamingUI(pane, tab, streaming) {
+    tab.isStreaming = Boolean(streaming);
+    if (!pane) return;
+    const sendBtn = pane.querySelector(`#send-btn-${tab.id}`);
+    const stopBtn = pane.querySelector(`#stop-btn-${tab.id}`);
+    if (sendBtn) sendBtn.style.display = streaming ? "none" : "flex";
+    if (stopBtn) stopBtn.style.display = streaming ? "flex" : "none";
   }
 
   // Populate Pane Content & Attach Handlers
@@ -1309,17 +1347,38 @@
       renderTokenStats(pane, tab.id, null);
     };
 
+    // 3. Attach input handlers early so UI stays responsive while conversation loads
+    chatInput.oninput = () => {
+      chatInput.style.height = "auto";
+      chatInput.style.height = Math.min(chatInput.scrollHeight, 150) + "px";
+    };
+
+    chatInput.onkeydown = (e) => {
+      if (e.key === "Enter" && !e.shiftKey) {
+        e.preventDefault();
+        sendMessageFromPane(pane, tab);
+      }
+    };
+
+    sendBtn.onclick = () => sendMessageFromPane(pane, tab);
+    stopBtn.onclick = () => callApi("stop_streaming", tab.id);
+    setTabStreamingUI(pane, tab, tab.isStreaming);
+
     // 2. Load Messages (or Draft Empty View)
     if (!tab.conversationId) {
       renderWelcomePlaceholder();
       if (tab.isStreaming) {
         messagesContainer.innerHTML = "";
         messagesContainer.appendChild(createLiveStreamingRow(tab));
-        lucide.createIcons();
+        renderIcons(messagesContainer);
       }
     } else {
+      const expectedConvId = tab.conversationId;
       messagesContainer.innerHTML = '<div style="color: var(--text-muted); font-size: 13px; text-align: center; margin-top: 30px;">Loading chat...</div>';
-      const conv = await callApi("get_conversation", tab.conversationId);
+      const conv = await callApi("get_conversation", expectedConvId);
+      if (!pane.isConnected || tab.conversationId !== expectedConvId) {
+        return;
+      }
       if (!conv) {
         tab.conversationId = null;
         persistTabsState();
@@ -1349,33 +1408,9 @@
             messagesContainer.appendChild(createLiveStreamingRow(tab));
           }
         }
-        lucide.createIcons();
+        renderIcons(messagesContainer);
         messagesContainer.scrollTop = messagesContainer.scrollHeight;
       }
-    }
-
-    // 3. Input handlers
-    chatInput.oninput = () => {
-      chatInput.style.height = "auto";
-      chatInput.style.height = Math.min(chatInput.scrollHeight, 150) + "px";
-    };
-
-    chatInput.onkeydown = (e) => {
-      if (e.key === "Enter" && !e.shiftKey) {
-        e.preventDefault();
-        sendMessageFromPane(pane, tab);
-      }
-    };
-
-    sendBtn.onclick = () => sendMessageFromPane(pane, tab);
-    stopBtn.onclick = () => callApi("stop_streaming", tab.id);
-
-    if (tab.isStreaming) {
-      sendBtn.style.display = "none";
-      stopBtn.style.display = "flex";
-    } else {
-      sendBtn.style.display = "flex";
-      stopBtn.style.display = "none";
     }
   }
 
@@ -1386,6 +1421,7 @@
     row.dataset.msgId = msg.id;
 
     if (msg.role === "user") {
+      row._rawContent = msg.content || "";
       row.innerHTML = `
         <div class="user-bubble">${escapeHtml(msg.content)}</div>
         <div class="user-actions">
@@ -1400,7 +1436,7 @@
         </div>
       `;
 
-      row.querySelector(".copy-msg-btn").onclick = () => copyText(msg.content, row.querySelector(".copy-msg-btn"));
+      row.querySelector(".copy-msg-btn").onclick = () => copyText(row._rawContent, row.querySelector(".copy-msg-btn"));
       row.querySelector(".edit-msg-btn").onclick = () => inlineEditUserMessage(row, tab, msg, pane);
     } else {
       const provTag = msg.provider_id ? msg.provider_id.toUpperCase() : "API";
@@ -1462,27 +1498,32 @@
         }
         row.remove();
 
-        tab.isStreaming = true;
-        const sendBtn = pane.querySelector(`#send-btn-${tab.id}`);
-        const stopBtn = pane.querySelector(`#stop-btn-${tab.id}`);
-        if (sendBtn) sendBtn.style.display = "none";
-        if (stopBtn) stopBtn.style.display = "flex";
-
+        setTabStreamingUI(pane, tab, true);
         const realMsgId = row.dataset.msgId || msg.id;
         const useWebSearch = Boolean(tab.webSearchEnabled && getWebSearchAvailability().available);
-        const res = await callApi(
-          "regenerate_message",
-          tab.id,
-          tab.conversationId,
-          realMsgId,
-          tab.providerId,
-          tab.modelId,
-          tab.thinkingLevel,
-          useWebSearch
-        );
-        if (res && res.token_stats) {
-          tab.tokenStats = res.token_stats;
-          renderTokenStats(pane, tab.id, res.token_stats);
+        try {
+          const res = await callApi(
+            "regenerate_message",
+            tab.id,
+            tab.conversationId,
+            realMsgId,
+            tab.providerId,
+            tab.modelId,
+            tab.thinkingLevel,
+            useWebSearch
+          );
+          if (!res || res.error) {
+            setTabStreamingUI(pane, tab, false);
+            showNoticeDialog((res && res.error) || "Failed to regenerate response.");
+            return;
+          }
+          if (res.token_stats) {
+            tab.tokenStats = res.token_stats;
+            renderTokenStats(pane, tab.id, res.token_stats);
+          }
+        } catch (err) {
+          setTabStreamingUI(pane, tab, false);
+          showNoticeDialog(`Failed to regenerate response: ${err.message || err}`);
         }
       };
     }
@@ -1490,19 +1531,40 @@
     return row;
   }
 
+  function sanitizeMarkdownDom(container) {
+    if (!container) return;
+    container.querySelectorAll("script, style, iframe, object, embed, form, meta, base, link").forEach((node) => node.remove());
+    container.querySelectorAll("*").forEach((node) => {
+      for (const attr of Array.from(node.attributes)) {
+        const name = attr.name.toLowerCase();
+        const val = (attr.value || "").trim().toLowerCase();
+        if (name.startsWith("on")) {
+          node.removeAttribute(attr.name);
+        } else if (
+          (name === "href" || name === "src" || name === "xlink:href" || name === "formaction") &&
+          (val.startsWith("javascript:") || val.startsWith("vbscript:") || val.startsWith("data:text/html"))
+        ) {
+          node.removeAttribute(attr.name);
+        }
+      }
+    });
+  }
+
   // Render Markdown with Code Highlighting, Copy Buttons & Protected KaTeX Math
   function renderMarkdownWithEnhancements(markdownText) {
     if (!markdownText || typeof markdownText !== "string") return "";
 
-    // 1. Protect fenced code blocks and inline code spans before math extraction
+    const nonce = Math.random().toString(36).slice(2, 10);
+
+    // 1. Protect fenced code blocks (including unclosed trailing fences during streaming) and inline code spans
     const codeTokens = [];
-    let protectedText = markdownText.replace(/(```[\s\S]*?```|~~~[\s\S]*?~~~|`[^`\n]+`)/g, (match) => {
+    let protectedText = markdownText.replace(/(```[\s\S]*?(?:```|$)|~~~[\s\S]*?(?:~~~|$)|`[^`\n]+`)/g, (match) => {
       const idx = codeTokens.length;
       codeTokens.push(match);
-      return `@@CHATINTCODE${idx}@@`;
+      return `@@CIT_${nonce}_CODE_${idx}@@`;
     });
 
-    // 2. Extract and render KaTeX math into safe placeholders so marked.parse doesn't mangle MathML/SVG
+    // 2. Extract and render KaTeX math into nonce-protected placeholders
     const mathTokens = [];
     if (window.katex) {
       const pushMathToken = (expr, displayMode, fallback) => {
@@ -1514,7 +1576,7 @@
           const htmlOut = displayMode ? `<div class="katex-display-block">${rendered}</div>` : rendered;
           const idx = mathTokens.length;
           mathTokens.push(htmlOut);
-          return `@@CHATINTMATH${idx}@@`;
+          return `@@CIT_${nonce}_MATH_${idx}@@`;
         } catch (e) {
           return fallback;
         }
@@ -1535,7 +1597,8 @@
     }
 
     // 3. Restore code blocks before running marked.parse
-    protectedText = protectedText.replace(/@@CHATINTCODE(\d+)@@/g, (_, idx) => codeTokens[Number(idx)]);
+    const codeRestoreRe = new RegExp(`@@CIT_${nonce}_CODE_(\\d+)@@`, "g");
+    protectedText = protectedText.replace(codeRestoreRe, (_, idx) => codeTokens[Number(idx)]);
 
     let html = "";
     try {
@@ -1544,51 +1607,60 @@
       return `<pre>${escapeHtml(markdownText)}</pre>`;
     }
 
-    // 4. Restore rendered KaTeX math tokens
-    if (mathTokens.length > 0) {
-      html = html.replace(/@@CHATINTMATH(\d+)@@/g, (_, idx) => mathTokens[Number(idx)]);
-    }
-
     const parser = new DOMParser();
     const doc = parser.parseFromString(`<div>${html}</div>`, "text/html");
+    const rootContainer = doc.body.firstElementChild;
+    sanitizeMarkdownDom(rootContainer);
 
-    doc.querySelectorAll("pre").forEach((pre) => {
-      const code = pre.querySelector("code");
-      let lang = "code";
-      if (code && code.className) {
-        const m = code.className.match(/language-([^\s]+)/);
-        if (m) lang = m[1];
+    if (rootContainer) {
+      let cleanHtml = rootContainer.innerHTML;
+      // 4. Restore trusted rendered KaTeX math tokens AFTER DOM sanitization
+      if (mathTokens.length > 0) {
+        const mathRestoreRe = new RegExp(`@@CIT_${nonce}_MATH_(\\d+)@@`, "g");
+        cleanHtml = cleanHtml.replace(mathRestoreRe, (_, idx) => mathTokens[Number(idx)]);
+        rootContainer.innerHTML = cleanHtml;
       }
 
-      if (window.hljs && code) {
-        const rawCode = code.textContent || "";
-        try {
-          if (lang && lang !== "code" && hljs.getLanguage(lang)) {
-            code.innerHTML = hljs.highlight(rawCode, { language: lang, ignoreIllegals: true }).value;
-          } else {
-            code.innerHTML = hljs.highlightAuto(rawCode).value;
-          }
-          code.classList.add("hljs");
-        } catch (e) {}
-      }
+      rootContainer.querySelectorAll("pre").forEach((pre) => {
+        const code = pre.querySelector("code");
+        let lang = "code";
+        if (code && code.className) {
+          const m = code.className.match(/language-([^\s]+)/);
+          if (m) lang = m[1];
+        }
 
-      const wrapper = document.createElement("div");
-      wrapper.className = "code-block-wrapper";
-      wrapper.innerHTML = `
-        <div class="code-block-header">
-          <span>${escapeHtml(lang)}</span>
-          <button class="copy-code-btn" title="Copy code">
-            <i data-lucide="copy" style="width: 11px; height: 11px;"></i>
-            <span>Copy</span>
-          </button>
-        </div>
-      `;
+        if (window.hljs && code) {
+          const rawCode = code.textContent || "";
+          try {
+            if (lang && lang !== "code" && hljs.getLanguage(lang)) {
+              code.innerHTML = hljs.highlight(rawCode, { language: lang, ignoreIllegals: true }).value;
+            } else {
+              code.innerHTML = hljs.highlightAuto(rawCode).value;
+            }
+            code.classList.add("hljs");
+          } catch (e) {}
+        }
 
-      pre.parentNode.insertBefore(wrapper, pre);
-      wrapper.appendChild(pre);
-    });
+        const wrapper = document.createElement("div");
+        wrapper.className = "code-block-wrapper";
+        wrapper.innerHTML = `
+          <div class="code-block-header">
+            <span>${escapeHtml(lang)}</span>
+            <button class="copy-code-btn" title="Copy code">
+              <i data-lucide="copy" style="width: 11px; height: 11px;"></i>
+              <span>Copy</span>
+            </button>
+          </div>
+        `;
 
-    return doc.body.firstElementChild ? doc.body.firstElementChild.innerHTML : html;
+        pre.parentNode.insertBefore(wrapper, pre);
+        wrapper.appendChild(pre);
+      });
+
+      return rootContainer.innerHTML;
+    }
+
+    return html;
   }
 
   // Inline User Message Editing
@@ -1626,6 +1698,7 @@
       }
 
       msg.content = newText;
+      row._rawContent = newText;
       bubble.textContent = newText;
 
       // Remove all subsequent messages in DOM
@@ -1633,31 +1706,36 @@
         row.nextElementSibling.remove();
       }
 
-      tab.isStreaming = true;
-      const sendBtn = pane.querySelector(`#send-btn-${tab.id}`);
-      const stopBtn = pane.querySelector(`#stop-btn-${tab.id}`);
-      if (sendBtn) sendBtn.style.display = "none";
-      if (stopBtn) stopBtn.style.display = "flex";
-
+      setTabStreamingUI(pane, tab, true);
       const realMsgId = row.dataset.msgId || msg.id;
       msg.id = realMsgId;
       row.dataset.msgId = realMsgId;
 
       const useWebSearch = Boolean(tab.webSearchEnabled && getWebSearchAvailability().available);
-      const res = await callApi(
-        "edit_message",
-        tab.id,
-        tab.conversationId,
-        realMsgId,
-        newText,
-        tab.providerId,
-        tab.modelId,
-        tab.thinkingLevel,
-        useWebSearch
-      );
-      if (res && res.token_stats) {
-        tab.tokenStats = res.token_stats;
-        renderTokenStats(pane, tab.id, res.token_stats);
+      try {
+        const res = await callApi(
+          "edit_message",
+          tab.id,
+          tab.conversationId,
+          realMsgId,
+          newText,
+          tab.providerId,
+          tab.modelId,
+          tab.thinkingLevel,
+          useWebSearch
+        );
+        if (!res || res.error) {
+          setTabStreamingUI(pane, tab, false);
+          showNoticeDialog((res && res.error) || "Failed to resend edited message.");
+          return;
+        }
+        if (res.token_stats) {
+          tab.tokenStats = res.token_stats;
+          renderTokenStats(pane, tab.id, res.token_stats);
+        }
+      } catch (err) {
+        setTabStreamingUI(pane, tab, false);
+        showNoticeDialog(`Failed to resend edited message: ${err.message || err}`);
       }
     };
   }
@@ -1693,43 +1771,49 @@
     };
     const userRow = createMessageElement(tab, tempUserMsg, pane);
     messagesContainer.appendChild(userRow);
-    lucide.createIcons();
+    renderIcons(userRow);
     messagesContainer.scrollTop = messagesContainer.scrollHeight;
 
     // Toggle button state to streaming & lock selected model/thinking
-    tab.isStreaming = true;
+    setTabStreamingUI(pane, tab, true);
     tab._userSelectedModel = true;
     tab._userSelectedThinking = true;
     tab._preferredProviderId = tab.providerId;
     tab._preferredModelId = tab.modelId;
     tab._preferredThinkingLevel = tab.thinkingLevel;
     tab._usingTempFallback = false;
-    const sendBtn = pane.querySelector(`#send-btn-${tab.id}`);
-    const stopBtn = pane.querySelector(`#stop-btn-${tab.id}`);
-    if (sendBtn) sendBtn.style.display = "none";
-    if (stopBtn) stopBtn.style.display = "flex";
 
     // Call backend send_message
     const useWebSearch = Boolean(tab.webSearchEnabled && getWebSearchAvailability().available);
-    const res = await callApi(
-      "send_message",
-      tab.id,
-      tab.conversationId,
-      text,
-      tab.providerId,
-      tab.modelId,
-      tab.thinkingLevel,
-      tab.title || "New Chat",
-      tab.systemPrompt || "",
-      tab.maxContextMessages || 30,
-      useWebSearch
-    );
-    if (res && res.conversation_id) {
-      tab.conversationId = res.conversation_id;
-    }
-    if (res && res.user_message && res.user_message.id) {
-      tempUserMsg.id = res.user_message.id;
-      userRow.dataset.msgId = res.user_message.id;
+    try {
+      const res = await callApi(
+        "send_message",
+        tab.id,
+        tab.conversationId,
+        text,
+        tab.providerId,
+        tab.modelId,
+        tab.thinkingLevel,
+        tab.title || "New Chat",
+        tab.systemPrompt || "",
+        tab.maxContextMessages || 30,
+        useWebSearch
+      );
+      if (!res || res.error) {
+        setTabStreamingUI(pane, tab, false);
+        showNoticeDialog((res && res.error) || "Failed to send message.");
+        return;
+      }
+      if (res.conversation_id) {
+        tab.conversationId = res.conversation_id;
+      }
+      if (res.user_message && res.user_message.id) {
+        tempUserMsg.id = res.user_message.id;
+        userRow.dataset.msgId = res.user_message.id;
+      }
+    } catch (err) {
+      setTabStreamingUI(pane, tab, false);
+      showNoticeDialog(`Failed to send message: ${err.message || err}`);
     }
   }
 
@@ -1766,7 +1850,7 @@
       chipsEl.innerHTML = '<span style="color: var(--text-muted);">Tokens: 0 in · 0 out · $0.00</span>';
       grandTotalEl.textContent = "0 total · Est. $0.00";
       detailsEl.innerHTML = `<span style="color: var(--text-muted);">No tokens recorded yet for this chat.</span>${searchSummaryHtml}`;
-      lucide.createIcons();
+      renderIcons(pane);
       return;
     }
 
@@ -1833,7 +1917,7 @@
       </table>
       ${searchSummaryHtml}
     `;
-    lucide.createIcons();
+    renderIcons(pane);
   }
 
   // Stream Event Handler (Dispatched from Python)
@@ -1841,115 +1925,50 @@
     onStreamEvent: function (event) {
       if (event.type === "provider_models_updated") {
         const updated = event.provider;
-        const isSettingsOpen = el.settingsModal.classList.contains("open");
+        const isSettingsOpen = el.settingsModal.classList.contains("open") && Boolean(state.settingsBuffer);
         if (isSettingsOpen) {
           saveGeneralTabInputs();
           saveActiveProviderInputs();
         }
 
         const idx = state.providers.findIndex((p) => p.id === updated.id);
-        let activeViewNeedsRefresh = false;
-
         if (idx !== -1) {
           const currentProv = state.providers[idx];
-          const snapProv = state.settingsSnapshot?.providers?.find((p) => p.id === updated.id);
-          const hasLocalEdits =
-            isSettingsOpen &&
-            snapProv &&
-            (snapProv.name !== currentProv.name ||
-              Boolean(snapProv.is_enabled) !== Boolean(currentProv.is_enabled) ||
-              (snapProv.base_url || "") !== (currentProv.base_url || "") ||
-              Boolean(currentProv.api_key) ||
-              Boolean(currentProv.clear_api_key) ||
-              JSON.stringify(snapProv.models || []) !== JSON.stringify(currentProv.models || []));
-
-          if (hasLocalEdits) {
-            // Preserve the user's in-progress Settings edits; only refresh remote metadata
-            currentProv.has_api_key = Boolean(updated.has_api_key);
-            currentProv.sync_status = updated.sync_status || "";
-            currentProv.sync_error = updated.sync_error || "";
-            if (Array.isArray(updated.fetched_model_ids) && updated.fetched_model_ids.length > 0) {
-              currentProv.fetched_model_ids = updated.fetched_model_ids;
-            }
-            refreshProviderAccessibility(currentProv);
-          } else {
-            const modelsChanged = JSON.stringify(currentProv.models || []) !== JSON.stringify(updated.models || []);
-            const accChanged = Boolean(currentProv.is_accessible) !== Boolean(updated.is_accessible);
-            const keyChanged = Boolean(currentProv.has_api_key) !== Boolean(updated.has_api_key);
-            const statusChanged = (currentProv.sync_status || "") !== (updated.sync_status || "");
-
-            // Mutate in-place to preserve active object references held by UI event closures
-            for (const k of Object.keys(currentProv)) {
-              if (!(k in updated)) delete currentProv[k];
-            }
-            Object.assign(currentProv, updated);
-            if (isSettingsOpen && state.settingsSnapshot?.providers) {
-              const sIdx = state.settingsSnapshot.providers.findIndex((p) => p.id === updated.id);
-              if (sIdx !== -1) {
-                state.settingsSnapshot.providers[sIdx] = JSON.parse(JSON.stringify(updated));
-              }
-            }
-            if (updated.id === state.activeProviderId && (modelsChanged || accChanged || keyChanged || statusChanged)) {
-              activeViewNeedsRefresh = true;
-            }
+          for (const k of Object.keys(currentProv)) {
+            if (!(k in updated)) delete currentProv[k];
           }
+          Object.assign(currentProv, updated);
         } else {
           state.providers.push(updated);
-          if (isSettingsOpen && state.settingsSnapshot?.providers) {
-            state.settingsSnapshot.providers.push(JSON.parse(JSON.stringify(updated)));
-          }
         }
 
-        // Live update model dropdowns across all visible panes
         if (updated.id === "gemini" && Array.isArray(updated.web_search_models)) {
-          const snapWs = state.settingsSnapshot?.webSearchModels;
-          const wsLocallyEdited =
-            isSettingsOpen &&
-            snapWs &&
-            JSON.stringify(snapWs) !== JSON.stringify(state.webSearchModels || []);
-          if (!wsLocallyEdited) {
-            state.webSearchModels = normalizeWebSearchModelsClient(updated.web_search_models);
-            if (isSettingsOpen && state.settingsSnapshot) {
-              state.settingsSnapshot.webSearchModels = JSON.parse(JSON.stringify(state.webSearchModels));
-            }
-          }
+          state.webSearchModels = normalizeWebSearchModelsClient(updated.web_search_models);
         }
+
+        // Live update model dropdowns across all visible panes from canonical state
         syncAllPaneModelDropdowns();
 
-        // Update settings modal view cleanly without destroying scroll state
-        if (isSettingsOpen && state.masterSettingsTab === "websearch" && updated.id === "gemini") {
+        // If Settings buffer is active, update provider metadata in buffer without overwriting user's uncommitted edits
+        if (isSettingsOpen && state.settingsBuffer) {
+          const bufProv = state.settingsBuffer.providers.find((p) => p.id === updated.id);
+          if (bufProv) {
+            bufProv.has_api_key = Boolean(updated.has_api_key);
+            bufProv.sync_status = updated.sync_status || "";
+            bufProv.sync_error = updated.sync_error || "";
+            if (Array.isArray(updated.fetched_model_ids) && updated.fetched_model_ids.length > 0) {
+              bufProv.fetched_model_ids = updated.fetched_model_ids;
+            }
+            refreshProviderAccessibility(bufProv);
+          }
           const isModelModalOpen = el.modelConfigModal && el.modelConfigModal.classList.contains("open");
           const activeEl = document.activeElement;
-          const isTypingInModal = activeEl && el.settingsModal.contains(activeEl) && activeEl.tagName === "INPUT";
+          const isTypingInModal =
+            activeEl &&
+            el.settingsModal.contains(activeEl) &&
+            (activeEl.tagName === "INPUT" || activeEl.tagName === "TEXTAREA");
           if (!isModelModalOpen && !isTypingInModal) {
             renderSettingsContent();
-          }
-        } else if (isSettingsOpen && state.masterSettingsTab === "providers") {
-          const provObj = state.providers.find((p) => p.id === updated.id);
-          const subBtn = el.settingsTabContent.querySelector(`.provider-sub-btn[data-prov-id="${CSS.escape(updated.id)}"]`);
-          if (subBtn && provObj) {
-            let dot = subBtn.querySelector(".prov-status-dot");
-            if (provObj.is_accessible && !dot) {
-              dot = document.createElement("span");
-              dot.className = "prov-status-dot";
-              dot.style.cssText = "color: #34a853; font-size: 10px;";
-              dot.textContent = "●";
-              subBtn.appendChild(dot);
-            } else if (!provObj.is_accessible && dot) {
-              dot.remove();
-            }
-          }
-
-          const isModelModalOpen = el.modelConfigModal && el.modelConfigModal.classList.contains("open");
-          if (activeViewNeedsRefresh && !isModelModalOpen) {
-            const activeEl = document.activeElement;
-            const isTypingInModal =
-              activeEl &&
-              el.settingsModal.contains(activeEl) &&
-              (activeEl.tagName === "INPUT" || activeEl.tagName === "TEXTAREA");
-            if (!isTypingInModal) {
-              renderSettingsContent();
-            }
           }
         }
         return;
@@ -1996,7 +2015,9 @@
         tab.hasAutoCollapsedThinking = false;
         tab.streamingProviderId = event.provider_id || tab.providerId;
         tab.streamingModelId = event.model_id || tab.modelId;
-        tab.streamingThinkingLevel = event.thinking_level || tab.thinkingLevel;
+        tab.streamingThinkingLevel = (event.thinking_level !== undefined && event.thinking_level !== null)
+          ? event.thinking_level
+          : "none";
         tab.streamingStartTime = Date.now();
 
         if (pane && messagesContainer) {
@@ -2011,11 +2032,11 @@
 
           // Remove any stale live row if present
           const staleLive = document.getElementById(`live-msg-${tab.id}`);
-          if (staleLive) staleLive.removeAttribute("id");
+          if (staleLive) staleLive.remove();
 
           const liveRow = createLiveStreamingRow(tab);
           messagesContainer.appendChild(liveRow);
-          lucide.createIcons();
+          renderIcons(liveRow);
           messagesContainer.scrollTop = messagesContainer.scrollHeight;
         }
       } else if (event.type === "tool_status") {
@@ -2024,17 +2045,34 @@
           if (toolBanner) {
             if (event.status === "searching") {
               toolBanner.style.display = "inline-flex";
-              toolBanner.innerHTML = `<i data-lucide="globe" style="width: 12px; height: 12px;"></i><span>Searching Google${event.query ? `: "${escapeHtml(event.query)}"` : "..."}</span>`;
-              lucide.createIcons();
-            } else if (event.status === "done") {
-              const reqUsed = Number(event.search_requests_used || 0);
-              if (event.ok) {
-                toolBanner.style.display = "inline-flex";
-                toolBanner.innerHTML = `<i data-lucide="check" style="width: 12px; height: 12px; color: #34a853;"></i><span>Google Search complete (${reqUsed} ${reqUsed === 1 ? "request" : "requests"})</span>`;
+              if (event.tool === "image_search") {
+                toolBanner.innerHTML = `<i data-lucide="image" style="width: 12px; height: 12px; color: var(--accent-color);"></i><span>Searching images${event.query ? `: "${escapeHtml(event.query)}"` : "..."}</span>`;
               } else {
-                toolBanner.style.display = "none";
+                toolBanner.innerHTML = `<i data-lucide="globe" style="width: 12px; height: 12px;"></i><span>Searching Google${event.query ? `: "${escapeHtml(event.query)}"` : "..."}</span>`;
               }
-              lucide.createIcons();
+              renderIcons(toolBanner);
+            } else if (event.status === "done") {
+              if (event.tool === "image_search") {
+                const imgCount = Number(event.images_found || 0);
+                if (event.ok && imgCount > 0) {
+                  toolBanner.style.display = "inline-flex";
+                  toolBanner.innerHTML = `<i data-lucide="check" style="width: 12px; height: 12px; color: #34a853;"></i><span>Image search complete (${imgCount} ${imgCount === 1 ? "image" : "images"} found)</span>`;
+                } else if (event.ok) {
+                  toolBanner.style.display = "inline-flex";
+                  toolBanner.innerHTML = `<i data-lucide="info" style="width: 12px; height: 12px; color: var(--text-muted);"></i><span>No images found</span>`;
+                } else {
+                  toolBanner.style.display = "none";
+                }
+              } else {
+                const reqUsed = Number(event.search_requests_used || 0);
+                if (event.ok) {
+                  toolBanner.style.display = "inline-flex";
+                  toolBanner.innerHTML = `<i data-lucide="check" style="width: 12px; height: 12px; color: #34a853;"></i><span>Google Search complete (${reqUsed} ${reqUsed === 1 ? "request" : "requests"})</span>`;
+                } else {
+                  toolBanner.style.display = "none";
+                }
+              }
+              renderIcons(toolBanner);
             }
             messagesContainer.scrollTop = messagesContainer.scrollHeight;
           }
@@ -2069,7 +2107,7 @@
           const contentDiv = document.getElementById(`live-content-${tab.id}`);
           if (contentDiv) {
             contentDiv.innerHTML = renderMarkdownWithEnhancements(tab.streamingContent);
-            lucide.createIcons();
+            renderIcons(contentDiv);
             const isNearBottom = messagesContainer.scrollHeight - messagesContainer.scrollTop - messagesContainer.clientHeight < 120;
             if (isNearBottom) {
               messagesContainer.scrollTop = messagesContainer.scrollHeight;
@@ -2093,7 +2131,7 @@
             } else if (!messagesContainer.querySelector(`[data-msg-id="${event.message.id}"]`)) {
               messagesContainer.appendChild(finalEl);
             }
-            lucide.createIcons();
+            renderIcons(finalEl);
           } else if (liveRow) {
             liveRow.remove();
           }
@@ -2156,15 +2194,21 @@
               const prevRow = targetRow.previousElementSibling;
               const prevMsgId = prevRow ? prevRow.dataset.msgId : null;
               const prevBubble = prevRow ? prevRow.querySelector(".user-bubble") : null;
-              const prevText = prevBubble ? prevBubble.textContent : "";
+              const prevText =
+                prevRow && typeof prevRow._rawContent === "string"
+                  ? prevRow._rawContent
+                  : (prevBubble ? prevBubble.textContent : "");
+
+              if (!prevMsgId || !tab.conversationId) {
+                showNoticeDialog("Unable to retry: the previous message has not finished saving yet.");
+                return;
+              }
 
               targetRow.remove();
-              if (prevMsgId && tab.conversationId) {
-                tab.isStreaming = true;
-                if (sendBtn) sendBtn.style.display = "none";
-                if (stopBtn) stopBtn.style.display = "flex";
-                const useWebSearch = Boolean(tab.webSearchEnabled && getWebSearchAvailability().available);
-                await callApi(
+              setTabStreamingUI(pane, tab, true);
+              const useWebSearch = Boolean(tab.webSearchEnabled && getWebSearchAvailability().available);
+              try {
+                const res = await callApi(
                   "edit_message",
                   tab.id,
                   tab.conversationId,
@@ -2175,6 +2219,13 @@
                   tab.thinkingLevel,
                   useWebSearch
                 );
+                if (!res || res.error) {
+                  setTabStreamingUI(pane, tab, false);
+                  showNoticeDialog((res && res.error) || "Failed to retry message.");
+                }
+              } catch (err) {
+                setTabStreamingUI(pane, tab, false);
+                showNoticeDialog(`Failed to retry message: ${err.message || err}`);
               }
             };
           }
@@ -2199,6 +2250,9 @@
       item.innerHTML = `
         <span class="conv-title">${escapeHtml(conv.title)}</span>
         <div class="conv-actions">
+          <button class="conv-action-btn branch-conv-btn" title="Branch Chat">
+            <i data-lucide="git-branch" style="width: 12px; height: 12px;"></i>
+          </button>
           <button class="conv-action-btn edit-title-btn" title="Rename">
             <i data-lucide="pencil" style="width: 12px; height: 12px;"></i>
           </button>
@@ -2209,18 +2263,68 @@
       `;
 
       item.onclick = async (e) => {
-        if (e.target.closest(".edit-title-btn")) {
+        if (e.target.closest(".branch-conv-btn")) {
           e.stopPropagation();
-          const newTitle = await showPromptDialog("Rename chat", conv.title);
-          if (newTitle && newTitle.trim()) {
-            conv.title = newTitle.trim();
-            state.tabs.forEach((t) => {
-              if (t.conversationId === conv.id) t.title = conv.title;
+          const res = await callApi("duplicate_conversation", conv.id);
+          if (res && res.conversation) {
+            const newConv = res.conversation;
+            if (!state.conversations.some((c) => c.id === newConv.id)) {
+              state.conversations.unshift(newConv);
+            }
+            const activeTab = state.tabs.find((t) => t.id === state.activeTabId);
+            const newTab = createTabObject({
+              conversationId: newConv.id,
+              title: newConv.title,
+              systemPrompt: newConv.system_prompt || (activeTab ? activeTab.systemPrompt : ""),
+              maxContextMessages: newConv.max_context_messages || (activeTab ? activeTab.maxContextMessages : 30),
+              providerId: activeTab ? (activeTab._preferredProviderId || activeTab.providerId) : undefined,
+              modelId: activeTab ? (activeTab._preferredModelId || activeTab.modelId) : undefined,
+              thinkingLevel: activeTab ? (activeTab._preferredThinkingLevel || activeTab.thinkingLevel) : undefined,
+              webSearchEnabled: activeTab ? activeTab.webSearchEnabled : false,
+              userSelectedModel: activeTab ? activeTab._userSelectedModel : false,
+              userSelectedThinking: activeTab ? activeTab._userSelectedThinking : false,
             });
-            callApi("rename_conversation", conv.id, conv.title);
+            state.tabs.push(newTab);
+            state.activeTabId = newTab.id;
+            if (!state.splitTabIds.includes(newTab.id)) {
+              if (state.splitTabIds.length < 5) {
+                state.splitTabIds.push(newTab.id);
+              } else {
+                const replaceIdx = state.splitTabIds[state.splitTabIds.length - 1] === (activeTab ? activeTab.id : null) ? 0 : state.splitTabIds.length - 1;
+                state.splitTabIds[replaceIdx] = newTab.id;
+              }
+            }
             persistTabsState();
             renderConversationsList();
             renderTabs();
+            renderActivePanes();
+          } else {
+            showNoticeDialog(res && res.error ? res.error : "Failed to branch conversation.");
+          }
+        } else if (e.target.closest(".edit-title-btn")) {
+          e.stopPropagation();
+          const newTitle = await showPromptDialog("Rename chat", conv.title);
+          if (newTitle && newTitle.trim()) {
+            const requestedTitle = newTitle.trim();
+            conv.title = requestedTitle;
+            state.tabs.forEach((t) => {
+              if (t.conversationId === conv.id) t.title = requestedTitle;
+            });
+            persistTabsState();
+            renderConversationsList();
+            renderTabs();
+            // Background check for unique name without interrupting user
+            callApi("rename_conversation", conv.id, requestedTitle).then((res) => {
+              if (res && res.title && res.title !== requestedTitle) {
+                conv.title = res.title;
+                state.tabs.forEach((t) => {
+                  if (t.conversationId === conv.id) t.title = res.title;
+                });
+                persistTabsState();
+                renderConversationsList();
+                renderTabs();
+              }
+            });
           }
         } else if (e.target.closest(".delete-conv-btn")) {
           e.stopPropagation();
@@ -2280,43 +2384,43 @@
       el.conversationsList.appendChild(item);
     });
 
-    lucide.createIcons();
+    renderIcons(el.conversationsList);
   }
 
   // Settings Modal Management (General, Providers & Web Search)
   function openSettingsModal() {
     state.webSearchModels = normalizeWebSearchModelsClient(state.webSearchModels);
-    state.settingsSnapshot = JSON.parse(
-      JSON.stringify({
-        providers: state.providers,
-        settings: state.settings,
-        webSearchModels: state.webSearchModels,
-      })
-    );
+    const clonedProviders = JSON.parse(JSON.stringify(state.providers));
+    clonedProviders.forEach((p) => {
+      p._saved_has_api_key = Boolean(p.has_api_key);
+    });
+    state.settingsBuffer = {
+      providers: clonedProviders,
+      settings: JSON.parse(JSON.stringify(state.settings)),
+      webSearchModels: JSON.parse(JSON.stringify(state.webSearchModels)),
+      activeProviderId: state.activeProviderId || (state.providers[0] ? state.providers[0].id : null),
+      masterSettingsTab: state.masterSettingsTab || "general",
+    };
     updateMasterTabsUI();
     renderSettingsContent({ resetScroll: true });
     el.settingsModal.classList.add("open");
-    lucide.createIcons();
+    renderIcons(el.settingsModal);
   }
 
   function closeSettingsModal(saved = false) {
-    if (!saved && state.settingsSnapshot) {
-      state.providers = state.settingsSnapshot.providers;
-      state.settings = state.settingsSnapshot.settings;
-      if (Array.isArray(state.settingsSnapshot.webSearchModels)) {
-        state.webSearchModels = normalizeWebSearchModelsClient(state.settingsSnapshot.webSearchModels);
-      }
+    if (!saved) {
       applyTheme(state.settings.theme || "dark");
     }
-    state.settingsSnapshot = null;
+    state.settingsBuffer = null;
     el.settingsModal.classList.remove("open");
   }
 
   function updateMasterTabsUI() {
-    el.masterTabGeneral.classList.toggle("active", state.masterSettingsTab === "general");
-    el.masterTabProviders.classList.toggle("active", state.masterSettingsTab === "providers");
+    const curTab = state.settingsBuffer ? state.settingsBuffer.masterSettingsTab : state.masterSettingsTab;
+    el.masterTabGeneral.classList.toggle("active", curTab === "general");
+    el.masterTabProviders.classList.toggle("active", curTab === "providers");
     if (el.masterTabWebSearch) {
-      el.masterTabWebSearch.classList.toggle("active", state.masterSettingsTab === "websearch");
+      el.masterTabWebSearch.classList.toggle("active", curTab === "websearch");
     }
   }
 
@@ -2359,9 +2463,10 @@
     return String(raw || "").replace(/[^A-Za-z]/g, "");
   }
 
-  function validateAllProviders() {
+  function validateAllProviders(providersList = null) {
+    const list = providersList || (state.settingsBuffer ? state.settingsBuffer.providers : state.providers);
     const seen = new Set();
-    for (const p of state.providers) {
+    for (const p of list) {
       const name = (p.name || "").trim();
       if (!name || !/^[A-Za-z]+$/.test(name)) {
         return `Provider name "${name || "(empty)"}" must contain only English alphabet letters (A-Z, a-z) with no spaces, numbers, dashes, underscores, or special characters.`;
@@ -2378,32 +2483,116 @@
   function canShowProviderModels(prov) {
     if (!prov || prov.clear_api_key) return false;
     const hasKey = Boolean((prov.api_key && prov.api_key.trim()) || prov.has_api_key);
-    return hasKey && prov.sync_status === "ready";
+    return hasKey && (prov.sync_status === "ready" || (Array.isArray(prov.fetched_model_ids) && prov.fetched_model_ids.length > 0));
   }
 
   function refreshProviderAccessibility(prov) {
     if (!prov) return;
     const typedKey = (prov.api_key || "").trim();
-    const hasCredentials = prov.clear_api_key ? false : Boolean(typedKey || prov.has_api_key);
-    const fetchedIds = Array.isArray(prov.fetched_model_ids) ? new Set(prov.fetched_model_ids) : new Set();
-    const models = Array.isArray(prov.models) ? prov.models : [];
-    const verifiedModels = fetchedIds.size > 0 ? models.filter((m) => fetchedIds.has(m.id)) : models;
+    const hasCredentials = Boolean(typedKey || (!prov.clear_api_key && prov.has_api_key));
+    const hasFetched = Array.isArray(prov.fetched_model_ids) && prov.fetched_model_ids.length > 0;
+    const verifiedModels = getVerifiedProviderModels(prov);
     prov.has_api_key = Boolean(hasCredentials);
     prov.is_accessible = Boolean(
-      prov.is_enabled && hasCredentials && prov.sync_status === "ready" && verifiedModels.length > 0
+      prov.is_enabled && hasCredentials && (prov.sync_status === "ready" || hasFetched) && verifiedModels.length > 0
     );
   }
 
-  function shuffleModelArray(models) {
-    const arr = [...(models || [])];
-    for (let i = arr.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [arr[i], arr[j]] = [arr[j], arr[i]];
+  function applyFetchedModelsToProvider(prov, res, { autoAdd = false } = {}) {
+    const fetched = res.models || [];
+    const fetchedIds = fetched.map((m) => m.id);
+    const cleanFetchedIds = new Set(fetchedIds.map((id) => stripModelPrefix(id).toLowerCase()));
+    const retained = (prov.models || []).filter((m) => m && m.id && cleanFetchedIds.has(stripModelPrefix(m.id).toLowerCase()));
+
+    if (autoAdd && retained.length < 5) {
+      const cleanRetainedIds = new Set(retained.map((m) => stripModelPrefix(m.id).toLowerCase()));
+      for (const candidate of fetched) {
+        if (retained.length >= 5) break;
+        const cleanCandId = stripModelPrefix(candidate.id).toLowerCase();
+        if (cleanRetainedIds.has(cleanCandId)) continue;
+        const isThinking = /o1|o3|r1|reasoning|thinking/i.test(candidate.id) ? 1 : (candidate.supports_thinking || 0);
+        retained.push({
+          id: candidate.id,
+          name: candidate.name || candidate.id,
+          supports_thinking: isThinking,
+          input_price: candidate.input_price || 0.0,
+          cached_input_price: candidate.cached_input_price || 0.0,
+          output_price: candidate.output_price || 0.0,
+        });
+        cleanRetainedIds.add(cleanCandId);
+      }
     }
-    if (arr.length > 1 && arr.every((m, i) => m.id === models[i].id)) {
-      arr.push(arr.shift());
+
+    prov.models = autoAdd ? retained.slice(0, 5) : retained;
+    prov.fetched_model_ids = fetchedIds;
+    prov.has_api_key = true;
+    prov.sync_status = res.sync_status || "ready";
+    prov.sync_error = res.sync_error || "";
+    refreshProviderAccessibility(prov);
+    return { fetched, cleanFetchedIds };
+  }
+
+  function applyFetchedModelsToWebSearch(buf, fetched, cleanFetchedIds, { autoAdd = false } = {}) {
+    const [wsPrimary, ...wsFallbacks] = normalizeWebSearchModelsClient(buf.webSearchModels);
+    const retainedWs = wsFallbacks.filter((m) => cleanFetchedIds.has(stripModelPrefix(m.id).toLowerCase()));
+    const wsModels = [wsPrimary, ...retainedWs];
+
+    if (autoAdd && wsModels.length < 5) {
+      const configuredWsIds = new Set(wsModels.map((m) => stripModelPrefix(m.id).toLowerCase()));
+      for (const candidate of fetched) {
+        if (wsModels.length >= 5) break;
+        const canonicalId = stripModelPrefix(candidate.id);
+        if (configuredWsIds.has(canonicalId.toLowerCase())) continue;
+        wsModels.push({
+          id: canonicalId,
+          name: candidate.name || canonicalId,
+          input_price: candidate.input_price || 0.0,
+          cached_input_price: candidate.cached_input_price || 0.0,
+          output_price: candidate.output_price || 0.0,
+        });
+        configuredWsIds.add(canonicalId.toLowerCase());
+      }
     }
-    return arr;
+
+    buf.webSearchModels = normalizeWebSearchModelsClient(wsModels);
+  }
+
+  async function runProviderFetchAction({ prov, btn, idleHtml, useTypedBaseUrl = false, onSuccess, failPrefix = "Could not fetch models" }) {
+    const typedKey = prov ? ((prov.api_key || "").trim() || null) : null;
+    const typedBaseUrl = useTypedBaseUrl && prov ? ((prov.base_url || "").trim() || null) : null;
+    const isEnabled = prov ? Boolean(prov.is_enabled) : true;
+    const clearApiKey = Boolean(prov && prov.clear_api_key && !typedKey);
+
+    btn.disabled = true;
+    btn.innerHTML = '<i data-lucide="loader" style="width: 11px; height: 11px;"></i> Fetching...';
+    renderIcons(btn);
+
+    let res = null;
+    let callErr = null;
+    try {
+      res = await callApi("fetch_provider_models", prov ? prov.id : "", typedKey, typedBaseUrl, isEnabled, clearApiKey);
+    } catch (err) {
+      callErr = err;
+    } finally {
+      btn.disabled = false;
+      btn.innerHTML = idleHtml;
+      renderIcons(btn);
+    }
+
+    if (res && res.models && res.models.length > 0 && prov) {
+      onSuccess(res);
+      return;
+    }
+
+    if (prov) {
+      prov.is_accessible = false;
+      prov.fetched_model_ids = [];
+      prov.sync_status = (res && res.sync_status) || "error";
+      prov.sync_error = (res && res.sync_error) || "FETCH ERROR";
+    }
+    renderSettingsContent();
+    const errMsg = (res && res.error) || (callErr && (callErr.message || String(callErr))) || "Endpoint unreachable or invalid API key";
+    showNoticeDialog(`${failPrefix}: ${errMsg}`);
   }
 
   function swapModelInArray(models, mid, delta, minIdx = 0) {
@@ -2416,13 +2605,6 @@
     const arr = [...list];
     [arr[idx], arr[targetIdx]] = [arr[targetIdx], arr[idx]];
     return arr;
-  }
-
-  function syncSearchModelsWithGeminiFetch(fetchedIds) {
-    const cleanFetchedSet = new Set(Array.from(fetchedIds || [], (id) => stripModelPrefix(id).toLowerCase()));
-    const [wsPrimary, ...wsFallbacks] = normalizeWebSearchModelsClient(state.webSearchModels);
-    const keptWs = wsFallbacks.filter((m) => cleanFetchedSet.has(stripModelPrefix(m.id).toLowerCase()));
-    state.webSearchModels = normalizeWebSearchModelsClient([wsPrimary, ...keptWs]);
   }
 
   function renderConfiguredModelRow(m, idx, totalM, isWebSearch = false) {
@@ -2481,6 +2663,8 @@
   }
 
   function renderSettingsContent(options = {}) {
+    if (!state.settingsBuffer) return;
+    const buf = state.settingsBuffer;
     const resetScroll = Boolean(options.resetScroll);
     const prevTab = el.settingsTabContent.dataset.renderedTab || "";
     const prevProvId = el.settingsTabContent.dataset.renderedProvId || "";
@@ -2490,29 +2674,29 @@
 
     const prevModalScroll = !resetScroll && modalBody ? modalBody.scrollTop : 0;
     const prevSubNavScroll = !resetScroll && prevSubNav ? prevSubNav.scrollTop : 0;
-    const targetProvId = state.masterSettingsTab === "providers" ? (state.activeProviderId || state.providers[0]?.id || "") : "";
+    const targetProvId = buf.masterSettingsTab === "providers" ? (buf.activeProviderId || buf.providers[0]?.id || "") : "";
     const sameProviderView =
       !resetScroll &&
       prevTab === "providers" &&
-      state.masterSettingsTab === "providers" &&
+      buf.masterSettingsTab === "providers" &&
       prevProvId === targetProvId;
-    const sameWebSearchView = !resetScroll && prevTab === "websearch" && state.masterSettingsTab === "websearch";
+    const sameWebSearchView = !resetScroll && prevTab === "websearch" && buf.masterSettingsTab === "websearch";
     const prevModelsScroll = (sameProviderView || sameWebSearchView) && prevModelsList ? prevModelsList.scrollTop : 0;
-    const sameGeneralView = !resetScroll && prevTab === "general" && state.masterSettingsTab === "general";
+    const sameGeneralView = !resetScroll && prevTab === "general" && buf.masterSettingsTab === "general";
 
     el.settingsTabContent.innerHTML = "";
 
-    if (state.masterSettingsTab === "general") {
+    if (buf.masterSettingsTab === "general") {
       el.settingsTabContent.innerHTML = `
         <div class="settings-group">
           <label class="settings-label">Global Default System Prompt</label>
-          <textarea class="settings-input" id="setting-global-system-prompt" rows="3">${escapeHtml(state.settings.global_system_prompt || "")}</textarea>
+          <textarea class="settings-input" id="setting-global-system-prompt" rows="3">${escapeHtml(buf.settings.global_system_prompt || "")}</textarea>
         </div>
 
         <div class="settings-group">
           <label class="settings-label">Default Provider</label>
           <select class="settings-input" id="setting-default-provider">
-            ${state.providers.map((p) => `<option value="${p.id}" ${p.id === state.settings.default_provider ? "selected" : ""}>${escapeHtml(p.name)}</option>`).join("")}
+            ${buf.providers.map((p) => `<option value="${p.id}" ${p.id === buf.settings.default_provider ? "selected" : ""}>${escapeHtml(p.name)}</option>`).join("")}
           </select>
         </div>
 
@@ -2520,7 +2704,7 @@
           <label class="settings-label">Default Thinking</label>
           <select class="settings-input" id="setting-default-thinking">
             ${THINKING_LEVELS.map(
-              (lvl) => `<option value="${lvl.value}" ${lvl.value === getDefaultThinkingLevel() ? "selected" : ""}>${lvl.label}</option>`
+              (lvl) => `<option value="${lvl.value}" ${lvl.value === (buf.settings.default_thinking || "medium") ? "selected" : ""}>${lvl.label}</option>`
             ).join("")}
           </select>
         </div>
@@ -2528,20 +2712,20 @@
         <div class="settings-group">
           <label class="settings-label">Appearance Theme</label>
           <select class="settings-input" id="setting-theme">
-            <option value="dark" ${state.settings.theme === "dark" ? "selected" : ""}>Dark Theme</option>
-            <option value="light" ${state.settings.theme === "light" ? "selected" : ""}>Light Theme</option>
+            <option value="dark" ${buf.settings.theme === "dark" ? "selected" : ""}>Dark Theme</option>
+            <option value="light" ${buf.settings.theme === "light" ? "selected" : ""}>Light Theme</option>
           </select>
         </div>
       `;
-    } else if (state.masterSettingsTab === "websearch") {
-      state.webSearchModels = normalizeWebSearchModelsClient(state.webSearchModels);
-      const geminiProv = state.providers.find((p) => p.id === "gemini");
-      const { available: wsAvail, reason: wsReason } = getWebSearchAvailability();
+    } else if (buf.masterSettingsTab === "websearch") {
+      buf.webSearchModels = normalizeWebSearchModelsClient(buf.webSearchModels);
+      const geminiProv = buf.providers.find((p) => p.id === "gemini");
+      const { available: wsAvail, reason: wsReason } = getWebSearchAvailability(geminiProv, buf.webSearchModels);
       const wsStatusLine = wsAvail
         ? '<span style="color: #34a853; font-weight: 600;">Ready</span> · Using your Gemini provider API key.'
         : `<span style="color: #ff8a80; font-weight: 600;">Unavailable (${escapeHtml(wsReason)})</span> · Configure Gemini in Providers.`;
 
-      const wsModels = state.webSearchModels;
+      const wsModels = buf.webSearchModels;
       const totalWs = wsModels.length;
 
       el.settingsTabContent.innerHTML = `
@@ -2554,11 +2738,11 @@
             <div style="display: flex; align-items: center; justify-content: space-between;">
               <label class="settings-label">Configured Search Models (Max 5 · Priority Order)</label>
               <div style="display: flex; gap: 6px; align-items: center;">
-                <button class="btn-secondary ws-shuffle-models-btn" style="padding: 2px 8px; font-size: 11px; display: flex; align-items: center; gap: 4px;" title="Shuffle fallback models (keeps gemini-3.1-flash-lite pinned at top)">
-                  <i data-lucide="shuffle" style="width: 11px; height: 11px;"></i>
-                  <span>Shuffle</span>
+                <button class="btn-secondary ws-auto-add-models-btn" style="padding: 2px 8px; font-size: 11px; display: flex; align-items: center; gap: 4px;" title="Fetch Gemini models, prune missing models, and auto-add available models up to 5 total">
+                  <i data-lucide="plus-circle" style="width: 11px; height: 11px;"></i>
+                  <span>Auto add</span>
                 </button>
-                <button class="btn-secondary ws-fetch-models-btn" style="padding: 2px 8px; font-size: 11px; display: flex; align-items: center; gap: 4px;" title="Fetch available Gemini models and discard missing fallback models">
+                <button class="btn-secondary ws-fetch-models-btn" style="padding: 2px 8px; font-size: 11px; display: flex; align-items: center; gap: 4px;" title="Fetch available Gemini models and prune missing fallback models (never auto-adds)">
                   <i data-lucide="refresh-cw" style="width: 11px; height: 11px;"></i>
                   <span>Fetch Gemini Models</span>
                 </button>
@@ -2581,29 +2765,18 @@
       el.settingsTabContent.querySelectorAll(".ws-model-config-btn").forEach((btn) => {
         btn.onclick = () => {
           const mid = btn.dataset.modelId;
-          const target = state.webSearchModels.find((m) => m.id === mid);
+          const target = buf.webSearchModels.find((m) => m.id === mid);
           if (target) {
             openModelConfigModal(geminiProv || null, target, { isWebSearch: true });
           }
         };
       });
 
-      // Shuffle fallback models only (index 0 stays fixed)
-      const wsShuffleBtn = el.settingsTabContent.querySelector(".ws-shuffle-models-btn");
-      if (wsShuffleBtn) {
-        wsShuffleBtn.onclick = () => {
-          if (state.webSearchModels.length <= 2) return;
-          const [primary, ...fallbacks] = state.webSearchModels;
-          state.webSearchModels = [primary, ...shuffleModelArray(fallbacks)];
-          renderSettingsContent();
-        };
-      }
-
       // Move fallback models up/down (index 0 cannot move, index 1 cannot move above index 0)
       const swapWsModel = (mid, delta) => {
-        const swapped = swapModelInArray(state.webSearchModels, mid, delta, 1);
+        const swapped = swapModelInArray(buf.webSearchModels, mid, delta, 1);
         if (swapped) {
-          state.webSearchModels = swapped;
+          buf.webSearchModels = swapped;
           renderSettingsContent();
         }
       };
@@ -2619,7 +2792,7 @@
         btn.onclick = () => {
           const mid = btn.dataset.modelId;
           if (mid.toLowerCase() === PRIMARY_WEB_SEARCH_MODEL) return;
-          state.webSearchModels = state.webSearchModels.filter((m) => m.id !== mid);
+          buf.webSearchModels = buf.webSearchModels.filter((m) => m.id !== mid);
           renderSettingsContent();
         };
       });
@@ -2642,15 +2815,15 @@
             showNoticeDialog(`Model "${mid}" was not found in fetched Gemini models. Only verified Gemini models can be added.`);
             return;
           }
-          if (state.webSearchModels.some((m) => m.id.toLowerCase() === canonical.toLowerCase())) {
+          if (buf.webSearchModels.some((m) => m.id.toLowerCase() === canonical.toLowerCase())) {
             wsAddInput.value = "";
             return;
           }
-          if (state.webSearchModels.length >= 5) {
+          if (buf.webSearchModels.length >= 5) {
             showNoticeDialog("Maximum 5 models can be configured for Web Search. Remove a fallback model first.");
             return;
           }
-          state.webSearchModels.push({
+          buf.webSearchModels.push({
             id: canonical,
             name: canonical,
             input_price: 0.0,
@@ -2668,72 +2841,55 @@
         };
       }
 
-      // Fetch Gemini Models from Web Search tab (discards missing fallbacks, never auto-adds)
+      // Auto add Gemini search models (prunes unavailable models, auto-adds unconfigured up to 5)
+      const wsAutoAddBtn = el.settingsTabContent.querySelector(".ws-auto-add-models-btn");
+      if (wsAutoAddBtn) {
+        wsAutoAddBtn.onclick = async () => {
+          saveGeneralTabInputs();
+          saveActiveProviderInputs();
+          await runProviderFetchAction({
+            prov: geminiProv,
+            btn: wsAutoAddBtn,
+            idleHtml: '<i data-lucide="plus-circle" style="width: 11px; height: 11px;"></i> Auto add',
+            failPrefix: "Could not fetch Gemini models",
+            onSuccess: (res) => {
+              const { fetched, cleanFetchedIds } = applyFetchedModelsToProvider(geminiProv, res, { autoAdd: false });
+              applyFetchedModelsToWebSearch(buf, fetched, cleanFetchedIds, { autoAdd: true });
+              renderSettingsContent();
+              showNoticeDialog(`Fetched ${fetched.length} Gemini models. Configured search models: ${buf.webSearchModels.length}/5.`);
+            },
+          });
+        };
+      }
+
+      // Fetch Gemini Models from Web Search tab (prunes unavailable models, NEVER auto-adds)
       const wsFetchBtn = el.settingsTabContent.querySelector(".ws-fetch-models-btn");
       if (wsFetchBtn) {
         wsFetchBtn.onclick = async () => {
-          const validationErr = validateAllProviders();
-          if (validationErr) {
-            showNoticeDialog(validationErr);
-            return;
-          }
-          const saveRes = await callApi("save_settings", state.providers, state.settings, state.webSearchModels);
-          if (saveRes && saveRes.error) {
-            showNoticeDialog(saveRes.error);
-            return;
-          }
-          state.providers.forEach((p) => {
-            delete p.api_key;
-            delete p.clear_api_key;
+          saveGeneralTabInputs();
+          saveActiveProviderInputs();
+          await runProviderFetchAction({
+            prov: geminiProv,
+            btn: wsFetchBtn,
+            idleHtml: '<i data-lucide="refresh-cw" style="width: 11px; height: 11px;"></i> Fetch Gemini Models',
+            failPrefix: "Could not fetch Gemini models",
+            onSuccess: (res) => {
+              const { fetched, cleanFetchedIds } = applyFetchedModelsToProvider(geminiProv, res, { autoAdd: false });
+              applyFetchedModelsToWebSearch(buf, fetched, cleanFetchedIds, { autoAdd: false });
+              renderSettingsContent();
+              showNoticeDialog(`Fetched ${fetched.length} Gemini models. Preserved ${buf.webSearchModels.length} search models.`);
+            },
           });
-
-          wsFetchBtn.disabled = true;
-          wsFetchBtn.innerHTML = '<i data-lucide="loader" style="width: 11px; height: 11px;"></i> Fetching...';
-          lucide.createIcons();
-
-          const res = await callApi("fetch_provider_models", "gemini");
-          wsFetchBtn.disabled = false;
-          wsFetchBtn.innerHTML = '<i data-lucide="refresh-cw" style="width: 11px; height: 11px;"></i> Fetch Gemini Models';
-          lucide.createIcons();
-
-          if (res && res.models && res.models.length > 0 && geminiProv) {
-            const fetchedIds = res.models.map((m) => m.id);
-            geminiProv.fetched_model_ids = fetchedIds;
-            geminiProv.has_api_key = true;
-            geminiProv.sync_status = res.sync_status || "ready";
-            geminiProv.sync_error = res.sync_error || "";
-
-            syncSearchModelsWithGeminiFetch(fetchedIds);
-
-            await callApi("save_settings", state.providers, state.settings, state.webSearchModels);
-            if (state.settingsSnapshot) {
-              state.settingsSnapshot.providers = JSON.parse(JSON.stringify(state.providers));
-              state.settingsSnapshot.webSearchModels = JSON.parse(JSON.stringify(state.webSearchModels));
-            }
-            syncAllPaneWebSearchButtons();
-            renderSettingsContent();
-            showNoticeDialog(`Verified Gemini search models (${fetchedIds.length} remote models fetched).`);
-          } else {
-            if (geminiProv) {
-              geminiProv.is_accessible = false;
-              geminiProv.fetched_model_ids = [];
-              geminiProv.sync_status = res?.sync_status || "error";
-              geminiProv.sync_error = res?.sync_error || "FETCH ERROR";
-            }
-            syncAllPaneWebSearchButtons();
-            renderSettingsContent();
-            showNoticeDialog(`Could not fetch Gemini models: ${res?.error || "Missing/invalid Gemini API key or network error"}`);
-          }
         };
       }
     } else {
       // Providers Tab Layout
-      if (!state.activeProviderId && state.providers.length > 0) {
-        state.activeProviderId = state.providers[0].id;
+      if (!buf.activeProviderId && buf.providers.length > 0) {
+        buf.activeProviderId = buf.providers[0].id;
       }
-      const activeProv = state.providers.find((p) => p.id === state.activeProviderId) || state.providers[0];
+      const activeProv = buf.providers.find((p) => p.id === buf.activeProviderId) || buf.providers[0];
 
-      let subNavHtml = state.providers
+      let subNavHtml = buf.providers
         .map(
           (p) => `
         <button class="provider-sub-btn ${p.id === activeProv?.id ? "active" : ""}" data-prov-id="${escapeHtml(p.id)}">
@@ -2812,11 +2968,11 @@
               <div style="display: flex; align-items: center; justify-content: space-between;">
                 <label class="settings-label">Configured Models (Max 5 shown in dropdown)</label>
                 <div style="display: flex; gap: 6px; align-items: center;">
-                  <button class="btn-secondary shuffle-models-btn" style="padding: 2px 8px; font-size: 11px; display: flex; align-items: center; gap: 4px;" title="Shuffle the order of configured models">
-                    <i data-lucide="shuffle" style="width: 11px; height: 11px;"></i>
-                    <span>Shuffle</span>
+                  <button class="btn-secondary auto-add-models-btn" style="padding: 2px 8px; font-size: 11px; display: flex; align-items: center; gap: 4px;" title="Fetch models from endpoint, prune missing models, and auto-add available models up to 5 total">
+                    <i data-lucide="plus-circle" style="width: 11px; height: 11px;"></i>
+                    <span>Auto add</span>
                   </button>
-                  <button class="btn-secondary fetch-models-btn" style="padding: 2px 8px; font-size: 11px; display: flex; align-items: center; gap: 4px;">
+                  <button class="btn-secondary fetch-models-btn" style="padding: 2px 8px; font-size: 11px; display: flex; align-items: center; gap: 4px;" title="Fetch models from endpoint and prune missing models (never auto-adds)">
                     <i data-lucide="refresh-cw" style="width: 11px; height: 11px;"></i>
                     <span>Fetch from Endpoint</span>
                   </button>
@@ -2867,7 +3023,7 @@
       el.settingsTabContent.querySelectorAll(".provider-sub-btn").forEach((btn) => {
         btn.onclick = () => {
           saveActiveProviderInputs();
-          state.activeProviderId = btn.dataset.provId;
+          buf.activeProviderId = btn.dataset.provId;
           renderSettingsContent();
         };
       });
@@ -2888,7 +3044,7 @@
             await showNoticeDialog("Provider name may only contain English alphabet letters (A-Z, a-z) with no spaces, dashes, underscores, numbers, or special characters.");
             return;
           }
-          if (state.providers.some((p) => p.name.toUpperCase() === cleanName.toUpperCase())) {
+          if (buf.providers.some((p) => p.name.toUpperCase() === cleanName.toUpperCase())) {
             await showNoticeDialog(`A provider named "${cleanName}" already exists (case-insensitive). Please choose a unique name.`);
             return;
           }
@@ -2903,8 +3059,8 @@
             fetched_model_ids: [],
             is_accessible: false,
           };
-          state.providers.push(newProv);
-          state.activeProviderId = newId;
+          buf.providers.push(newProv);
+          buf.activeProviderId = newId;
           renderSettingsContent();
         };
       }
@@ -2920,7 +3076,6 @@
           activeProv.sync_error = "NO API KEY";
           activeProv.fetched_model_ids = [];
           refreshProviderAccessibility(activeProv);
-          syncAllPaneModelDropdowns();
           renderSettingsContent();
         };
       }
@@ -2952,17 +3107,20 @@
           saveActiveProviderInputs();
           const mid = newMInput.value.trim();
           if (!mid) return;
-          const fetchedIds = Array.isArray(activeProv.fetched_model_ids) ? new Set(activeProv.fetched_model_ids) : new Set();
-          if (!fetchedIds.has(mid)) {
+          const fetchedList = Array.isArray(activeProv.fetched_model_ids) ? activeProv.fetched_model_ids : [];
+          const fetchedByClean = new Map(fetchedList.map((fid) => [stripModelPrefix(fid).toLowerCase(), fid]));
+          const canonical = fetchedByClean.get(stripModelPrefix(mid).toLowerCase());
+          if (!canonical) {
             showNoticeDialog(
-              fetchedIds.size === 0
+              fetchedByClean.size === 0
                 ? "Please fetch models from the endpoint first (requires a valid API key)."
                 : `Model "${mid}" was not found in the models fetched from ${activeProv.name}. Only successfully fetched models can be added.`
             );
             return;
           }
           if (!activeProv.models) activeProv.models = [];
-          if (activeProv.models.some((m) => m.id === mid)) {
+          const cleanCanonical = stripModelPrefix(canonical).toLowerCase();
+          if (activeProv.models.some((m) => stripModelPrefix(m.id).toLowerCase() === cleanCanonical)) {
             newMInput.value = "";
             return;
           }
@@ -2971,8 +3129,8 @@
             return;
           }
           activeProv.models.push({
-            id: mid,
-            name: mid,
+            id: canonical,
+            name: canonical,
             supports_thinking: 0,
             input_price: 0.0,
             cached_input_price: 0.0,
@@ -3002,18 +3160,6 @@
         };
       });
 
-      // Shuffle Models
-      const shuffleBtn = el.settingsTabContent.querySelector(".shuffle-models-btn");
-      if (shuffleBtn && activeProv) {
-        shuffleBtn.onclick = () => {
-          saveActiveProviderInputs();
-          if (!activeProv.models || activeProv.models.length <= 1) return;
-          activeProv.models = shuffleModelArray(activeProv.models);
-          renderSettingsContent();
-          syncAllPaneModelDropdowns();
-        };
-      }
-
       // Move Model Up / Down
       const swapModel = (mid, delta) => {
         saveActiveProviderInputs();
@@ -3021,7 +3167,6 @@
         if (swapped) {
           activeProv.models = swapped;
           renderSettingsContent();
-          syncAllPaneModelDropdowns();
         }
       };
       el.settingsTabContent.querySelectorAll(".move-model-up-btn").forEach((btn) => {
@@ -3036,10 +3181,9 @@
         btn.onclick = () => {
           saveActiveProviderInputs();
           const mid = btn.dataset.modelId;
-          activeProv.models = activeProv.models.filter((m) => m.id !== mid);
+          activeProv.models = (activeProv.models || []).filter((m) => m.id !== mid);
           refreshProviderAccessibility(activeProv);
           renderSettingsContent();
-          syncAllPaneModelDropdowns();
         };
       });
 
@@ -3049,127 +3193,83 @@
         delProvBtn.onclick = async () => {
           const confirmed = await showConfirmDialog(`Delete provider "${activeProv.name}"?`);
           if (confirmed) {
-            callApi("delete_provider", activeProv.id);
-            state.providers = state.providers.filter((p) => p.id !== activeProv.id);
-            if (state.settings.default_provider === activeProv.id) {
-              state.settings.default_provider = state.providers[0]?.id || "openai";
+            buf.providers = buf.providers.filter((p) => p.id !== activeProv.id);
+            if (buf.settings.default_provider === activeProv.id) {
+              buf.settings.default_provider = buf.providers[0]?.id || "openai";
             }
-            state.activeProviderId = state.providers[0]?.id || null;
-            if (state.settingsSnapshot) {
-              state.settingsSnapshot.providers = JSON.parse(JSON.stringify(state.providers));
-              state.settingsSnapshot.settings = JSON.parse(JSON.stringify(state.settings));
-            }
+            buf.activeProviderId = buf.providers[0]?.id || null;
             renderSettingsContent();
-            syncAllPaneModelDropdowns();
           }
         };
       }
 
-      // Fetch from Endpoint
-      const fetchBtn = el.settingsTabContent.querySelector(".fetch-models-btn");
-      if (fetchBtn && activeProv) {
-        fetchBtn.onclick = async () => {
+      // Auto add models (fetches remote models, prunes unavailable, auto-adds unconfigured up to 5)
+      const autoAddBtn = el.settingsTabContent.querySelector(".auto-add-models-btn");
+      if (autoAddBtn && activeProv) {
+        autoAddBtn.onclick = async () => {
           saveActiveProviderInputs();
-          const validationErr = validateAllProviders();
+          const validationErr = validateAllProviders(buf.providers);
           if (validationErr) {
             showNoticeDialog(validationErr);
             return;
           }
-          const saveRes = await callApi("save_settings", state.providers, state.settings);
-          if (saveRes && saveRes.error) {
-            showNoticeDialog(saveRes.error);
+          await runProviderFetchAction({
+            prov: activeProv,
+            btn: autoAddBtn,
+            idleHtml: '<i data-lucide="plus-circle" style="width: 11px; height: 11px;"></i> Auto add',
+            useTypedBaseUrl: true,
+            onSuccess: (res) => {
+              const { fetched, cleanFetchedIds } = applyFetchedModelsToProvider(activeProv, res, { autoAdd: true });
+              if (activeProv.id === "gemini") {
+                applyFetchedModelsToWebSearch(buf, fetched, cleanFetchedIds, { autoAdd: false });
+              }
+              renderSettingsContent();
+              showNoticeDialog(`Fetched ${fetched.length} models for ${activeProv.name}. Configured: ${activeProv.models.length}/5.`);
+            },
+          });
+        };
+      }
+
+      // Fetch from Endpoint (prunes unavailable models, NEVER auto-adds)
+      const fetchBtn = el.settingsTabContent.querySelector(".fetch-models-btn");
+      if (fetchBtn && activeProv) {
+        fetchBtn.onclick = async () => {
+          saveActiveProviderInputs();
+          const validationErr = validateAllProviders(buf.providers);
+          if (validationErr) {
+            showNoticeDialog(validationErr);
             return;
           }
-          delete activeProv.api_key;
-          delete activeProv.clear_api_key;
-
-          fetchBtn.disabled = true;
-          fetchBtn.innerHTML = '<i data-lucide="loader" style="width: 11px; height: 11px;"></i> Fetching...';
-          lucide.createIcons();
-
-          const res = await callApi("fetch_provider_models", activeProv.id);
-          fetchBtn.disabled = false;
-          fetchBtn.innerHTML = '<i data-lucide="refresh-cw" style="width: 11px; height: 11px;"></i> Fetch from Endpoint';
-          lucide.createIcons();
-
-          if (res && res.models && res.models.length > 0) {
-            // Keep at most 5 models; new models default to $0 pricing and thinking=0
-            const fetched = res.models;
-            const fetchedIds = new Set(fetched.map((m) => m.id));
-            const current = activeProv.models || [];
-
-            // 1. Keep existing models that are present in fetch (preserving user-configured pricing/thinking)
-            const cleanFetchedIds = new Set(Array.from(fetchedIds, stripModelPrefix));
-            const retained = current.filter((m) => fetchedIds.has(m.id) || cleanFetchedIds.has(stripModelPrefix(m.id)));
-            const retainedIds = new Set(retained.map((m) => m.id));
-
-            // 2. If any slots for configured models is empty out of maximum 5,
-            // add unconfigured fetched models, newer ones first!
-            const cleanRetainedIds = new Set(Array.from(retainedIds, stripModelPrefix));
-            if (retained.length < 5) {
-              const unconfigured = fetched.filter(
-                (fm) => !retainedIds.has(fm.id) && !cleanRetainedIds.has(stripModelPrefix(fm.id))
-              );
-              for (const candidate of sortModelsNewerFirst(unconfigured)) {
-                if (retained.length >= 5) break;
-                const isThinking = /o1|o3|r1|reasoning|thinking/i.test(candidate.id) ? 1 : (candidate.supports_thinking || 0);
-                retained.push({
-                  id: candidate.id,
-                  name: candidate.name || candidate.id,
-                  supports_thinking: isThinking,
-                  input_price: candidate.input_price || 0.0,
-                  cached_input_price: candidate.cached_input_price || 0.0,
-                  output_price: candidate.output_price || 0.0,
-                });
-                retainedIds.add(candidate.id);
-                cleanRetainedIds.add(stripModelPrefix(candidate.id));
+          await runProviderFetchAction({
+            prov: activeProv,
+            btn: fetchBtn,
+            idleHtml: '<i data-lucide="refresh-cw" style="width: 11px; height: 11px;"></i> Fetch from Endpoint',
+            useTypedBaseUrl: true,
+            onSuccess: (res) => {
+              const { fetched, cleanFetchedIds } = applyFetchedModelsToProvider(activeProv, res, { autoAdd: false });
+              if (activeProv.id === "gemini") {
+                applyFetchedModelsToWebSearch(buf, fetched, cleanFetchedIds, { autoAdd: false });
               }
-            }
-
-            activeProv.models = retained.slice(0, 5);
-            activeProv.fetched_model_ids = Array.from(fetchedIds);
-            activeProv.has_api_key = true;
-            activeProv.is_accessible = activeProv.is_enabled && activeProv.models.length > 0;
-            activeProv.sync_status = res.sync_status || "ready";
-            activeProv.sync_error = res.sync_error || "";
-
-            if (activeProv.id === "gemini") {
-              syncSearchModelsWithGeminiFetch(fetchedIds);
-            }
-
-            await callApi("save_settings", state.providers, state.settings, state.webSearchModels);
-            if (state.settingsSnapshot) {
-              state.settingsSnapshot.providers = JSON.parse(JSON.stringify(state.providers));
-              state.settingsSnapshot.webSearchModels = JSON.parse(JSON.stringify(state.webSearchModels));
-            }
-            renderSettingsContent();
-            syncAllPaneModelDropdowns();
-            showNoticeDialog(`Synced ${activeProv.models.length} models for ${activeProv.name}!`);
-          } else {
-            activeProv.is_accessible = false;
-            activeProv.fetched_model_ids = [];
-            activeProv.sync_status = res?.sync_status || "error";
-            activeProv.sync_error = res?.sync_error || "FETCH ERROR";
-            syncAllPaneWebSearchButtons();
-            renderSettingsContent();
-            showNoticeDialog(`Could not fetch models: ${res?.error || "Endpoint unreachable or invalid API key"}`);
-          }
+              renderSettingsContent();
+              showNoticeDialog(`Fetched ${fetched.length} models for ${activeProv.name}. Preserved ${activeProv.models.length} configured models.`);
+            },
+          });
         };
       }
     }
 
-    lucide.createIcons();
+    renderIcons(el.settingsTabContent);
 
-    el.settingsTabContent.dataset.renderedTab = state.masterSettingsTab;
+    el.settingsTabContent.dataset.renderedTab = buf.masterSettingsTab;
     el.settingsTabContent.dataset.renderedProvId =
-      state.masterSettingsTab === "providers" ? (state.activeProviderId || state.providers[0]?.id || "") : "";
+      buf.masterSettingsTab === "providers" ? (buf.activeProviderId || buf.providers[0]?.id || "") : "";
 
     const restoreScrollPositions = () => {
-      if (modalBody && (sameProviderView || sameGeneralView || sameWebSearchView || (prevTab === "providers" && state.masterSettingsTab === "providers"))) {
+      if (modalBody && (sameProviderView || sameGeneralView || sameWebSearchView || (prevTab === "providers" && buf.masterSettingsTab === "providers"))) {
         modalBody.scrollTop = prevModalScroll;
       }
       const newSubNav = el.settingsTabContent.querySelector(".providers-sub-nav");
-      if (newSubNav && prevSubNavScroll > 0 && state.masterSettingsTab === "providers") {
+      if (newSubNav && prevSubNavScroll > 0 && buf.masterSettingsTab === "providers") {
         newSubNav.scrollTop = prevSubNavScroll;
       }
       const newModelsList = document.getElementById("prov-models-list") || document.getElementById("ws-models-list");
@@ -3183,26 +3283,33 @@
   }
 
   function saveGeneralTabInputs() {
-    if (state.masterSettingsTab === "general") {
+    if (!state.settingsBuffer) return;
+    const buf = state.settingsBuffer;
+    if (buf.masterSettingsTab === "general") {
       const sysPrompt = document.getElementById("setting-global-system-prompt");
-      if (sysPrompt) state.settings.global_system_prompt = sysPrompt.value.trim();
+      if (sysPrompt) buf.settings.global_system_prompt = sysPrompt.value.trim();
 
       const defProv = document.getElementById("setting-default-provider");
-      if (defProv) state.settings.default_provider = defProv.value;
+      if (defProv) buf.settings.default_provider = defProv.value;
 
       const defThink = document.getElementById("setting-default-thinking");
       if (defThink && VALID_THINKING_LEVELS.has(defThink.value)) {
-        state.settings.default_thinking = defThink.value;
+        buf.settings.default_thinking = defThink.value;
       }
 
       const themeSelect = document.getElementById("setting-theme");
-      if (themeSelect) applyTheme(themeSelect.value);
+      if (themeSelect) {
+        buf.settings.theme = themeSelect.value;
+        applyTheme(themeSelect.value, { persistState: false });
+      }
     }
   }
 
   function saveActiveProviderInputs() {
-    if (state.masterSettingsTab === "providers" && state.activeProviderId) {
-      const prov = state.providers.find((p) => p.id === state.activeProviderId);
+    if (!state.settingsBuffer) return;
+    const buf = state.settingsBuffer;
+    if (buf.masterSettingsTab === "providers" && buf.activeProviderId) {
+      const prov = buf.providers.find((p) => p.id === buf.activeProviderId);
       if (prov) {
         const nameInput = document.getElementById("prov-name-input");
         if (nameInput) {
@@ -3223,6 +3330,9 @@
             prov.api_key = typed;
             prov.has_api_key = true;
             prov.clear_api_key = false;
+          } else {
+            delete prov.api_key;
+            prov.has_api_key = Boolean(prov._saved_has_api_key && !prov.clear_api_key);
           }
         }
 
@@ -3232,32 +3342,46 @@
   }
 
   async function saveSettingsFromModal() {
+    if (!state.settingsBuffer) return;
     saveGeneralTabInputs();
     saveActiveProviderInputs();
 
-    const validationErr = validateAllProviders();
+    const buf = state.settingsBuffer;
+    const validationErr = validateAllProviders(buf.providers);
     if (validationErr) {
       showNoticeDialog(validationErr);
       return;
     }
 
-    const res = await callApi("save_settings", state.providers, state.settings, state.webSearchModels);
+    const res = await callApi("save_settings", buf.providers, buf.settings, buf.webSearchModels);
     if (res && res.error) {
       showNoticeDialog(res.error);
       return;
     }
+
     if (res && Array.isArray(res.providers)) {
       state.providers = res.providers;
     } else {
+      state.providers = buf.providers;
       state.providers.forEach((p) => {
         delete p.api_key;
         delete p.clear_api_key;
       });
     }
+
+    state.settings = buf.settings;
+
     if (res && Array.isArray(res.web_search_models)) {
       state.webSearchModels = normalizeWebSearchModelsClient(res.web_search_models);
+    } else {
+      state.webSearchModels = normalizeWebSearchModelsClient(buf.webSearchModels);
     }
+
+    state.activeProviderId = buf.activeProviderId;
+    state.masterSettingsTab = buf.masterSettingsTab;
+
     closeSettingsModal(true);
+
     for (const tab of state.tabs) {
       if (!tab.conversationId) {
         if (!tab._userSelectedModel) {
@@ -3277,7 +3401,17 @@
         }
       }
     }
-    renderActivePanes();
+
+    syncAllPaneModelDropdowns();
+    syncAllPaneWebSearchButtons();
+    renderTabs();
+    el.panesContainer.querySelectorAll(".chat-pane").forEach((paneEl) => {
+      const tabId = paneEl.dataset.tabId;
+      const t = state.tabs.find((item) => item.id === tabId);
+      if (t) {
+        renderTokenStats(paneEl, t.id, t.tokenStats || null);
+      }
+    });
   }
 
   // Conversation Context Settings Modal
@@ -3334,12 +3468,14 @@
 
     if (tab.conversationId) {
       // Conversation already exists in DB -> update it
-      await callApi("rename_conversation", tab.conversationId, newTitle);
+      const renameRes = await callApi("rename_conversation", tab.conversationId, newTitle);
       await callApi("update_conversation_settings", tab.conversationId, newPrompt, newLimit);
 
+      const resolvedTitle = (renameRes && renameRes.title) || newTitle;
+      tab.title = resolvedTitle;
       const conv = state.conversations.find((c) => c.id === tab.conversationId);
       if (conv) {
-        conv.title = newTitle;
+        conv.title = resolvedTitle;
         conv.system_prompt = newPrompt;
         conv.max_context_messages = newLimit;
       }
@@ -3350,6 +3486,7 @@
       const conv = await callApi("create_conversation", newTitle, newPrompt, newLimit);
       if (conv && conv.id) {
         tab.conversationId = conv.id;
+        if (conv.title) tab.title = conv.title;
       }
     }
 
@@ -3364,7 +3501,7 @@
   function openExportModal(convId) {
     state.activeExportConvId = convId;
     el.exportModal.classList.add("open");
-    lucide.createIcons();
+    renderIcons(el.exportModal);
   }
 
   async function downloadExport(format) {
@@ -3414,16 +3551,69 @@
     }
   }
 
+  // Upload / Import Chat (.json and .md)
+  async function openUploadChat() {
+    const res = await callApi("open_import_chat_dialog");
+    if (res && res.cancelled) {
+      return;
+    }
+    if (res && res.fallback) {
+      if (el.uploadChatFileInput) el.uploadChatFileInput.click();
+      return;
+    }
+    if (res && res.conversation) {
+      handleImportedConversation(res.conversation);
+    } else if (res && res.error) {
+      showNoticeDialog(res.error);
+    }
+  }
+
+  function handleImportedConversation(newConv) {
+    if (!state.conversations.some((c) => c.id === newConv.id)) {
+      state.conversations.unshift(newConv);
+    }
+    const activeTab = state.tabs.find((t) => t.id === state.activeTabId);
+    const newTab = createTabObject({
+      conversationId: newConv.id,
+      title: newConv.title,
+      systemPrompt: newConv.system_prompt || "",
+      maxContextMessages: newConv.max_context_messages || 30,
+      providerId: activeTab ? (activeTab._preferredProviderId || activeTab.providerId) : undefined,
+      modelId: activeTab ? (activeTab._preferredModelId || activeTab.modelId) : undefined,
+      thinkingLevel: activeTab ? (activeTab._preferredThinkingLevel || activeTab.thinkingLevel) : undefined,
+      webSearchEnabled: activeTab ? activeTab.webSearchEnabled : false,
+      userSelectedModel: activeTab ? activeTab._userSelectedModel : false,
+      userSelectedThinking: activeTab ? activeTab._userSelectedThinking : false,
+    });
+    state.tabs.push(newTab);
+    state.activeTabId = newTab.id;
+    if (!state.splitTabIds.includes(newTab.id)) {
+      if (state.splitTabIds.length < 5) {
+        state.splitTabIds.push(newTab.id);
+      } else {
+        const replaceIdx =
+          state.splitTabIds[state.splitTabIds.length - 1] === (activeTab ? activeTab.id : null)
+            ? 0
+            : state.splitTabIds.length - 1;
+        state.splitTabIds[replaceIdx] = newTab.id;
+      }
+    }
+    persistTabsState();
+    renderConversationsList();
+    renderTabs();
+    renderActivePanes();
+  }
+
   // Clipboard Helper with Reliable Fallback
   function copyText(text, btnElement) {
     function showFeedback() {
       if (btnElement) {
         const origHtml = btnElement.innerHTML;
         btnElement.innerHTML = '<i data-lucide="check" style="width: 11px; height: 11px; color: #34a853;"></i> <span style="color: #34a853;">Copied!</span>';
-        lucide.createIcons();
+        renderIcons(btnElement);
         setTimeout(() => {
           btnElement.innerHTML = origHtml;
-          lucide.createIcons();
+          renderIcons(btnElement);
         }, 1800);
       }
     }
@@ -3473,6 +3663,27 @@
 
     el.newChatBtn.onclick = () => createNewTab();
     el.convSearchInput.oninput = () => renderConversationsList();
+    if (el.uploadChatBtn) {
+      el.uploadChatBtn.onclick = openUploadChat;
+    }
+    if (el.uploadChatFileInput) {
+      el.uploadChatFileInput.onchange = (e) => {
+        const file = e.target.files && e.target.files[0];
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = async (event) => {
+          const content = event.target.result;
+          const res = await callApi("import_conversation_content", content, file.name);
+          if (res && res.conversation) {
+            handleImportedConversation(res.conversation);
+          } else if (res && res.error) {
+            showNoticeDialog(res.error);
+          }
+          el.uploadChatFileInput.value = "";
+        };
+        reader.readAsText(file);
+      };
+    }
     el.themeToggleBtn.onclick = toggleTheme;
     el.globalSettingsBtn.onclick = openSettingsModal;
 
@@ -3526,7 +3737,6 @@
 
       const mdLink = e.target.closest(".assistant-markdown-content a[href]");
       if (mdLink) {
-        isPageUnloading = true;
         persistTabsState();
       }
     });
@@ -3534,6 +3744,7 @@
     // Master Settings Tabs
     el.masterTabGeneral.onclick = () => {
       saveActiveProviderInputs();
+      if (state.settingsBuffer) state.settingsBuffer.masterSettingsTab = "general";
       state.masterSettingsTab = "general";
       updateMasterTabsUI();
       renderSettingsContent();
@@ -3541,6 +3752,7 @@
 
     el.masterTabProviders.onclick = () => {
       saveGeneralTabInputs();
+      if (state.settingsBuffer) state.settingsBuffer.masterSettingsTab = "providers";
       state.masterSettingsTab = "providers";
       updateMasterTabsUI();
       renderSettingsContent();
@@ -3550,6 +3762,7 @@
       el.masterTabWebSearch.onclick = () => {
         saveGeneralTabInputs();
         saveActiveProviderInputs();
+        if (state.settingsBuffer) state.settingsBuffer.masterSettingsTab = "websearch";
         state.masterSettingsTab = "websearch";
         updateMasterTabsUI();
         renderSettingsContent();
@@ -3560,6 +3773,13 @@
     document.querySelectorAll(".close-modal-btn").forEach((btn) => {
       btn.onclick = () => closeSettingsModal(false);
     });
+    if (el.settingsModal) {
+      el.settingsModal.onclick = (e) => {
+        if (e.target === el.settingsModal) {
+          closeSettingsModal(false);
+        }
+      };
+    }
 
     el.saveConvSettingsBtn.onclick = saveConvSettings;
     document.querySelectorAll(".close-conv-settings-btn").forEach((btn) => {
@@ -3590,18 +3810,23 @@
         if (el.settingsModal.classList.contains("open")) closeSettingsModal(false);
         el.convSettingsModal.classList.remove("open");
         el.exportModal.classList.remove("open");
-      } else if (e.ctrlKey && e.key === "t") {
-        e.preventDefault();
-        createNewTab();
-      } else if (e.ctrlKey && e.key === "w") {
-        e.preventDefault();
-        if (state.activeTabId) closeTab(state.activeTabId);
-      } else if (e.ctrlKey && e.key === "\\") {
-        e.preventDefault();
-        addSplitPane();
-      } else if (e.ctrlKey && e.key === ",") {
-        e.preventDefault();
-        openSettingsModal();
+      } else if (!document.querySelector(".modal-overlay.open") && !e.altKey) {
+        if (e.ctrlKey && e.shiftKey && (e.key === "=" || e.key === "+" || e.code === "Equal")) {
+          e.preventDefault();
+          branchActiveTabToSplitPane();
+        } else if (e.ctrlKey && e.key === "t") {
+          e.preventDefault();
+          createNewTab();
+        } else if (e.ctrlKey && e.key === "w") {
+          e.preventDefault();
+          if (state.activeTabId) closeTab(state.activeTabId);
+        } else if (e.ctrlKey && e.key === "\\") {
+          e.preventDefault();
+          addSplitPane();
+        } else if (e.ctrlKey && e.key === ",") {
+          e.preventDefault();
+          openSettingsModal();
+        }
       }
     });
   }

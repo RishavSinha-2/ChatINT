@@ -6,22 +6,30 @@ import re
 import socket
 import threading
 import time
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, Iterable, List, Optional, Set
 import warnings
 
 warnings.filterwarnings("ignore", category=SyntaxWarning)
 
 from chatint.db import (
-    PRIMARY_WEB_SEARCH_MODEL,
     get_api_key_from_env,
-    get_connection,
     get_providers,
     get_web_search_models,
+    open_db,
     sanitize_provider_name,
-    save_providers,
     save_web_search_models,
     strip_model_prefix,
+    update_provider_models,
 )
+
+
+def is_gemini_3_or_newer(model_id: str) -> bool:
+    """Return True if Gemini model ID is generation 3 or newer (or unversioned modern alias)."""
+    mid = (model_id or "").lower()
+    m_ver = re.search(r"gemini[-_](\d+)", mid)
+    if m_ver:
+        return int(m_ver.group(1)) >= 3
+    return not any(legacy in mid for legacy in ("gemini-1", "gemini-2", "gemini/1", "gemini/2"))
 
 
 def model_recency_key(m: Any) -> tuple:
@@ -128,30 +136,59 @@ class ClientManager:
         return "openai"
 
     @classmethod
-    def _resolve_provider_auth(cls, provider_id: str) -> tuple[Optional[Dict[str, Any]], Optional[str], Optional[str]]:
+    def _resolve_provider_auth(
+        cls,
+        provider_id: str,
+        override_api_key: Optional[str] = None,
+        override_base_url: Optional[str] = None,
+        override_is_enabled: Optional[bool] = None,
+        clear_api_key: bool = False,
+    ) -> tuple[Optional[Dict[str, Any]], Optional[str], Optional[str]]:
         provider = cls.get_provider(provider_id)
         if not provider:
-            return None, None, f"Provider '{provider_id}' not found."
-        if not provider.get("is_enabled", True):
+            provider = {"id": provider_id, "name": provider_id, "is_enabled": True}
+        else:
+            provider = dict(provider)
+
+        if override_base_url is not None and str(override_base_url).strip():
+            provider["base_url"] = str(override_base_url).strip()
+
+        is_enabled = provider.get("is_enabled", True) if override_is_enabled is None else bool(override_is_enabled)
+        if not is_enabled and not override_api_key:
             return None, None, f"Provider '{provider['name']}' is currently disabled in Settings."
-        api_key = get_api_key_from_env(provider.get("name", ""))
+
+        clean_override_key = (override_api_key or "").strip() if override_api_key is not None else ""
+        if clear_api_key and not clean_override_key:
+            return None, None, f"API key for {provider['name']} is cleared. Enter an API key before fetching."
+
+        api_key = clean_override_key or get_api_key_from_env(provider.get("name", ""))
         if not api_key:
             return None, None, f"API key for {provider['name']} is missing in .env. Please set it in Settings (Ctrl+,)."
         return provider, api_key, None
 
     @classmethod
     def get_anthropic_client(
-        cls, provider_id: str, timeout: float = 60.0
+        cls,
+        provider_id: str,
+        timeout: float = 60.0,
+        api_key: Optional[str] = None,
+        is_enabled: Optional[bool] = None,
+        clear_api_key: bool = False,
     ) -> tuple[Optional[anthropic.Anthropic], Optional[str]]:
         import anthropic
         import httpx2
 
-        _, api_key, err = cls._resolve_provider_auth(provider_id)
+        _, key, err = cls._resolve_provider_auth(
+            provider_id,
+            override_api_key=api_key,
+            override_is_enabled=is_enabled,
+            clear_api_key=clear_api_key,
+        )
         if err:
             return None, err
 
         client = anthropic.Anthropic(
-            api_key=api_key,
+            api_key=key,
             timeout=httpx2.Timeout(timeout, connect=min(15.0, timeout)),
             max_retries=0,
         )
@@ -159,38 +196,62 @@ class ClientManager:
 
     @classmethod
     def get_gemini_client(
-        cls, provider_id: str, timeout: float = 60.0
+        cls,
+        provider_id: str,
+        timeout: float = 60.0,
+        api_key: Optional[str] = None,
+        is_enabled: Optional[bool] = None,
+        clear_api_key: bool = False,
     ) -> tuple[Optional[genai.Client], Optional[str]]:
         from google import genai
         from google.genai import types as genai_types
 
-        _, api_key, err = cls._resolve_provider_auth(provider_id)
+        _, key, err = cls._resolve_provider_auth(
+            provider_id,
+            override_api_key=api_key,
+            override_is_enabled=is_enabled,
+            clear_api_key=clear_api_key,
+        )
         if err:
             return None, err
 
         timeout_ms = int(max(1.0, timeout) * 1000)
         client = genai.Client(
-            api_key=api_key,
+            api_key=key,
             http_options=genai_types.HttpOptions(timeout=timeout_ms),
         )
         return client, None
 
     @classmethod
-    def get_client(cls, provider_id: str, timeout: float = 60.0) -> tuple[Optional[openai.OpenAI], Optional[str]]:
+    def get_client(
+        cls,
+        provider_id: str,
+        timeout: float = 60.0,
+        api_key: Optional[str] = None,
+        base_url: Optional[str] = None,
+        is_enabled: Optional[bool] = None,
+        clear_api_key: bool = False,
+    ) -> tuple[Optional[openai.OpenAI], Optional[str]]:
         """
         Returns (openai_client, error_message).
         """
         import httpx
         import openai
 
-        provider, api_key, err = cls._resolve_provider_auth(provider_id)
+        provider, key, err = cls._resolve_provider_auth(
+            provider_id,
+            override_api_key=api_key,
+            override_base_url=base_url,
+            override_is_enabled=is_enabled,
+            clear_api_key=clear_api_key,
+        )
         if err:
             return None, err
 
-        base_url = (provider.get("base_url") or "").strip() or "https://api.openai.com/v1"
+        base_url_val = (base_url or provider.get("base_url") or "").strip() or "https://api.openai.com/v1"
         client = openai.OpenAI(
-            base_url=base_url,
-            api_key=api_key,
+            base_url=base_url_val,
+            api_key=key,
             timeout=httpx.Timeout(timeout, connect=min(15.0, timeout)),
             max_retries=0,
         )
@@ -198,7 +259,14 @@ class ClientManager:
 
     @classmethod
     def fetch_remote_models(
-        cls, provider_id: str, timeout: float = 60.0
+        cls,
+        provider_id: str,
+        timeout: float = 60.0,
+        api_key: Optional[str] = None,
+        base_url: Optional[str] = None,
+        is_enabled: Optional[bool] = None,
+        clear_api_key: bool = False,
+        update_sync_state: bool = True,
     ) -> tuple[List[Dict[str, Any]], Optional[str], bool]:
         """
         Fetches models with a strict wall-clock TTL (default 60s).
@@ -207,12 +275,14 @@ class ClientManager:
         """
         provider = cls.get_provider(provider_id)
         if not provider:
-            return [], f"Provider '{provider_id}' not found.", False
+            provider = {"id": provider_id, "name": provider_id, "is_enabled": True}
 
         sdk_type = cls.get_sdk_type(provider, provider_id)
 
         if sdk_type == "anthropic":
-            client, err = cls.get_anthropic_client(provider_id, timeout=timeout)
+            client, err = cls.get_anthropic_client(
+                provider_id, timeout=timeout, api_key=api_key, is_enabled=is_enabled, clear_api_key=clear_api_key
+            )
             if err or not client:
                 return [], err, False
 
@@ -229,7 +299,9 @@ class ClientManager:
             fetch_fn = _do_fetch_anthropic
 
         elif sdk_type == "gemini":
-            client, err = cls.get_gemini_client(provider_id, timeout=timeout)
+            client, err = cls.get_gemini_client(
+                provider_id, timeout=timeout, api_key=api_key, is_enabled=is_enabled, clear_api_key=clear_api_key
+            )
             if err or not client:
                 return [], err, False
 
@@ -252,7 +324,14 @@ class ClientManager:
             fetch_fn = _do_fetch_gemini
 
         else:
-            client, err = cls.get_client(provider_id, timeout=timeout)
+            client, err = cls.get_client(
+                provider_id,
+                timeout=timeout,
+                api_key=api_key,
+                base_url=base_url,
+                is_enabled=is_enabled,
+                clear_api_key=clear_api_key,
+            )
             if err or not client:
                 return [], err, False
 
@@ -295,21 +374,22 @@ class ClientManager:
                         "created": created,
                     })
             models = sort_models_newer_first(models)
-            if models:
-                BackgroundModelSyncer.mark_provider_verified(provider_id, {m["id"] for m in models})
-                BackgroundModelSyncer.set_sync_status(provider_id, "ready", "")
-            else:
-                BackgroundModelSyncer.clear_provider_verified(provider_id)
-                BackgroundModelSyncer.set_sync_status(provider_id, "error", "NO MODELS")
+            if update_sync_state:
+                if models:
+                    BackgroundModelSyncer.mark_provider_verified(provider_id, {m["id"] for m in models})
+                    BackgroundModelSyncer.set_sync_status(provider_id, "ready", "")
+                else:
+                    BackgroundModelSyncer.clear_provider_verified(provider_id)
+                    BackgroundModelSyncer.set_sync_status(provider_id, "error", "NO MODELS")
             return models, None, False
         except concurrent.futures.TimeoutError:
             executor.shutdown(wait=False, cancel_futures=True)
-            BackgroundModelSyncer.clear_provider_verified(provider_id)
-            BackgroundModelSyncer.set_sync_status(provider_id, "network_error", "NETWORK ERROR")
+            if update_sync_state:
+                BackgroundModelSyncer.clear_provider_verified(provider_id)
+                BackgroundModelSyncer.set_sync_status(provider_id, "network_error", "NETWORK ERROR")
             return [], f"Request timed out after {int(timeout)}s", True
         except Exception as e:
             executor.shutdown(wait=False)
-            BackgroundModelSyncer.clear_provider_verified(provider_id)
             err_str = str(e).lower()
             err_type = type(e).__name__.lower()
             is_net = (
@@ -319,8 +399,10 @@ class ClientManager:
             )
             is_timeout = "timeout" in err_type or "timed out" in err_str
             msg = f"Request timed out after {int(timeout)}s" if is_timeout else str(e)
-            status, brief = BackgroundModelSyncer.classify_sync_error(msg, is_net)
-            BackgroundModelSyncer.set_sync_status(provider_id, status, brief)
+            if update_sync_state:
+                BackgroundModelSyncer.clear_provider_verified(provider_id)
+                status, brief = BackgroundModelSyncer.classify_sync_error(msg, is_net)
+                BackgroundModelSyncer.set_sync_status(provider_id, status, brief)
             return [], msg, is_net
 
 
@@ -459,22 +541,36 @@ class BackgroundModelSyncer:
         cls._bridge = bridge
 
     @classmethod
-    def start_background_sync(cls, bridge: Optional[Any] = None):
+    def start_background_sync(
+        cls, bridge: Optional[Any] = None, provider_ids: Optional[Iterable[str]] = None
+    ):
         """
         Launches background fetch without blocking UI startup.
         Each endpoint with an API key is fetched asynchronously with a 60s TTL.
+        If provider_ids is specified, only those providers are synced.
         """
         if bridge:
             cls._bridge = bridge
 
+        target_ids = set(provider_ids) if provider_ids is not None else None
+
         with cls._lock:
-            cls._retry_backoff.clear()
+            if target_ids is None:
+                cls._retry_backoff.clear()
+            else:
+                for pid in target_ids:
+                    cls._retry_backoff.pop(pid, None)
             if not cls._watcher_thread or not cls._watcher_thread.is_alive():
                 cls._watcher_thread = threading.Thread(target=cls._network_watcher_loop, daemon=True)
                 cls._watcher_thread.start()
 
+        if target_ids is not None and not target_ids:
+            return
+
         providers = get_providers()
         for p in providers:
+            if target_ids is not None and p["id"] not in target_ids:
+                continue
             if p.get("is_enabled") and p.get("has_api_key") and p.get("sync_status") != "ready":
                 cls.set_sync_status(p["id"], "checking", "CHECKING...")
             threading.Thread(target=cls._sync_single_provider, args=(p["id"],), daemon=True).start()
@@ -542,38 +638,21 @@ class BackgroundModelSyncer:
                 cls._sync_status[provider_id] = ("ready", "")
 
             # Re-read latest provider state from DB after network call to avoid overwriting concurrent user edits
-            conn = get_connection()
-            row = conn.execute("SELECT models_json FROM providers WHERE id = ?", (provider_id,)).fetchone()
-            conn.close()
+            with open_db() as conn:
+                row = conn.execute("SELECT models_json FROM providers WHERE id = ?", (provider_id,)).fetchone()
             stored_models = json.loads(row["models_json"]) if row and row["models_json"] else []
 
             latest_provider = ClientManager.get_provider(provider_id)
             if not latest_provider:
                 return
 
-            # Sync models: retain existing configured models present in fetch; if any slots are empty (< 5), auto-fill from unconfigured fetched, newer ones first
-            clean_fetched_ids = {strip_model_prefix(mid) for mid in fetched_ids}
+            # Sync models: retain existing configured models present in fetch (prune unavailable ones; no auto-fill)
+            clean_fetched_lower = {strip_model_prefix(mid).lower() for mid in fetched_ids}
             retained = [
                 m
                 for m in stored_models
-                if m.get("id") in fetched_ids or strip_model_prefix(m.get("id", "")) in clean_fetched_ids
+                if m.get("id") in fetched_ids or strip_model_prefix(m.get("id", "")).lower() in clean_fetched_lower
             ]
-            retained_ids = {m["id"] for m in retained}
-            clean_retained_ids = {strip_model_prefix(mid) for mid in retained_ids}
-
-            if len(retained) < 5:
-                unconfigured = [
-                    fm
-                    for fm in fetched
-                    if fm["id"] not in retained_ids and strip_model_prefix(fm["id"]) not in clean_retained_ids
-                ]
-                for fm in sort_models_newer_first(unconfigured):
-                    if len(retained) >= 5:
-                        break
-                    retained.append(fm)
-                    retained_ids.add(fm["id"])
-                    clean_retained_ids.add(strip_model_prefix(fm["id"]))
-
             synced_models = retained[:5]
             latest_provider["models"] = synced_models
             latest_provider["fetched_model_ids"] = sorted(list(fetched_ids))
@@ -581,8 +660,8 @@ class BackgroundModelSyncer:
             latest_provider["sync_status"] = "ready"
             latest_provider["sync_error"] = ""
 
-            # Save updated provider to database atomically
-            save_providers([latest_provider])
+            # Persist only this provider's models without touching or pruning other providers
+            update_provider_models(provider_id, synced_models)
 
             # Keep Web Search fallback models pruned against fetched Gemini models (no auto-add, fixed primary)
             if provider_id == "gemini":
@@ -590,7 +669,7 @@ class BackgroundModelSyncer:
                 kept_ws = [
                     m
                     for m in ws_models[1:]
-                    if m.get("id") in fetched_ids or strip_model_prefix(m.get("id", "")) in clean_fetched_ids
+                    if m.get("id") in fetched_ids or strip_model_prefix(m.get("id", "")).lower() in clean_fetched_lower
                 ]
                 latest_provider["web_search_models"] = save_web_search_models([ws_models[0], *kept_ws])
 

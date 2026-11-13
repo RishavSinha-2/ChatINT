@@ -1,3 +1,4 @@
+import contextlib
 import json
 import re
 import sqlite3
@@ -7,7 +8,7 @@ import uuid
 from typing import Any, Dict, List, Optional
 from chatint.config import DB_PATH, DEFAULT_PROVIDERS, ENV_PATH
 
-_ENV_LOCK = threading.Lock()
+_ENV_LOCK = threading.RLock()
 
 
 def strip_model_prefix(model_id: str) -> str:
@@ -96,24 +97,26 @@ def get_api_key_from_env(provider_name: str) -> str:
 
 
 def set_api_key_in_env(provider_name: str, api_key: str, old_provider_name: Optional[str] = None):
-    env_map = read_env_dict()
-    old_val = ""
-    if old_provider_name and sanitize_provider_name(old_provider_name).upper() != sanitize_provider_name(provider_name).upper():
-        old_key = provider_env_key(old_provider_name)
-        old_val = env_map.pop(old_key, "")
-    new_key = provider_env_key(provider_name)
-    if new_key != "_API_KEY":
-        final_val = (api_key if api_key is not None else "").strip() or old_val
-        env_map[new_key] = final_val
-    write_env_dict(env_map)
+    with _ENV_LOCK:
+        env_map = read_env_dict()
+        old_val = ""
+        if old_provider_name and sanitize_provider_name(old_provider_name).upper() != sanitize_provider_name(provider_name).upper():
+            old_key = provider_env_key(old_provider_name)
+            old_val = env_map.pop(old_key, "")
+        new_key = provider_env_key(provider_name)
+        if new_key != "_API_KEY":
+            final_val = (api_key if api_key is not None else "").strip() or old_val
+            env_map[new_key] = final_val
+        write_env_dict(env_map)
 
 
 def remove_api_key_from_env(provider_name: str):
-    env_map = read_env_dict()
-    key_name = provider_env_key(provider_name)
-    if key_name in env_map:
-        env_map.pop(key_name, None)
-        write_env_dict(env_map)
+    with _ENV_LOCK:
+        env_map = read_env_dict()
+        key_name = provider_env_key(provider_name)
+        if key_name in env_map:
+            env_map.pop(key_name, None)
+            write_env_dict(env_map)
 
 
 def get_connection() -> sqlite3.Connection:
@@ -125,207 +128,226 @@ def get_connection() -> sqlite3.Connection:
     return conn
 
 
-def init_db():
+@contextlib.contextmanager
+def open_db():
     conn = get_connection()
-    cursor = conn.cursor()
-
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS providers (
-        id TEXT PRIMARY KEY,
-        name TEXT NOT NULL,
-        base_url TEXT NOT NULL,
-        api_key TEXT NOT NULL DEFAULT '',
-        is_enabled INTEGER NOT NULL DEFAULT 1,
-        models_json TEXT NOT NULL DEFAULT '[]'
-    )
-    """)
-
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS conversations (
-        id TEXT PRIMARY KEY,
-        title TEXT NOT NULL DEFAULT 'New Chat',
-        system_prompt TEXT NOT NULL DEFAULT '',
-        max_context_messages INTEGER NOT NULL DEFAULT 30,
-        created_at REAL NOT NULL,
-        updated_at REAL NOT NULL
-    )
-    """)
-
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS messages (
-        id TEXT PRIMARY KEY,
-        conversation_id TEXT NOT NULL,
-        role TEXT NOT NULL,
-        content TEXT NOT NULL,
-        thinking_content TEXT NOT NULL DEFAULT '',
-        provider_id TEXT NOT NULL DEFAULT '',
-        model_id TEXT NOT NULL DEFAULT '',
-        thinking_level TEXT NOT NULL DEFAULT 'none',
-        prompt_tokens INTEGER NOT NULL DEFAULT 0,
-        completion_tokens INTEGER NOT NULL DEFAULT 0,
-        cached_tokens INTEGER NOT NULL DEFAULT 0,
-        created_at REAL NOT NULL,
-        FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
-    )
-    """)
-
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS tab_sessions (
-        id INTEGER PRIMARY KEY CHECK (id = 1),
-        state_json TEXT NOT NULL,
-        updated_at REAL NOT NULL
-    )
-    """)
-
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS app_settings (
-        key TEXT PRIMARY KEY,
-        value TEXT NOT NULL
-    )
-    """)
-
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS token_ledger (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        conversation_id TEXT NOT NULL,
-        provider_id TEXT NOT NULL DEFAULT '',
-        model_id TEXT NOT NULL DEFAULT '',
-        prompt_tokens INTEGER NOT NULL DEFAULT 0,
-        completion_tokens INTEGER NOT NULL DEFAULT 0,
-        cached_tokens INTEGER NOT NULL DEFAULT 0,
-        google_search_requests INTEGER NOT NULL DEFAULT 0,
-        created_at REAL NOT NULL,
-        FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
-    )
-    """)
-
-    cursor.execute("PRAGMA table_info(token_ledger)")
-    ledger_cols = {r["name"] for r in cursor.fetchall()}
-    if "google_search_requests" not in ledger_cols:
-        cursor.execute("ALTER TABLE token_ledger ADD COLUMN google_search_requests INTEGER NOT NULL DEFAULT 0")
-
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS google_search_usage (
-        month_key TEXT PRIMARY KEY,
-        request_count INTEGER NOT NULL DEFAULT 0,
-        updated_at REAL NOT NULL
-    )
-    """)
-
-    # Populate token_ledger from historical messages if token_ledger is empty
-    cursor.execute("SELECT COUNT(*) as count FROM token_ledger")
-    t_count = cursor.fetchone()
-    if t_count and t_count["count"] == 0:
-        cursor.execute("""
-            INSERT INTO token_ledger (
-                conversation_id, provider_id, model_id,
-                prompt_tokens, completion_tokens, cached_tokens, created_at
-            )
-            SELECT conversation_id, provider_id, model_id,
-                   prompt_tokens, completion_tokens, cached_tokens, created_at
-            FROM messages
-            WHERE role = 'assistant' AND (prompt_tokens > 0 OR completion_tokens > 0)
-        """)
-
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(conversation_id)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_token_ledger_conv ON token_ledger(conversation_id)")
-
-    # Clean up legacy 'custom' provider if present from earlier runs
-    cursor.execute("DELETE FROM providers WHERE id = 'custom'")
-
-    # Ensure .env exists
-    ensure_env_file()
-
-    # Seed default providers if none exist, and ensure newly added built-in providers (e.g. anthropic, gemini) exist
-    cursor.execute("SELECT id, name FROM providers")
-    existing_prov_rows = cursor.fetchall()
-    existing_ids = {r["id"] for r in existing_prov_rows}
-    existing_upper_names = {sanitize_provider_name(r["name"]).upper() for r in existing_prov_rows if r["name"]}
-
-    for p in DEFAULT_PROVIDERS:
-        clean_name = sanitize_provider_name(p["name"]) or "Provider"
-        if p["id"] not in existing_ids and clean_name.upper() not in existing_upper_names:
-            cursor.execute(
-                """
-                INSERT INTO providers (id, name, base_url, api_key, is_enabled, models_json)
-                VALUES (?, ?, ?, '', ?, ?)
-            """,
-                (
-                    p["id"],
-                    clean_name,
-                    p["base_url"],
-                    p["is_enabled"],
-                    json.dumps(p["models"]),
-                ),
-            )
-            default_env_key = get_api_key_from_env(clean_name) or ("ollama" if clean_name.lower() == "ollama" else (p.get("api_key") or ""))
-            set_api_key_in_env(clean_name, default_env_key)
-            existing_ids.add(p["id"])
-            existing_upper_names.add(clean_name.upper())
-
-    # Ensure anthropic and gemini providers have empty base_url since they use native SDKs without user endpoints
-    cursor.execute(
-        "UPDATE providers SET base_url = '' WHERE id IN ('anthropic', 'gemini') OR LOWER(name) IN ('anthropic', 'gemini')"
-    )
-
-    # Migrate any legacy API keys out of SQLite into .env, sanitize provider names to English letters only,
-    # deduplicate case-insensitively, and wipe api_key column in DB.
-    cursor.execute("SELECT id, name, api_key FROM providers")
-    existing_rows = cursor.fetchall()
-    seen_upper_names = set()
-    for r in existing_rows:
-        pid = r["id"]
-        raw_name = r["name"] or ""
-        if raw_name.strip().lower() in ("ollama (local)", "ollamalocal"):
-            clean_name = "Ollama"
-        else:
-            clean_name = sanitize_provider_name(raw_name) or "Provider"
-        base_clean = clean_name
-        suffix_idx = 0
-        while clean_name.upper() in seen_upper_names:
-            # Append letters (A, B, C...) if duplicate
-            letter = chr(ord("A") + (suffix_idx % 26))
-            clean_name = f"{base_clean}{letter}"
-            suffix_idx += 1
-        seen_upper_names.add(clean_name.upper())
-
-        db_key = (r["api_key"] or "").strip()
-        env_key_val = get_api_key_from_env(clean_name) or (get_api_key_from_env(raw_name) if raw_name != clean_name else "")
-        final_key = env_key_val or db_key or ("ollama" if clean_name.lower() == "ollama" else "")
-        set_api_key_in_env(clean_name, final_key, old_provider_name=raw_name if raw_name != clean_name else None)
-
-        cursor.execute(
-            "UPDATE providers SET name = ?, api_key = '' WHERE id = ?",
-            (clean_name, pid),
-        )
-
-    # Seed default app settings if missing
-    default_ws_models = json.dumps([
-        {
-            "id": PRIMARY_WEB_SEARCH_MODEL,
-            "name": PRIMARY_WEB_SEARCH_MODEL,
-            "input_price": 0.0,
-            "cached_input_price": 0.0,
-            "output_price": 0.0,
-        }
-    ])
-    cursor.executemany(
-        "INSERT OR IGNORE INTO app_settings (key, value) VALUES (?, ?)",
-        [
-            ("theme", "dark"),
-            ("global_system_prompt", "You are a helpful, brilliant, and precise assistant."),
-            ("default_provider", "openai"),
-            ("default_model", "gpt-4o"),
-            ("default_thinking", "medium"),
-            ("web_search_models", default_ws_models),
-        ],
-    )
-
-    conn.commit()
-    conn.close()
+    try:
+        yield conn
+    finally:
+        conn.close()
 
 
 PRIMARY_WEB_SEARCH_MODEL = "gemini-3.1-flash-lite"
+
+
+def init_db():
+    with open_db() as conn:
+        cursor = conn.cursor()
+
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS providers (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            base_url TEXT NOT NULL,
+            api_key TEXT NOT NULL DEFAULT '',
+            is_enabled INTEGER NOT NULL DEFAULT 1,
+            models_json TEXT NOT NULL DEFAULT '[]'
+        )
+        """)
+
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS conversations (
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL DEFAULT 'New Chat',
+            system_prompt TEXT NOT NULL DEFAULT '',
+            max_context_messages INTEGER NOT NULL DEFAULT 30,
+            is_imported INTEGER NOT NULL DEFAULT 0,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL
+        )
+        """)
+
+        cursor.execute("PRAGMA table_info(conversations)")
+        conv_cols = {r["name"] for r in cursor.fetchall()}
+        if "is_imported" not in conv_cols:
+            cursor.execute("ALTER TABLE conversations ADD COLUMN is_imported INTEGER NOT NULL DEFAULT 0")
+
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS messages (
+            id TEXT PRIMARY KEY,
+            conversation_id TEXT NOT NULL,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            thinking_content TEXT NOT NULL DEFAULT '',
+            provider_id TEXT NOT NULL DEFAULT '',
+            model_id TEXT NOT NULL DEFAULT '',
+            thinking_level TEXT NOT NULL DEFAULT 'none',
+            prompt_tokens INTEGER NOT NULL DEFAULT 0,
+            completion_tokens INTEGER NOT NULL DEFAULT 0,
+            cached_tokens INTEGER NOT NULL DEFAULT 0,
+            created_at REAL NOT NULL,
+            FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
+        )
+        """)
+
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS tab_sessions (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            state_json TEXT NOT NULL,
+            updated_at REAL NOT NULL
+        )
+        """)
+
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS app_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+        """)
+
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS token_ledger (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            conversation_id TEXT NOT NULL,
+            provider_id TEXT NOT NULL DEFAULT '',
+            model_id TEXT NOT NULL DEFAULT '',
+            prompt_tokens INTEGER NOT NULL DEFAULT 0,
+            completion_tokens INTEGER NOT NULL DEFAULT 0,
+            cached_tokens INTEGER NOT NULL DEFAULT 0,
+            google_search_requests INTEGER NOT NULL DEFAULT 0,
+            created_at REAL NOT NULL,
+            FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
+        )
+        """)
+
+        cursor.execute("PRAGMA table_info(token_ledger)")
+        ledger_cols = {r["name"] for r in cursor.fetchall()}
+        if "google_search_requests" not in ledger_cols:
+            cursor.execute("ALTER TABLE token_ledger ADD COLUMN google_search_requests INTEGER NOT NULL DEFAULT 0")
+
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS google_search_usage (
+            month_key TEXT PRIMARY KEY,
+            request_count INTEGER NOT NULL DEFAULT 0,
+            updated_at REAL NOT NULL
+        )
+        """)
+
+        # Populate token_ledger from historical messages if token_ledger is empty
+        cursor.execute("SELECT COUNT(*) as count FROM token_ledger")
+        t_count = cursor.fetchone()
+        if t_count and t_count["count"] == 0:
+            cursor.execute("""
+                INSERT INTO token_ledger (
+                    conversation_id, provider_id, model_id,
+                    prompt_tokens, completion_tokens, cached_tokens, created_at
+                )
+                SELECT conversation_id, provider_id, model_id,
+                       prompt_tokens, completion_tokens, cached_tokens, created_at
+                FROM messages
+                WHERE role = 'assistant' AND (prompt_tokens > 0 OR completion_tokens > 0)
+            """)
+
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(conversation_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_token_ledger_conv ON token_ledger(conversation_id)")
+
+        # Clean up legacy 'custom' provider if present from earlier runs
+        cursor.execute("DELETE FROM providers WHERE id = 'custom'")
+
+        # Ensure .env exists
+        ensure_env_file()
+
+        # Seed default providers if none exist, and ensure newly added built-in providers (e.g. anthropic, gemini) exist
+        cursor.execute("SELECT id, name FROM providers")
+        existing_prov_rows = cursor.fetchall()
+        existing_ids = {r["id"] for r in existing_prov_rows}
+        existing_upper_names = {sanitize_provider_name(r["name"]).upper() for r in existing_prov_rows if r["name"]}
+
+        for p in DEFAULT_PROVIDERS:
+            clean_name = sanitize_provider_name(p["name"]) or "Provider"
+            if p["id"] not in existing_ids and clean_name.upper() not in existing_upper_names:
+                cursor.execute(
+                    """
+                    INSERT INTO providers (id, name, base_url, api_key, is_enabled, models_json)
+                    VALUES (?, ?, ?, '', ?, ?)
+                """,
+                    (
+                        p["id"],
+                        clean_name,
+                        p["base_url"],
+                        p["is_enabled"],
+                        json.dumps(p["models"]),
+                    ),
+                )
+                default_env_key = get_api_key_from_env(clean_name) or (
+                    "ollama" if clean_name.lower() == "ollama" else (p.get("api_key") or "")
+                )
+                set_api_key_in_env(clean_name, default_env_key)
+                existing_ids.add(p["id"])
+                existing_upper_names.add(clean_name.upper())
+
+        # Ensure anthropic and gemini providers have empty base_url since they use native SDKs without user endpoints
+        cursor.execute(
+            "UPDATE providers SET base_url = '' WHERE id IN ('anthropic', 'gemini') OR LOWER(name) IN ('anthropic', 'gemini')"
+        )
+
+        # Migrate any legacy API keys out of SQLite into .env, sanitize provider names to English letters only,
+        # deduplicate case-insensitively, and wipe api_key column in DB.
+        cursor.execute("SELECT id, name, api_key FROM providers")
+        existing_rows = cursor.fetchall()
+        seen_upper_names = set()
+        for r in existing_rows:
+            pid = r["id"]
+            raw_name = r["name"] or ""
+            if raw_name.strip().lower() in ("ollama (local)", "ollamalocal"):
+                clean_name = "Ollama"
+            else:
+                clean_name = sanitize_provider_name(raw_name) or "Provider"
+            base_clean = clean_name
+            suffix_idx = 0
+            while clean_name.upper() in seen_upper_names:
+                letter = chr(ord("A") + (suffix_idx % 26))
+                clean_name = f"{base_clean}{letter}"
+                suffix_idx += 1
+            seen_upper_names.add(clean_name.upper())
+
+            db_key = (r["api_key"] or "").strip()
+            env_key_val = get_api_key_from_env(clean_name) or (
+                get_api_key_from_env(raw_name) if raw_name != clean_name else ""
+            )
+            final_key = env_key_val or db_key or ("ollama" if clean_name.lower() == "ollama" else "")
+            set_api_key_in_env(
+                clean_name, final_key, old_provider_name=raw_name if raw_name != clean_name else None
+            )
+
+            cursor.execute(
+                "UPDATE providers SET name = ?, api_key = '' WHERE id = ?",
+                (clean_name, pid),
+            )
+
+        # Seed default app settings if missing
+        default_ws_models = json.dumps([
+            {
+                "id": PRIMARY_WEB_SEARCH_MODEL,
+                "name": PRIMARY_WEB_SEARCH_MODEL,
+                "input_price": 0.0,
+                "cached_input_price": 0.0,
+                "output_price": 0.0,
+            }
+        ])
+        cursor.executemany(
+            "INSERT OR IGNORE INTO app_settings (key, value) VALUES (?, ?)",
+            [
+                ("theme", "dark"),
+                ("global_system_prompt", "You are a helpful, brilliant, and precise assistant."),
+                ("default_provider", "openai"),
+                ("default_model", "gpt-4o"),
+                ("default_thinking", "medium"),
+                ("web_search_models", default_ws_models),
+            ],
+        )
+
+        conn.commit()
 
 
 def _normalize_search_model_entry(m: Dict[str, Any]) -> Dict[str, Any]:
@@ -397,7 +419,7 @@ def save_web_search_models(models: Optional[List[Dict[str, Any]]]) -> List[Dict[
 
 def _normalize_model_entry(m: Dict[str, Any]) -> Dict[str, Any]:
     mid = (m.get("id") or "").strip()
-    return {
+    entry = {
         "id": mid,
         "name": (m.get("name") or mid).strip(),
         "supports_thinking": 1 if m.get("supports_thinking") else 0,
@@ -405,6 +427,14 @@ def _normalize_model_entry(m: Dict[str, Any]) -> Dict[str, Any]:
         "cached_input_price": float(m.get("cached_input_price") or 0.0),
         "output_price": float(m.get("output_price") or 0.0),
     }
+    raw_res = m.get("resolved_thinking")
+    if isinstance(raw_res, dict):
+        entry["resolved_thinking"] = {
+            str(k).lower(): str(v).lower()
+            for k, v in raw_res.items()
+            if isinstance(k, str) and isinstance(v, str)
+        }
+    return entry
 
 
 _BUILTIN_PROVIDER_ORDER = {p["id"]: idx for idx, p in enumerate(DEFAULT_PROVIDERS)}
@@ -413,11 +443,10 @@ _BUILTIN_PROVIDER_ORDER = {p["id"]: idx for idx, p in enumerate(DEFAULT_PROVIDER
 def get_providers() -> List[Dict[str, Any]]:
     from chatint.client_manager import BackgroundModelSyncer
 
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT rowid, id, name, base_url, is_enabled, models_json FROM providers")
-    rows = list(cursor.fetchall())
-    conn.close()
+    with open_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT rowid, id, name, base_url, is_enabled, models_json FROM providers")
+        rows = list(cursor.fetchall())
 
     rows.sort(key=lambda r: (_BUILTIN_PROVIDER_ORDER.get(r["id"], 999), r["rowid"]))
 
@@ -447,120 +476,318 @@ def get_providers() -> List[Dict[str, Any]]:
     return providers
 
 
-def save_providers(providers: List[Dict[str, Any]]):
+def update_provider_models(provider_id: str, models: List[Dict[str, Any]]) -> bool:
+    """Safely update only models_json for a single provider without touching or pruning other providers."""
+    if not provider_id:
+        return False
+    normalized_models = [_normalize_model_entry(m) for m in (models or []) if isinstance(m, dict) and m.get("id")]
+    with open_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE providers SET models_json = ? WHERE id = ?",
+            (json.dumps(normalized_models), provider_id),
+        )
+        conn.commit()
+        return cursor.rowcount > 0
+
+
+def save_providers(providers: List[Dict[str, Any]], prune_missing: bool = True):
     from chatint.client_manager import BackgroundModelSyncer
 
-    conn = get_connection()
-    cursor = conn.cursor()
+    with open_db() as conn:
+        cursor = conn.cursor()
 
-    cursor.execute("SELECT id, name, base_url, models_json FROM providers")
-    existing_rows = {r["id"]: r for r in cursor.fetchall()}
+        cursor.execute("SELECT id, name, base_url, models_json FROM providers")
+        existing_rows = {r["id"]: r for r in cursor.fetchall()}
 
-    for p in providers:
-        pid = p["id"]
-        old_row = existing_rows.get(pid)
-        old_name = old_row["name"] if old_row else None
-        clean_name = sanitize_provider_name(p.get("name", "")) or sanitize_provider_name(old_name or "") or "Provider"
+        # Clean up any custom (non-builtin) providers that were deleted by the user
+        if prune_missing:
+            submitted_ids = {p["id"] for p in providers}
+            for old_id, old_r in existing_rows.items():
+                if old_id not in submitted_ids and old_id not in _BUILTIN_PROVIDER_ORDER:
+                    if old_r["name"]:
+                        remove_api_key_from_env(old_r["name"])
+                    cursor.execute("DELETE FROM providers WHERE id = ?", (old_id,))
 
-        # If provider was renamed or a new api_key was explicitly passed in payload, update .env ONLY
-        raw_new_key = p.get("api_key")
-        if raw_new_key is not None and str(raw_new_key).strip() != "":
-            set_api_key_in_env(clean_name, str(raw_new_key).strip(), old_provider_name=old_name)
-        elif p.get("clear_api_key"):
-            set_api_key_in_env(clean_name, "", old_provider_name=old_name)
-        elif old_name and sanitize_provider_name(old_name).upper() != clean_name.upper():
-            # Renamed without changing key -> migrate existing .env entry to new name
-            existing_val = get_api_key_from_env(old_name)
-            set_api_key_in_env(clean_name, existing_val, old_provider_name=old_name)
-        elif not old_name:
-            # Newly added provider -> ensure entry exists in .env
-            default_env_key = get_api_key_from_env(clean_name) or ("ollama" if clean_name.lower() == "ollama" else (p.get("api_key") or ""))
-            set_api_key_in_env(clean_name, default_env_key)
+        for p in providers:
+            pid = p["id"]
+            old_row = existing_rows.get(pid)
+            old_name = old_row["name"] if old_row else None
+            clean_name = sanitize_provider_name(p.get("name", "")) or sanitize_provider_name(old_name or "") or "Provider"
 
-        normalized_models = [_normalize_model_entry(m) for m in (p.get("models") or []) if m.get("id")]
-        if p.get("models") is not None:
-            models_json_str = json.dumps(normalized_models)
-        elif old_row and old_row["models_json"]:
-            models_json_str = old_row["models_json"]
-        else:
-            models_json_str = "[]"
+            # If provider was renamed or a new api_key was explicitly passed in payload, update .env ONLY
+            raw_new_key = p.get("api_key")
+            if raw_new_key is not None and str(raw_new_key).strip() != "":
+                set_api_key_in_env(clean_name, str(raw_new_key).strip(), old_provider_name=old_name)
+            elif p.get("clear_api_key"):
+                set_api_key_in_env(clean_name, "", old_provider_name=old_name)
+            elif old_name and sanitize_provider_name(old_name).upper() != clean_name.upper():
+                # Renamed without changing key -> migrate existing .env entry to new name
+                existing_val = get_api_key_from_env(old_name)
+                set_api_key_in_env(clean_name, existing_val, old_provider_name=old_name)
+            elif not old_name:
+                # Newly added provider -> ensure entry exists in .env
+                default_env_key = get_api_key_from_env(clean_name) or ("ollama" if clean_name.lower() == "ollama" else (p.get("api_key") or ""))
+                set_api_key_in_env(clean_name, default_env_key)
 
-        is_native_sdk = pid.lower() in ("anthropic", "gemini") or clean_name.lower() in ("anthropic", "gemini")
-        base_url_val = "" if is_native_sdk else p.get("base_url", "")
-
-        key_changed = (raw_new_key is not None and str(raw_new_key).strip() != "") or bool(p.get("clear_api_key"))
-        url_changed = bool(old_row and not is_native_sdk and (base_url_val != old_row["base_url"]))
-        if key_changed or url_changed:
-            BackgroundModelSyncer.clear_provider_verified(pid)
-            if p.get("clear_api_key"):
-                BackgroundModelSyncer.set_sync_status(pid, "no_key", "NO API KEY")
+            normalized_models = [_normalize_model_entry(m) for m in (p.get("models") or []) if m.get("id")]
+            if p.get("models") is not None:
+                models_json_str = json.dumps(normalized_models)
+            elif old_row and old_row["models_json"]:
+                models_json_str = old_row["models_json"]
             else:
-                BackgroundModelSyncer.set_sync_status(pid, "checking", "CHECKING...")
+                models_json_str = "[]"
 
-        # Never store api_key in the database (always '')
-        cursor.execute(
-            """
-            INSERT INTO providers (id, name, base_url, api_key, is_enabled, models_json)
-            VALUES (?, ?, ?, '', ?, ?)
-            ON CONFLICT(id) DO UPDATE SET
-                name=excluded.name,
-                base_url=excluded.base_url,
-                api_key='',
-                is_enabled=excluded.is_enabled,
-                models_json=excluded.models_json
-        """,
-            (
-                pid,
-                clean_name,
-                base_url_val,
-                1 if p.get("is_enabled", True) else 0,
-                models_json_str,
-            ),
-        )
-    conn.commit()
-    conn.close()
+            is_native_sdk = pid.lower() in ("anthropic", "gemini") or clean_name.lower() in ("anthropic", "gemini")
+            base_url_val = "" if is_native_sdk else p.get("base_url", "")
+
+            key_changed = (raw_new_key is not None and str(raw_new_key).strip() != "") or bool(p.get("clear_api_key"))
+            url_changed = bool(old_row and not is_native_sdk and (base_url_val != old_row["base_url"]))
+            if key_changed or url_changed:
+                BackgroundModelSyncer.clear_provider_verified(pid)
+                if p.get("clear_api_key"):
+                    BackgroundModelSyncer.set_sync_status(pid, "no_key", "NO API KEY")
+                else:
+                    BackgroundModelSyncer.set_sync_status(pid, "checking", "CHECKING...")
+
+            # Never store api_key in the database (always '')
+            cursor.execute(
+                """
+                INSERT INTO providers (id, name, base_url, api_key, is_enabled, models_json)
+                VALUES (?, ?, ?, '', ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    name=excluded.name,
+                    base_url=excluded.base_url,
+                    api_key='',
+                    is_enabled=excluded.is_enabled,
+                    models_json=excluded.models_json
+            """,
+                (
+                    pid,
+                    clean_name,
+                    base_url_val,
+                    1 if p.get("is_enabled", True) else 0,
+                    models_json_str,
+                ),
+            )
+        conn.commit()
+
+
+def update_model_resolved_thinking(provider_id: str, model_id: str, requested_level: str, resolved_level: str):
+    """Store the verified thinking fallback for a specific model under its provider entry."""
+    if not provider_id or not model_id or not requested_level:
+        return
+    req = requested_level.strip().lower()
+    res = (resolved_level or "none").strip().lower()
+
+    with open_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT models_json FROM providers WHERE id = ?", (provider_id,))
+        row = cursor.fetchone()
+        if not row:
+            return
+
+        try:
+            models = json.loads(row["models_json"] or "[]")
+        except Exception:
+            models = []
+
+        model_found = False
+        for m in models:
+            if m.get("id") == model_id:
+                m_resolved = m.setdefault("resolved_thinking", {})
+                if m_resolved.get(req) != res:
+                    m_resolved[req] = res
+                    model_found = True
+                break
+
+        if model_found:
+            cursor.execute(
+                "UPDATE providers SET models_json = ? WHERE id = ?",
+                (json.dumps(models), provider_id),
+            )
+            conn.commit()
+
+
+def get_model_resolved_thinking(provider_id: str, model_id: str, requested_level: str) -> Optional[str]:
+    """Retrieve the stored verified thinking fallback for a specific model."""
+    if not provider_id or not model_id or not requested_level:
+        return None
+    req = requested_level.strip().lower()
+
+    with open_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT models_json FROM providers WHERE id = ?", (provider_id,))
+        row = cursor.fetchone()
+    if not row:
+        return None
+
+    try:
+        models = json.loads(row["models_json"] or "[]")
+        for m in models:
+            if m.get("id") == model_id:
+                m_resolved = m.get("resolved_thinking") or {}
+                return m_resolved.get(req)
+    except Exception:
+        pass
+    return None
+
+
+def remove_model_resolved_thinking(
+    provider_id: str,
+    model_id: Optional[str] = None,
+    requested_level: Optional[str] = None,
+):
+    """Remove cached thinking resolution(s) for a provider/model/level if stale or invalid."""
+    if not provider_id:
+        return
+    req = requested_level.strip().lower() if requested_level else None
+    clean_mid = strip_model_prefix(model_id) if model_id else None
+
+    with open_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT models_json FROM providers WHERE id = ?", (provider_id,))
+        row = cursor.fetchone()
+        if not row:
+            return
+
+        try:
+            models = json.loads(row["models_json"] or "[]")
+            changed = False
+            for m in models:
+                mid = m.get("id") or ""
+                if model_id is None or mid == model_id or strip_model_prefix(mid) == clean_mid:
+                    if "resolved_thinking" in m:
+                        if req is None:
+                            del m["resolved_thinking"]
+                            changed = True
+                        elif isinstance(m["resolved_thinking"], dict) and req in m["resolved_thinking"]:
+                            del m["resolved_thinking"][req]
+                            changed = True
+            if changed:
+                cursor.execute(
+                    "UPDATE providers SET models_json = ? WHERE id = ?",
+                    (json.dumps(models), provider_id),
+                )
+                conn.commit()
+        except Exception:
+            pass
 
 
 def get_app_settings() -> Dict[str, str]:
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT key, value FROM app_settings")
-    rows = cursor.fetchall()
-    conn.close()
+    with open_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT key, value FROM app_settings")
+        rows = cursor.fetchall()
     return {r["key"]: r["value"] for r in rows}
 
 
 def save_app_settings(settings: Dict[str, str]):
-    conn = get_connection()
-    cursor = conn.cursor()
-    for k, v in settings.items():
-        cursor.execute(
-            """
-            INSERT INTO app_settings (key, value) VALUES (?, ?)
-            ON CONFLICT(key) DO UPDATE SET value=excluded.value
-        """,
-            (k, str(v)),
-        )
-    conn.commit()
-    conn.close()
+    with open_db() as conn:
+        cursor = conn.cursor()
+        for k, v in settings.items():
+            cursor.execute(
+                """
+                INSERT INTO app_settings (key, value) VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value
+            """,
+                (k, str(v)),
+            )
+        conn.commit()
+
+
+def get_unique_conversation_title(
+    title: str,
+    exclude_conv_id: Optional[str] = None,
+    conn: Optional[sqlite3.Connection] = None,
+) -> str:
+    """
+    Ensures that no two conversations share the exact same title (case-insensitive).
+    If a conflict exists, appends (1), (2), etc.
+    """
+    candidate = (title or "New Chat").strip()
+    if not candidate:
+        candidate = "New Chat"
+
+    ctx = contextlib.nullcontext(conn) if conn is not None else open_db()
+    with ctx as active_conn:
+        cursor = active_conn.cursor()
+        if exclude_conv_id:
+            cursor.execute("SELECT title FROM conversations WHERE id != ?", (exclude_conv_id,))
+        else:
+            cursor.execute("SELECT title FROM conversations")
+        rows = cursor.fetchall()
+
+    existing_titles = {r["title"].strip().lower() for r in rows if r["title"]}
+
+    if candidate.lower() not in existing_titles:
+        return candidate
+
+    # If duplicate, check if candidate already ends with `(N)` (where N <= 500)
+    match = re.search(r"^(.*?)(?:\s*\((\d+)\))?$", candidate)
+    if match and match.group(2) and int(match.group(2)) <= 500:
+        base = match.group(1).strip()
+        start_num = int(match.group(2)) + 1
+    else:
+        base = candidate
+        start_num = 1
+
+    i = start_num
+    while True:
+        suffixed = f"{base} ({i})"
+        if suffixed.lower() not in existing_titles:
+            return suffixed
+        i += 1
+
+
+def get_branch_title(
+    original_title: str,
+    conn: Optional[sqlite3.Connection] = None,
+) -> str:
+    """
+    Generates a unique branch title: 'Original Title (Branch)', 'Original Title (Branch 1)', etc.
+    """
+    raw_title = (original_title or "New Chat").strip()
+    clean_title = re.sub(r"\s*\(Branch(?:\s*\d+)?\)$", "", raw_title, flags=re.IGNORECASE).strip()
+    if not clean_title:
+        clean_title = "New Chat"
+
+    ctx = contextlib.nullcontext(conn) if conn is not None else open_db()
+    with ctx as active_conn:
+        cursor = active_conn.cursor()
+        cursor.execute("SELECT title FROM conversations")
+        rows = cursor.fetchall()
+
+    existing_titles = {r["title"].strip().lower() for r in rows if r["title"]}
+
+    candidate = f"{clean_title} (Branch)"
+    if candidate.lower() not in existing_titles:
+        return candidate
+
+    i = 1
+    while True:
+        candidate_n = f"{clean_title} (Branch {i})"
+        if candidate_n.lower() not in existing_titles:
+            return candidate_n
+        i += 1
 
 
 def create_conversation(
     title: str = "New Chat", system_prompt: str = "", max_context: int = 30
 ) -> Dict[str, Any]:
-    conn = get_connection()
-    cursor = conn.cursor()
-    conv_id = str(uuid.uuid4())
-    now = time.time()
-    cursor.execute(
-        """
-        INSERT INTO conversations (id, title, system_prompt, max_context_messages, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?)
-    """,
-        (conv_id, title, system_prompt, max_context, now, now),
-    )
-    conn.commit()
-    conn.close()
+    with open_db() as conn:
+        title = get_unique_conversation_title(title, conn=conn)
+        cursor = conn.cursor()
+        conv_id = str(uuid.uuid4())
+        now = time.time()
+        cursor.execute(
+            """
+            INSERT INTO conversations (id, title, system_prompt, max_context_messages, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """,
+            (conv_id, title, system_prompt, max_context, now, now),
+        )
+        conn.commit()
     return {
         "id": conv_id,
         "title": title,
@@ -573,19 +800,20 @@ def create_conversation(
 
 
 def get_conversations() -> List[Dict[str, Any]]:
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT c.id, c.title, c.system_prompt, c.max_context_messages, c.created_at, c.updated_at,
-               COUNT(m.id) as message_count
-        FROM conversations c
-        INNER JOIN messages m ON c.id = m.conversation_id
-        WHERE m.role = 'assistant' AND (LENGTH(TRIM(m.content)) > 0 OR LENGTH(TRIM(m.thinking_content)) > 0)
-        GROUP BY c.id
-        ORDER BY c.updated_at DESC
-    """)
-    rows = cursor.fetchall()
-    conn.close()
+    with open_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT c.id, c.title, c.system_prompt, c.max_context_messages, c.is_imported,
+                   c.created_at, c.updated_at,
+                   COALESCE(SUM(CASE WHEN m.role = 'assistant' AND (LENGTH(TRIM(m.content)) > 0 OR LENGTH(TRIM(m.thinking_content)) > 0) THEN 1 ELSE 0 END), 0) as message_count,
+                   COUNT(m.id) as total_messages
+            FROM conversations c
+            LEFT JOIN messages m ON c.id = m.conversation_id
+            GROUP BY c.id
+            HAVING message_count > 0 OR (c.is_imported = 1 AND total_messages > 0)
+            ORDER BY c.updated_at DESC
+        """)
+        rows = cursor.fetchall()
 
     return [
         {
@@ -593,6 +821,7 @@ def get_conversations() -> List[Dict[str, Any]]:
             "title": r["title"],
             "system_prompt": r["system_prompt"],
             "max_context_messages": r["max_context_messages"],
+            "is_imported": bool(r["is_imported"]),
             "created_at": r["created_at"],
             "updated_at": r["updated_at"],
             "message_count": r["message_count"],
@@ -604,30 +833,27 @@ def get_conversations() -> List[Dict[str, Any]]:
 def delete_provider(provider_id: str):
     if provider_id in _BUILTIN_PROVIDER_ORDER:
         return
-    conn = get_connection()
-    cursor = conn.cursor()
-    row = cursor.execute("SELECT name FROM providers WHERE id = ?", (provider_id,)).fetchone()
-    if row and row["name"]:
-        remove_api_key_from_env(row["name"])
-    cursor.execute("DELETE FROM providers WHERE id = ?", (provider_id,))
-    conn.commit()
-    conn.close()
+    with open_db() as conn:
+        cursor = conn.cursor()
+        row = cursor.execute("SELECT name FROM providers WHERE id = ?", (provider_id,)).fetchone()
+        if row and row["name"]:
+            remove_api_key_from_env(row["name"])
+        cursor.execute("DELETE FROM providers WHERE id = ?", (provider_id,))
+        conn.commit()
 
 
 def get_conversation(conv_id: str) -> Optional[Dict[str, Any]]:
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM conversations WHERE id = ?", (conv_id,))
-    conv_row = cursor.fetchone()
-    if not conv_row:
-        conn.close()
-        return None
+    with open_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM conversations WHERE id = ?", (conv_id,))
+        conv_row = cursor.fetchone()
+        if not conv_row:
+            return None
 
-    cursor.execute(
-        "SELECT * FROM messages WHERE conversation_id = ? ORDER BY created_at ASC, rowid ASC", (conv_id,)
-    )
-    msg_rows = cursor.fetchall()
-    conn.close()
+        cursor.execute(
+            "SELECT * FROM messages WHERE conversation_id = ? ORDER BY created_at ASC, rowid ASC", (conv_id,)
+        )
+        msg_rows = cursor.fetchall()
 
     messages = [
         {
@@ -652,6 +878,7 @@ def get_conversation(conv_id: str) -> Optional[Dict[str, Any]]:
         "title": conv_row["title"],
         "system_prompt": conv_row["system_prompt"],
         "max_context_messages": conv_row["max_context_messages"],
+        "is_imported": bool(conv_row["is_imported"]) if "is_imported" in conv_row.keys() else False,
         "created_at": conv_row["created_at"],
         "updated_at": conv_row["updated_at"],
         "messages": messages,
@@ -659,30 +886,157 @@ def get_conversation(conv_id: str) -> Optional[Dict[str, Any]]:
     }
 
 
-def update_conversation(conv_id: str, **kwargs):
-    conn = get_connection()
-    cursor = conn.cursor()
-    fields = []
-    values = []
-    for k, v in kwargs.items():
-        fields.append(f"{k} = ?")
-        values.append(v)
-    values.append(time.time())
-    values.append(conv_id)
-    query = f"UPDATE conversations SET {', '.join(fields)}, updated_at = ? WHERE id = ?"
-    cursor.execute(query, tuple(values))
-    conn.commit()
-    conn.close()
+_ALLOWED_CONV_COLUMNS = {"title", "system_prompt", "max_context_messages", "is_imported"}
+
+
+def update_conversation(conv_id: str, **kwargs) -> Optional[str]:
+    invalid_keys = [k for k in kwargs if k not in _ALLOWED_CONV_COLUMNS]
+    if invalid_keys:
+        raise ValueError(f"Unsupported conversation update column(s): {', '.join(invalid_keys)}")
+
+    with open_db() as conn:
+        if "title" in kwargs and kwargs["title"]:
+            kwargs["title"] = get_unique_conversation_title(kwargs["title"], exclude_conv_id=conv_id, conn=conn)
+        cursor = conn.cursor()
+        fields = [f"{k} = ?" for k in kwargs]
+        values = list(kwargs.values())
+        values.append(time.time())
+        values.append(conv_id)
+        set_clause = f"{', '.join(fields)}, updated_at = ?" if fields else "updated_at = ?"
+        cursor.execute(f"UPDATE conversations SET {set_clause} WHERE id = ?", tuple(values))
+        conn.commit()
+    return kwargs.get("title")
+
+
+def duplicate_conversation(conv_id: str) -> Optional[Dict[str, Any]]:
+    """
+    Creates an exact duplicate/branch of the conversation under a unique branch title:
+    'Original Title (Branch)', 'Original Title (Branch 1)', etc.
+    All messages (content, role, thinking, model) are duplicated,
+    while token usage and cost in token_ledger start at 0.
+    """
+    conv = get_conversation(conv_id)
+    if not conv:
+        return None
+
+    with open_db() as conn:
+        cursor = conn.cursor()
+        new_conv_id = str(uuid.uuid4())
+        branch_title = get_branch_title(conv["title"], conn=conn)
+        now = time.time()
+
+        cursor.execute(
+            """
+            INSERT INTO conversations (id, title, system_prompt, max_context_messages, is_imported, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                new_conv_id,
+                branch_title,
+                conv.get("system_prompt", ""),
+                conv.get("max_context_messages", 30),
+                1 if conv.get("is_imported") else 0,
+                now,
+                now,
+            ),
+        )
+
+        # Duplicate all messages; set per-message tokens to 0 so the ledger & bottom panel start from 0
+        for idx, m in enumerate(conv.get("messages", [])):
+            new_msg_id = str(uuid.uuid4())
+            msg_time = now + (idx * 0.001)
+            cursor.execute(
+                """
+                INSERT INTO messages (
+                    id, conversation_id, role, content, thinking_content,
+                    provider_id, model_id, thinking_level,
+                    prompt_tokens, completion_tokens, cached_tokens, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, ?)
+                """,
+                (
+                    new_msg_id,
+                    new_conv_id,
+                    m["role"],
+                    m.get("content", ""),
+                    m.get("thinking_content", ""),
+                    m.get("provider_id", ""),
+                    m.get("model_id", ""),
+                    m.get("thinking_level", "none"),
+                    msg_time,
+                ),
+            )
+
+        conn.commit()
+    return get_conversation(new_conv_id)
+
+
+def import_conversation_data(
+    title: str,
+    system_prompt: str = "",
+    max_context: int = 30,
+    messages: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """
+    Imports a conversation from parsed data with a deduplicated title.
+    Starts with 0 in token ledger so bottom analytics start clean.
+    """
+    with open_db() as conn:
+        cursor = conn.cursor()
+        unique_title = get_unique_conversation_title(title or "Imported Chat", conn=conn)
+        new_conv_id = str(uuid.uuid4())
+        now = time.time()
+
+        cursor.execute(
+            """
+            INSERT INTO conversations (id, title, system_prompt, max_context_messages, is_imported, created_at, updated_at)
+            VALUES (?, ?, ?, ?, 1, ?, ?)
+            """,
+            (
+                new_conv_id,
+                unique_title,
+                system_prompt or "",
+                int(max_context or 30),
+                now,
+                now,
+            ),
+        )
+
+        if messages:
+            for idx, m in enumerate(messages):
+                new_msg_id = str(uuid.uuid4())
+                msg_time = now + (idx * 0.001)
+                cursor.execute(
+                    """
+                    INSERT INTO messages (
+                        id, conversation_id, role, content, thinking_content,
+                        provider_id, model_id, thinking_level,
+                        prompt_tokens, completion_tokens, cached_tokens, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, ?)
+                    """,
+                    (
+                        new_msg_id,
+                        new_conv_id,
+                        m.get("role", "user"),
+                        m.get("content", ""),
+                        m.get("thinking_content", ""),
+                        m.get("provider_id", ""),
+                        m.get("model_id", ""),
+                        m.get("thinking_level", "none"),
+                        msg_time,
+                    ),
+                )
+
+        conn.commit()
+    return get_conversation(new_conv_id)
 
 
 def delete_conversation(conv_id: str):
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM messages WHERE conversation_id = ?", (conv_id,))
-    cursor.execute("DELETE FROM token_ledger WHERE conversation_id = ?", (conv_id,))
-    cursor.execute("DELETE FROM conversations WHERE id = ?", (conv_id,))
-    conn.commit()
-    conn.close()
+    with open_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM messages WHERE conversation_id = ?", (conv_id,))
+        cursor.execute("DELETE FROM token_ledger WHERE conversation_id = ?", (conv_id,))
+        cursor.execute("DELETE FROM conversations WHERE id = ?", (conv_id,))
+        conn.commit()
 
 
 def record_google_search_requests(query_count: int):
@@ -692,30 +1046,28 @@ def record_google_search_requests(query_count: int):
         return
     month_key = time.strftime("%Y-%m")
     now = time.time()
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute(
-        """
-        INSERT INTO google_search_usage (month_key, request_count, updated_at)
-        VALUES (?, ?, ?)
-        ON CONFLICT(month_key) DO UPDATE SET
-            request_count = request_count + excluded.request_count,
-            updated_at = excluded.updated_at
-        """,
-        (month_key, count, now),
-    )
-    conn.commit()
-    conn.close()
+    with open_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO google_search_usage (month_key, request_count, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(month_key) DO UPDATE SET
+                request_count = request_count + excluded.request_count,
+                updated_at = excluded.updated_at
+            """,
+            (month_key, count, now),
+        )
+        conn.commit()
 
 
 def get_google_search_request_totals() -> Dict[str, Any]:
     """Return current month and all-time actual Google Search request counts."""
     month_key = time.strftime("%Y-%m")
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT month_key, request_count FROM google_search_usage")
-    rows = cursor.fetchall()
-    conn.close()
+    with open_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT month_key, request_count FROM google_search_usage")
+        rows = cursor.fetchall()
     monthly = 0
     all_time = 0
     for r in rows:
@@ -738,29 +1090,28 @@ def record_token_usage(
     search_cnt = max(0, int(google_search_requests or 0))
     if not conversation_id or (prompt_tokens == 0 and completion_tokens == 0 and cached_tokens == 0 and search_cnt == 0):
         return
-    conn = get_connection()
-    cursor = conn.cursor()
-    now = time.time()
-    cursor.execute(
-        """
-        INSERT INTO token_ledger (
-            conversation_id, provider_id, model_id,
-            prompt_tokens, completion_tokens, cached_tokens, google_search_requests, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            conversation_id,
-            provider_id or "",
-            model_id or "",
-            prompt_tokens,
-            completion_tokens,
-            cached_tokens,
-            search_cnt,
-            now,
-        ),
-    )
-    conn.commit()
-    conn.close()
+    with open_db() as conn:
+        cursor = conn.cursor()
+        now = time.time()
+        cursor.execute(
+            """
+            INSERT INTO token_ledger (
+                conversation_id, provider_id, model_id,
+                prompt_tokens, completion_tokens, cached_tokens, google_search_requests, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                conversation_id,
+                provider_id or "",
+                model_id or "",
+                prompt_tokens,
+                completion_tokens,
+                cached_tokens,
+                search_cnt,
+                now,
+            ),
+        )
+        conn.commit()
 
 
 def add_message(
@@ -776,51 +1127,29 @@ def add_message(
     cached_tokens: int = 0,
     msg_id: Optional[str] = None,
 ) -> Dict[str, Any]:
-    conn = get_connection()
-    cursor = conn.cursor()
     if not msg_id:
         msg_id = str(uuid.uuid4())
     now = time.time()
 
-    cursor.execute(
-        """
-        INSERT INTO messages (
-            id, conversation_id, role, content, thinking_content,
-            provider_id, model_id, thinking_level,
-            prompt_tokens, completion_tokens, cached_tokens, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """,
-        (
-            msg_id,
-            conversation_id,
-            role,
-            content,
-            thinking_content,
-            provider_id,
-            model_id,
-            thinking_level,
-            prompt_tokens,
-            completion_tokens,
-            cached_tokens,
-            now,
-        ),
-    )
-
-    # Touch conversation updated_at
-    cursor.execute("UPDATE conversations SET updated_at = ? WHERE id = ?", (now, conversation_id))
-
-    if prompt_tokens > 0 or completion_tokens > 0 or cached_tokens > 0:
+    with open_db() as conn:
+        cursor = conn.cursor()
         cursor.execute(
             """
-            INSERT INTO token_ledger (
-                conversation_id, provider_id, model_id,
+            INSERT INTO messages (
+                id, conversation_id, role, content, thinking_content,
+                provider_id, model_id, thinking_level,
                 prompt_tokens, completion_tokens, cached_tokens, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
             (
+                msg_id,
                 conversation_id,
-                provider_id or "",
-                model_id or "",
+                role,
+                content,
+                thinking_content,
+                provider_id,
+                model_id,
+                thinking_level,
                 prompt_tokens,
                 completion_tokens,
                 cached_tokens,
@@ -828,8 +1157,29 @@ def add_message(
             ),
         )
 
-    conn.commit()
-    conn.close()
+        # Touch conversation updated_at
+        cursor.execute("UPDATE conversations SET updated_at = ? WHERE id = ?", (now, conversation_id))
+
+        if prompt_tokens > 0 or completion_tokens > 0 or cached_tokens > 0:
+            cursor.execute(
+                """
+                INSERT INTO token_ledger (
+                    conversation_id, provider_id, model_id,
+                    prompt_tokens, completion_tokens, cached_tokens, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    conversation_id,
+                    provider_id or "",
+                    model_id or "",
+                    prompt_tokens,
+                    completion_tokens,
+                    cached_tokens,
+                    now,
+                ),
+            )
+
+        conn.commit()
 
     return {
         "id": msg_id,
@@ -847,55 +1197,63 @@ def add_message(
     }
 
 
+_ALLOWED_MSG_COLUMNS = {
+    "role",
+    "content",
+    "thinking_content",
+    "provider_id",
+    "model_id",
+    "thinking_level",
+    "prompt_tokens",
+    "completion_tokens",
+    "cached_tokens",
+}
+
+
 def update_message(msg_id: str, **kwargs):
-    conn = get_connection()
-    cursor = conn.cursor()
-    fields = []
-    values = []
-    for k, v in kwargs.items():
-        fields.append(f"{k} = ?")
-        values.append(v)
+    if not kwargs:
+        return
+    invalid_keys = [k for k in kwargs if k not in _ALLOWED_MSG_COLUMNS]
+    if invalid_keys:
+        raise ValueError(f"Unsupported message update column(s): {', '.join(invalid_keys)}")
+
+    fields = [f"{k} = ?" for k in kwargs]
+    values = list(kwargs.values())
     values.append(msg_id)
-    query = f"UPDATE messages SET {', '.join(fields)} WHERE id = ?"
-    cursor.execute(query, tuple(values))
-    conn.commit()
-    conn.close()
+    with open_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(f"UPDATE messages SET {', '.join(fields)} WHERE id = ?", tuple(values))
+        conn.commit()
 
 
 def delete_messages_from(conversation_id: str, from_msg_id: str, include_self: bool = True):
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute(
-        "SELECT rowid, created_at FROM messages WHERE id = ? AND conversation_id = ?",
-        (from_msg_id, conversation_id),
-    )
-    target = cursor.fetchone()
-    if not target and (from_msg_id.startswith("user_temp_") or not from_msg_id):
-        # Fallback: if client passed a temporary user message ID, match the latest user message
+    with open_db() as conn:
+        cursor = conn.cursor()
         cursor.execute(
-            "SELECT rowid, id, created_at FROM messages WHERE conversation_id = ? AND role = 'user' ORDER BY rowid DESC LIMIT 1",
-            (conversation_id,),
+            "SELECT rowid, created_at FROM messages WHERE id = ? AND conversation_id = ?",
+            (from_msg_id, conversation_id),
         )
         target = cursor.fetchone()
+        if not target and (from_msg_id.startswith("user_temp_") or not from_msg_id):
+            # Fallback: if client passed a temporary user message ID, match the latest user message
+            cursor.execute(
+                "SELECT rowid, id, created_at FROM messages WHERE conversation_id = ? AND role = 'user' ORDER BY rowid DESC LIMIT 1",
+                (conversation_id,),
+            )
+            target = cursor.fetchone()
 
-    if target:
-        target_rowid = target["rowid"]
-        target_time = target["created_at"]
-        if include_self:
+        if target:
+            target_rowid = target["rowid"]
+            target_time = target["created_at"]
+            op = ">=" if include_self else ">"
             cursor.execute(
-                "DELETE FROM messages WHERE conversation_id = ? AND (created_at > ? OR (created_at = ? AND rowid >= ?))",
+                f"DELETE FROM messages WHERE conversation_id = ? AND (created_at > ? OR (created_at = ? AND rowid {op} ?))",
                 (conversation_id, target_time, target_time, target_rowid),
             )
-        else:
             cursor.execute(
-                "DELETE FROM messages WHERE conversation_id = ? AND (created_at > ? OR (created_at = ? AND rowid > ?))",
-                (conversation_id, target_time, target_time, target_rowid),
+                "UPDATE conversations SET updated_at = ? WHERE id = ?", (time.time(), conversation_id)
             )
-        cursor.execute(
-            "UPDATE conversations SET updated_at = ? WHERE id = ?", (time.time(), conversation_id)
-        )
-        conn.commit()
-    conn.close()
+            conn.commit()
 
 
 def get_token_stats(conversation_id: str) -> Dict[str, Any]:
@@ -920,52 +1278,51 @@ def get_token_stats(conversation_id: str) -> Dict[str, Any]:
             "google_search_totals": global_search_totals,
         }
 
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute(
-        """
-        SELECT COALESCE(SUM(google_search_requests), 0) as conv_searches
-        FROM token_ledger
-        WHERE conversation_id = ?
-    """,
-        (conversation_id,),
-    )
-    conv_search_row = cursor.fetchone()
-    conv_search_requests = int((conv_search_row["conv_searches"] if conv_search_row else 0) or 0)
+    with open_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT COALESCE(SUM(google_search_requests), 0) as conv_searches
+            FROM token_ledger
+            WHERE conversation_id = ?
+        """,
+            (conversation_id,),
+        )
+        conv_search_row = cursor.fetchone()
+        conv_search_requests = int((conv_search_row["conv_searches"] if conv_search_row else 0) or 0)
 
-    cursor.execute(
-        """
-        SELECT model_id, provider_id,
-               SUM(prompt_tokens) as total_in,
-               SUM(completion_tokens) as total_out,
-               SUM(cached_tokens) as total_cached
-        FROM token_ledger
-        WHERE conversation_id = ? AND (model_id != '' OR prompt_tokens > 0)
-        GROUP BY model_id, provider_id
-    """,
-        (conversation_id,),
-    )
-    rows = cursor.fetchall()
-
-    # Fallback to messages table if token_ledger has no records for this conversation
-    if not rows:
         cursor.execute(
             """
             SELECT model_id, provider_id,
                    SUM(prompt_tokens) as total_in,
                    SUM(completion_tokens) as total_out,
                    SUM(cached_tokens) as total_cached
-            FROM messages
-            WHERE conversation_id = ? AND role = 'assistant' AND (model_id != '' OR prompt_tokens > 0)
+            FROM token_ledger
+            WHERE conversation_id = ? AND (model_id != '' OR prompt_tokens > 0)
             GROUP BY model_id, provider_id
         """,
             (conversation_id,),
         )
         rows = cursor.fetchall()
 
-    cursor.execute("SELECT id, models_json FROM providers")
-    prov_rows = cursor.fetchall()
-    conn.close()
+        # Fallback to messages table if token_ledger has no records for this conversation
+        if not rows:
+            cursor.execute(
+                """
+                SELECT model_id, provider_id,
+                       SUM(prompt_tokens) as total_in,
+                       SUM(completion_tokens) as total_out,
+                       SUM(cached_tokens) as total_cached
+                FROM messages
+                WHERE conversation_id = ? AND role = 'assistant' AND (model_id != '' OR prompt_tokens > 0)
+                GROUP BY model_id, provider_id
+            """,
+                (conversation_id,),
+            )
+            rows = cursor.fetchall()
+
+        cursor.execute("SELECT id, models_json FROM providers")
+        prov_rows = cursor.fetchall()
 
     pricing_map: Dict[tuple[str, str], Dict[str, float]] = {}
     model_fallback_map: Dict[str, Dict[str, float]] = {}
@@ -1102,27 +1459,25 @@ def get_token_stats(conversation_id: str) -> Dict[str, Any]:
 
 
 def get_tabs_state() -> Optional[Dict[str, Any]]:
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT state_json FROM tab_sessions WHERE id = 1")
-    row = cursor.fetchone()
-    conn.close()
+    with open_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT state_json FROM tab_sessions WHERE id = 1")
+        row = cursor.fetchone()
     if row:
         return json.loads(row["state_json"])
     return None
 
 
 def save_tabs_state(state: Dict[str, Any]):
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute(
-        """
-        INSERT INTO tab_sessions (id, state_json, updated_at)
-        VALUES (1, ?, ?)
-        ON CONFLICT(id) DO UPDATE SET state_json=excluded.state_json, updated_at=excluded.updated_at
-    """,
-        (json.dumps(state), time.time()),
-    )
-    conn.commit()
-    conn.close()
+    with open_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO tab_sessions (id, state_json, updated_at)
+            VALUES (1, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET state_json=excluded.state_json, updated_at=excluded.updated_at
+        """,
+            (json.dumps(state), time.time()),
+        )
+        conn.commit()
 

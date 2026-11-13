@@ -1,3 +1,4 @@
+import ctypes
 import sys
 import threading
 from urllib.parse import urlparse
@@ -5,6 +6,37 @@ import webview
 from chatint.bridge import DesktopBridge
 from chatint.config import UI_DIR
 from chatint.db import init_db
+
+# Windows Single-Instance Mutex
+_MUTEX_HANDLE = None
+
+
+def _ensure_single_instance() -> bool:
+    """
+    Enforces a single running instance of ChatInt on Windows.
+    If another instance is already running, restores and brings its window
+    to the foreground, then exits this instance cleanly.
+    """
+    global _MUTEX_HANDLE
+    if sys.platform != "win32":
+        return True
+
+    try:
+        kernel32 = ctypes.windll.kernel32
+        user32 = ctypes.windll.user32
+        mutex_name = "ChatInt_SingleInstance_Mutex_Local"
+
+        _MUTEX_HANDLE = kernel32.CreateMutexW(None, True, mutex_name)
+        # ERROR_ALREADY_EXISTS = 183
+        if kernel32.GetLastError() == 183:
+            hwnd = user32.FindWindowW(None, "ChatInt")
+            if hwnd:
+                user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+                user32.SetForegroundWindow(hwnd)
+            return False
+    except Exception:
+        pass
+    return True
 
 
 def _prewarm_sdks():
@@ -39,66 +71,83 @@ _EXTERNAL_NAV_BAR_JS = r"""
     try { return new URL(window.location.href).hostname || 'Web Page'; }
     catch { return 'Web Page'; }
   })();
-  shadow.innerHTML = `
-    <style>
-      .bar {
-        display: inline-flex;
-        align-items: center;
-        gap: 6px;
-        padding: 5px 8px;
-        border-radius: 999px;
-        background: rgba(19, 19, 20, 0.92);
-        border: 1px solid rgba(255, 255, 255, 0.16);
-        box-shadow: 0 6px 20px rgba(0, 0, 0, 0.45);
-        backdrop-filter: blur(8px);
-        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-        color: #f0f4f9;
-        font-size: 12px;
-      }
-      .domain {
-        max-width: 150px;
-        overflow: hidden;
-        text-overflow: ellipsis;
-        white-space: nowrap;
-        color: #9aa0a6;
-        padding: 0 4px;
-        font-size: 11px;
-      }
-      button {
-        display: inline-flex;
-        align-items: center;
-        gap: 5px;
-        border: 1px solid rgba(255, 255, 255, 0.14);
-        background: #282a2c;
-        color: #f0f4f9;
-        border-radius: 999px;
-        padding: 4px 10px;
-        font-size: 11.5px;
-        font-weight: 500;
-        font-family: inherit;
-        cursor: pointer;
-        transition: background 0.14s, border-color 0.14s;
-      }
-      button:hover {
-        background: #333538;
-        border-color: #60b8ff;
-      }
-      .back-btn {
-        background: rgba(96, 184, 255, 0.16);
-        border-color: rgba(96, 184, 255, 0.45);
-        color: #8fd0ff;
-      }
-      .back-btn:hover {
-        background: rgba(96, 184, 255, 0.26);
-      }
-    </style>
-    <div class="bar">
-      <button type="button" class="back-btn" id="ci-back-btn" title="Back to Chat">&#8592; Back to Chat</button>
-      <span class="domain" id="ci-domain"></span>
-      <button type="button" id="ci-ext-btn" title="Open in Default Browser">Open in Browser &#8599;</button>
-    </div>
+  const style = document.createElement('style');
+  style.textContent = `
+    .bar {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 5px 8px;
+      border-radius: 999px;
+      background: rgba(19, 19, 20, 0.92);
+      border: 1px solid rgba(255, 255, 255, 0.16);
+      box-shadow: 0 6px 20px rgba(0, 0, 0, 0.45);
+      backdrop-filter: blur(8px);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      color: #f0f4f9;
+      font-size: 12px;
+    }
+    .domain {
+      max-width: 150px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      color: #9aa0a6;
+      padding: 0 4px;
+      font-size: 11px;
+    }
+    button {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      border: 1px solid rgba(255, 255, 255, 0.14);
+      background: #282a2c;
+      color: #f0f4f9;
+      border-radius: 999px;
+      padding: 4px 10px;
+      font-size: 11.5px;
+      font-weight: 500;
+      font-family: inherit;
+      cursor: pointer;
+      transition: background 0.14s, border-color 0.14s;
+    }
+    button:hover {
+      background: #333538;
+      border-color: #60b8ff;
+    }
+    .back-btn {
+      background: rgba(96, 184, 255, 0.16);
+      border-color: rgba(96, 184, 255, 0.45);
+      color: #8fd0ff;
+    }
+    .back-btn:hover {
+      background: rgba(96, 184, 255, 0.26);
+    }
   `;
-  shadow.getElementById('ci-domain').textContent = domain;
+
+  const bar = document.createElement('div');
+  bar.className = 'bar';
+
+  const backBtn = document.createElement('button');
+  backBtn.type = 'button';
+  backBtn.className = 'back-btn';
+  backBtn.title = 'Back to Chat';
+  backBtn.textContent = '\u2190 Back to Chat';
+
+  const domainSpan = document.createElement('span');
+  domainSpan.className = 'domain';
+  domainSpan.textContent = domain;
+
+  const extBtn = document.createElement('button');
+  extBtn.type = 'button';
+  extBtn.title = 'Open in Default Browser';
+  extBtn.textContent = 'Open in Browser \u2197';
+
+  bar.appendChild(backBtn);
+  bar.appendChild(domainSpan);
+  bar.appendChild(extBtn);
+  shadow.appendChild(style);
+  shadow.appendChild(bar);
 
   const callBridge = async (method, ...args) => {
     for (let i = 0; i < 30; i++) {
@@ -110,8 +159,8 @@ _EXTERNAL_NAV_BAR_JS = r"""
     return null;
   };
 
-  shadow.getElementById('ci-back-btn').onclick = () => callBridge('return_to_chat');
-  shadow.getElementById('ci-ext-btn').onclick = () => callBridge('open_external_url', window.location.href);
+  backBtn.onclick = () => callBridge('return_to_chat');
+  extBtn.onclick = () => callBridge('open_external_url', window.location.href);
   (document.body || document.documentElement).appendChild(host);
 })();
 """
@@ -159,6 +208,10 @@ def _attach_external_navigation_overlay(window: webview.Window, bridge: DesktopB
 
 
 def main():
+    # Enforce single instance: if another window is already open, focus it and exit
+    if not _ensure_single_instance():
+        sys.exit(0)
+
     # Start SDK background pre-warming thread immediately
     threading.Thread(target=_prewarm_sdks, daemon=True, name="sdk-prewarm").start()
 

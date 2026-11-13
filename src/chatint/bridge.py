@@ -13,9 +13,9 @@ from chatint.db import (
     delete_conversation,
     delete_messages_from,
     delete_provider as db_delete_provider,
+    duplicate_conversation as db_duplicate_conversation,
     get_api_key_from_env,
     get_app_settings,
-    get_connection,
     get_conversation,
     get_conversations,
     get_google_search_request_totals,
@@ -23,7 +23,9 @@ from chatint.db import (
     get_tabs_state,
     get_token_stats,
     get_web_search_models,
+    import_conversation_data as db_import_conversation_data,
     is_valid_provider_name,
+    open_db,
     save_app_settings,
     save_providers,
     save_tabs_state,
@@ -32,6 +34,129 @@ from chatint.db import (
     update_message,
 )
 from chatint.streamer import StreamManager, stream_chat_completion
+
+
+def parse_chat_file_content(content: str, filename: str = "") -> Dict[str, Any]:
+    """
+    Parses exported .json or .md chat content into a structured dictionary
+    containing title, system_prompt, max_context, and messages.
+    """
+    content_str = (content or "").strip()
+    if not content_str:
+        return {"title": "Imported Chat", "system_prompt": "", "max_context": 30, "messages": []}
+
+    # 1. Try parsing JSON first
+    try:
+        data = json.loads(content_str)
+        if isinstance(data, dict):
+            title = data.get("title") or (Path(filename).stem if filename else "") or "Imported Chat"
+            system_prompt = data.get("system_prompt") or ""
+            max_context = int(data.get("max_context_messages") or 30)
+            messages = [
+                {
+                    "role": m.get("role", "user"),
+                    "content": m.get("content", ""),
+                    "thinking_content": m.get("thinking_content", ""),
+                    "provider_id": m.get("provider_id", ""),
+                    "model_id": m.get("model_id", ""),
+                    "thinking_level": m.get("thinking_level", "none"),
+                }
+                for m in (data.get("messages") or [])
+                if isinstance(m, dict)
+            ]
+            return {
+                "title": title,
+                "system_prompt": system_prompt,
+                "max_context": max_context,
+                "messages": messages,
+            }
+        elif isinstance(data, list):
+            messages = [
+                {
+                    "role": m.get("role", "user"),
+                    "content": m.get("content", ""),
+                    "thinking_content": m.get("thinking_content", ""),
+                    "provider_id": m.get("provider_id", ""),
+                    "model_id": m.get("model_id", ""),
+                    "thinking_level": m.get("thinking_level", "none"),
+                }
+                for m in data
+                if isinstance(m, dict)
+            ]
+            return {
+                "title": (Path(filename).stem if filename else "") or "Imported Chat",
+                "system_prompt": "",
+                "max_context": 30,
+                "messages": messages,
+            }
+    except Exception:
+        pass
+
+    # 2. Parse Markdown format
+    title = ""
+    system_prompt = ""
+    messages = []
+
+    title_match = re.search(r"^#\s+(.+)$", content_str, re.MULTILINE)
+    if title_match:
+        title = title_match.group(1).strip()
+    if not title:
+        title = (Path(filename).stem if filename else "") or "Imported Chat"
+
+    sys_match = re.search(r"^>\s*\*\*System Prompt:\*\*\s*(.+)$", content_str, re.MULTILINE)
+    if sys_match:
+        system_prompt = sys_match.group(1).strip()
+
+    pattern = r"^###\s+(User|Assistant(?:\s*\([^)]*\))?)\s*$"
+    parts = re.split(pattern, content_str, flags=re.MULTILINE)
+
+    if len(parts) > 1:
+        for i in range(1, len(parts), 2):
+            header = parts[i].strip()
+            body = parts[i + 1].strip() if (i + 1) < len(parts) else ""
+
+            if header.lower().startswith("user"):
+                role = "user"
+                model_id = ""
+            else:
+                role = "assistant"
+                m_match = re.search(r"\((.*?)\)", header)
+                model_id = m_match.group(1).strip() if m_match else ""
+
+            thinking_content = ""
+            think_match = re.search(
+                r"<details><summary>Thought Process</summary>\s*([\s\S]*?)\s*</details>",
+                body,
+                re.IGNORECASE,
+            )
+            if think_match:
+                thinking_content = think_match.group(1).strip()
+                body = (body[:think_match.start()] + "\n" + body[think_match.end():]).strip()
+
+            messages.append({
+                "role": role,
+                "content": body,
+                "thinking_content": thinking_content,
+                "provider_id": "",
+                "model_id": model_id,
+                "thinking_level": "medium" if thinking_content else "none",
+            })
+    else:
+        messages.append({
+            "role": "user",
+            "content": content_str,
+            "thinking_content": "",
+            "provider_id": "",
+            "model_id": "",
+            "thinking_level": "none",
+        })
+
+    return {
+        "title": title,
+        "system_prompt": system_prompt,
+        "max_context": 30,
+        "messages": messages,
+    }
 
 
 class DesktopBridge:
@@ -171,12 +296,20 @@ class DesktopBridge:
     def get_conversation_token_stats(self, conv_id: str) -> Dict[str, Any]:
         return get_token_stats(conv_id)
 
+    def set_theme(self, theme: str) -> Dict[str, Any]:
+        """Persist only the active theme without touching providers or triggering model sync."""
+        clean_theme = "light" if str(theme or "").strip().lower() == "light" else "dark"
+        save_app_settings({"theme": clean_theme})
+        return {"success": True, "theme": clean_theme}
+
     def save_settings(
         self,
         providers: List[Dict[str, Any]],
         settings: Dict[str, str],
         web_search_models: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
+        old_by_id = {p["id"]: p for p in get_providers()}
+
         seen_names = set()
         for p in providers:
             pname = (p.get("name") or "").strip()
@@ -193,15 +326,59 @@ class DesktopBridge:
                 }
             seen_names.add(upper_name)
 
+        changed_provider_ids: List[str] = []
+        for p in providers:
+            pid = p["id"]
+            old_p = old_by_id.get(pid)
+            new_enabled = bool(p.get("is_enabled", True))
+            pname = (p.get("name") or "").strip()
+            is_native = pid.lower() in ("anthropic", "gemini") or pname.lower() in ("anthropic", "gemini")
+            new_url = "" if is_native else (p.get("base_url") or "")
+
+            key_changed = bool((p.get("api_key") is not None and str(p.get("api_key")).strip() != "") or p.get("clear_api_key"))
+            url_changed = bool(old_p and not is_native and new_url != (old_p.get("base_url") or ""))
+            name_changed = bool(old_p and pname.upper() != (old_p.get("name") or "").upper())
+            enabled_changed = bool(old_p and new_enabled != bool(old_p.get("is_enabled", True)))
+            needs_initial_verify = bool(
+                new_enabled
+                and old_p
+                and old_p.get("has_api_key")
+                and not BackgroundModelSyncer.is_provider_verified(pid)
+                and not p.get("clear_api_key")
+            )
+
+            if old_p is None or key_changed or url_changed or name_changed or enabled_changed or needs_initial_verify:
+                changed_provider_ids.append(pid)
+
         save_providers(providers)
         save_app_settings(settings)
         saved_ws = save_web_search_models(web_search_models) if web_search_models is not None else get_web_search_models()
-        BackgroundModelSyncer.start_background_sync(self)
+        BackgroundModelSyncer.start_background_sync(self, provider_ids=changed_provider_ids)
         return {"success": True, "providers": get_providers(), "web_search_models": saved_ws}
 
-    def fetch_provider_models(self, provider_id: str) -> Dict[str, Any]:
-        models, err, is_net = ClientManager.fetch_remote_models(provider_id, timeout=60.0)
-        sync_status, sync_error = BackgroundModelSyncer.get_sync_status(provider_id)
+    def fetch_provider_models(
+        self,
+        provider_id: str,
+        api_key: Optional[str] = None,
+        base_url: Optional[str] = None,
+        is_enabled: Optional[bool] = None,
+        clear_api_key: bool = False,
+    ) -> Dict[str, Any]:
+        models, err, is_net = ClientManager.fetch_remote_models(
+            provider_id,
+            timeout=60.0,
+            api_key=api_key,
+            base_url=base_url,
+            is_enabled=is_enabled,
+            clear_api_key=bool(clear_api_key),
+            update_sync_state=False,
+        )
+        if err:
+            sync_status, sync_error = BackgroundModelSyncer.classify_sync_error(err, is_net)
+        elif not models:
+            sync_status, sync_error = "error", "NO MODELS"
+        else:
+            sync_status, sync_error = "ready", ""
         return {
             "models": models,
             "fetched_model_ids": [m["id"] for m in models],
@@ -226,8 +403,63 @@ class DesktopBridge:
         return conv
 
     def rename_conversation(self, conv_id: str, title: str) -> Dict[str, Any]:
-        update_conversation(conv_id, title=title)
-        return {"success": True}
+        resolved_title = update_conversation(conv_id, title=title)
+        return {"success": True, "title": resolved_title or title}
+
+    def duplicate_conversation(self, conv_id: str) -> Dict[str, Any]:
+        conv = db_duplicate_conversation(conv_id)
+        if not conv:
+            return {"error": "Conversation not found"}
+        return {"success": True, "conversation": conv}
+
+    def open_import_chat_dialog(self) -> Dict[str, Any]:
+        if webview.windows:
+            try:
+                win = webview.windows[0]
+                dialog_type = getattr(webview, "FileDialog", None)
+                open_mode = dialog_type.OPEN if dialog_type and hasattr(dialog_type, "OPEN") else webview.OPEN_DIALOG
+                file_types = (
+                    "Supported Files (*.json;*.md)",
+                    "JSON Files (*.json)",
+                    "Markdown Files (*.md)",
+                    "All files (*.*)",
+                )
+                selected = win.create_file_dialog(open_mode, file_types=file_types)
+                if not selected:
+                    return {"cancelled": True}
+                if isinstance(selected, (list, tuple)):
+                    if len(selected) == 0:
+                        return {"cancelled": True}
+                    selected = selected[0]
+
+                p = Path(str(selected))
+                if not p.exists():
+                    return {"error": "File does not exist."}
+                content = p.read_text(encoding="utf-8")
+                parsed = parse_chat_file_content(content, filename=p.name)
+                new_conv = db_import_conversation_data(
+                    title=parsed["title"],
+                    system_prompt=parsed["system_prompt"],
+                    max_context=parsed["max_context"],
+                    messages=parsed["messages"],
+                )
+                return {"success": True, "conversation": new_conv}
+            except Exception as e:
+                return {"error": f"Failed to open file: {str(e)}"}
+        return {"fallback": True}
+
+    def import_conversation_content(self, content: str, filename: str = "") -> Dict[str, Any]:
+        try:
+            parsed = parse_chat_file_content(content, filename=filename)
+            new_conv = db_import_conversation_data(
+                title=parsed["title"],
+                system_prompt=parsed["system_prompt"],
+                max_context=parsed["max_context"],
+                messages=parsed["messages"],
+            )
+            return {"success": True, "conversation": new_conv}
+        except Exception as e:
+            return {"error": f"Failed to import chat: {str(e)}"}
 
     def update_conversation_settings(
         self, conv_id: str, system_prompt: str, max_context_messages: int
@@ -409,14 +641,23 @@ class DesktopBridge:
     ) -> Dict[str, Any]:
         """Edits user message, deletes any subsequent messages, and triggers new completion."""
         if message_id.startswith("user_temp_") or not message_id:
-            conn = get_connection()
-            row = conn.execute(
-                "SELECT id FROM messages WHERE conversation_id = ? AND role = 'user' ORDER BY rowid DESC LIMIT 1",
-                (conversation_id,),
+            with open_db() as conn:
+                row = conn.execute(
+                    "SELECT id FROM messages WHERE conversation_id = ? AND role = 'user' ORDER BY rowid DESC LIMIT 1",
+                    (conversation_id,),
+                ).fetchone()
+            message_id = row["id"] if row else ""
+
+        if not message_id:
+            return {"error": "Message not found"}
+
+        with open_db() as conn:
+            existing = conn.execute(
+                "SELECT id FROM messages WHERE id = ? AND conversation_id = ?",
+                (message_id, conversation_id),
             ).fetchone()
-            conn.close()
-            if row:
-                message_id = row["id"]
+        if not existing:
+            return {"error": "Message not found"}
 
         delete_messages_from(conversation_id, message_id, include_self=False)
         update_message(
