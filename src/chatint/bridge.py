@@ -1,15 +1,28 @@
+from __future__ import annotations
+
 import collections
 import functools
 import json
+import os
+from pathlib import Path
 import re
+import subprocess
+import sys
 import threading
+from typing import Any, Dict, List, Optional
 import urllib.parse
+import urllib.request
 import uuid
 import webbrowser
-from pathlib import Path
-from typing import Any, Dict, List, Optional
+
 import webview
-from chatint.client_manager import BackgroundModelSyncer, ClientManager
+
+from chatint.client_manager import (
+    BackgroundModelSyncer,
+    ClientManager,
+    is_loopback_endpoint,
+    normalize_endpoint_origin,
+)
 from chatint.db import (
     add_message,
     create_conversation,
@@ -27,6 +40,8 @@ from chatint.db import (
     get_token_stats,
     get_web_search_models,
     import_conversation_data as db_import_conversation_data,
+    is_default_conversation_title,
+    is_saved_secret_non_placeholder,
     is_valid_provider_name,
     mask_api_key,
     open_db,
@@ -37,11 +52,46 @@ from chatint.db import (
     update_conversation,
     update_message,
 )
-from chatint.logging_setup import get_logger
+from chatint.logging_setup import get_logger, get_logs_dir
+from chatint.services.import_export import (
+    format_conversation_markdown,
+    parse_chat_file_content,
+    read_chat_file_safely,
+)
 from chatint.streamer import StreamManager, stream_chat_completion
 
 _logger = get_logger("chatint.bridge")
 _VALID_THINKING_LEVELS = {"none", "minimal", "low", "medium", "high", "xhigh", "max"}
+
+PUBLIC_RPC_METHODS: tuple[str, ...] = (
+    "return_to_chat",
+    "open_external_url",
+    "open_logs_folder",
+    "get_pending_events",
+    "get_initial_data",
+    "add_provider",
+    "delete_provider",
+    "get_provider_api_key",
+    "get_conversation_token_stats",
+    "set_theme",
+    "save_settings",
+    "fetch_provider_models",
+    "create_conversation",
+    "get_conversations",
+    "get_conversation",
+    "rename_conversation",
+    "duplicate_conversation",
+    "open_import_chat_dialog",
+    "import_conversation_content",
+    "update_conversation_settings",
+    "delete_conversation",
+    "export_conversation",
+    "save_tabs_state",
+    "send_message",
+    "regenerate_message",
+    "edit_message",
+    "stop_streaming",
+)
 
 
 def _clamp_max_context(value: Any, default: int = 30) -> int:
@@ -57,9 +107,52 @@ def _normalize_thinking_level(level: Any) -> str:
     return val if val in _VALID_THINKING_LEVELS else "none"
 
 
-def _sanitize_msg_role(role: Any) -> str:
-    val = str(role or "user").strip().lower()
-    return val if val in ("user", "assistant", "system") else "user"
+def _normalize_file_uri_key(url: str) -> str:
+    parsed = urllib.parse.urlparse((url or "").strip())
+    raw_path = urllib.parse.unquote(parsed.path or "")
+    try:
+        fs_path = Path(urllib.request.url2pathname(raw_path))
+        if fs_path.exists():
+            return str(fs_path.resolve()).replace("\\", "/").lower()
+    except Exception:
+        pass
+    norm = re.sub(r"^/+([a-zA-Z]:/)", r"\1", raw_path.replace("\\", "/"))
+    return norm.rstrip("/").lower()
+
+
+def wrap_rpc_envelope(raw_result: Any) -> Dict[str, Any]:
+    """Normalize any DesktopBridge return payload into a uniform `{ok, data, error}` DTO envelope."""
+    if (
+        isinstance(raw_result, dict)
+        and "ok" in raw_result
+        and "data" in raw_result
+        and "error" in raw_result
+        and isinstance(raw_result["ok"], bool)
+    ):
+        return raw_result
+
+    if isinstance(raw_result, dict):
+        # `fetch_provider_models` returns preview metadata including `models` + `sync_status` + optional `error`
+        if "models" in raw_result and "sync_status" in raw_result:
+            err_val = raw_result.get("error")
+            return {
+                "ok": not bool(err_val),
+                "data": raw_result,
+                "error": str(err_val) if err_val else None,
+            }
+        if raw_result.get("success") is False or (raw_result.get("error") and raw_result.get("success") is not True):
+            err_msg = str(raw_result.get("error") or "Operation failed.")
+            return {
+                "ok": False,
+                "data": raw_result,
+                "error": err_msg,
+            }
+
+    return {
+        "ok": True,
+        "data": raw_result,
+        "error": None,
+    }
 
 
 def _guarded_rpc(fn):
@@ -67,237 +160,150 @@ def _guarded_rpc(fn):
     def wrapper(self, *args, **kwargs):
         self._require_trusted_origin()
         return fn(self, *args, **kwargs)
+
     return wrapper
 
 
-def parse_chat_file_content(content: str, filename: str = "") -> Dict[str, Any]:
+def make_public_bridge_api(bridge: DesktopBridge) -> Any:
     """
-    Parses exported .json or .md chat content into a structured dictionary
-    containing title, system_prompt, max_context, and messages.
+    Build a sealed JS-facing RPC object exposing ONLY whitelisted `PUBLIC_RPC_METHODS`.
+    - Contains zero instance attributes (`__slots__ = ()`), closing over `bridge` in function cells.
+    - Blocks attribute traversal (`__getattribute__` whitelist) so `pywebview`'s `get_nested_attribute`
+      cannot reach `attach_window`, `set_origin_trusted`, `push_event`, `_window`, or dunder internals.
+    - Wraps every RPC response in a uniform `{"ok": bool, "data": ..., "error": Optional[str]}` DTO.
     """
-    content_str = (content or "").strip()
-    if not content_str:
-        return {"title": "Imported Chat", "system_prompt": "", "max_context": 30, "messages": []}
+    allowed_set = frozenset(PUBLIC_RPC_METHODS)
+    namespace: Dict[str, Any] = {"__slots__": ()}
 
-    # 1. Try parsing JSON first
-    try:
-        data = json.loads(content_str)
-        if isinstance(data, dict):
-            title = data.get("title") or (Path(filename).stem if filename else "") or "Imported Chat"
-            system_prompt = data.get("system_prompt") or ""
-            max_context = _clamp_max_context(data.get("max_context_messages"), default=30)
-            messages = [
-                {
-                    "role": _sanitize_msg_role(m.get("role", "user")),
-                    "content": str(m.get("content", "") or ""),
-                    "thinking_content": str(m.get("thinking_content", "") or ""),
-                    "provider_id": str(m.get("provider_id", "") or ""),
-                    "model_id": str(m.get("model_id", "") or ""),
-                    "thinking_level": _normalize_thinking_level(m.get("thinking_level", "none")),
-                    **({"created_at": float(m["created_at"])} if isinstance(m.get("created_at"), (int, float)) else {}),
-                }
-                for m in (data.get("messages") or [])
-                if isinstance(m, dict)
-            ]
-            return {
-                "title": title,
-                "system_prompt": system_prompt,
-                "max_context": max_context,
-                "messages": messages,
-            }
-        elif isinstance(data, list):
-            messages = [
-                {
-                    "role": _sanitize_msg_role(m.get("role", "user")),
-                    "content": str(m.get("content", "") or ""),
-                    "thinking_content": str(m.get("thinking_content", "") or ""),
-                    "provider_id": str(m.get("provider_id", "") or ""),
-                    "model_id": str(m.get("model_id", "") or ""),
-                    "thinking_level": _normalize_thinking_level(m.get("thinking_level", "none")),
-                    **({"created_at": float(m["created_at"])} if isinstance(m.get("created_at"), (int, float)) else {}),
-                }
-                for m in data
-                if isinstance(m, dict)
-            ]
-            return {
-                "title": (Path(filename).stem if filename else "") or "Imported Chat",
-                "system_prompt": "",
-                "max_context": 30,
-                "messages": messages,
-            }
-    except Exception:
-        pass
+    def _make_endpoint(method_name: str):
+        target_unbound = getattr(DesktopBridge, method_name)
 
-    # 2. Parse Markdown format (fence-aware & multi-line system prompt support)
-    title = ""
-    system_lines: List[str] = []
-    messages: List[Dict[str, Any]] = []
+        @functools.wraps(target_unbound)
+        def _rpc_endpoint(self, *args, **kwargs):
+            try:
+                raw = getattr(bridge, method_name)(*args, **kwargs)
+                return wrap_rpc_envelope(raw)
+            except PermissionError:
+                raise
+            except Exception as exc:
+                _logger.warning("RPC error in %s: %s", method_name, exc)
+                return {"ok": False, "data": None, "error": str(exc)}
 
-    raw_lines = content_str.splitlines()
-    in_fence_char = ""
-    in_fence_len = 0
-    in_details = False
-    collecting_sys_quote = False
-    current_role: Optional[str] = None
-    current_model_id = ""
-    current_body_lines: List[str] = []
+        return _rpc_endpoint
 
-    def _flush_current_message():
-        if current_role is None:
-            return
-        body = "\n".join(current_body_lines).strip()
-        thinking_content = ""
-        think_match = re.search(
-            r"<details>\s*<summary>\s*Thought Process\s*</summary>\s*([\s\S]*?)\s*</details>",
-            body,
-            re.IGNORECASE,
-        )
-        if think_match:
-            thinking_content = think_match.group(1).strip()
-            body = (body[:think_match.start()] + "\n" + body[think_match.end():]).strip()
-        messages.append({
-            "role": current_role,
-            "content": body,
-            "thinking_content": thinking_content,
-            "provider_id": "",
-            "model_id": current_model_id,
-            "thinking_level": "medium" if thinking_content else "none",
-        })
+    for m_name in PUBLIC_RPC_METHODS:
+        namespace[m_name] = _make_endpoint(m_name)
 
-    header_re = re.compile(r"^###\s+(User|Assistant(?:\s*\((.+)\))?)\s*$", re.IGNORECASE)
-    sys_start_re = re.compile(r"^>\s*\*\*System Prompt:\*\*\s*(.*)$")
+    def _dir(self) -> List[str]:
+        return list(PUBLIC_RPC_METHODS)
 
-    for line in raw_lines:
-        stripped = line.strip()
+    def _getattribute(self, name: str) -> Any:
+        if name in allowed_set:
+            return object.__getattribute__(self, name)
+        raise AttributeError(f"RPC attribute '{name}' is not exposed.")
 
-        # Track fenced code blocks so ### headings inside examples never split messages
-        fence_match = re.match(r"^(`{3,}|~{3,})", stripped)
-        if fence_match:
-            f_str = fence_match.group(1)
-            if not in_fence_char:
-                in_fence_char = f_str[0]
-                in_fence_len = len(f_str)
-            elif f_str[0] == in_fence_char and len(f_str) >= in_fence_len and stripped == f_str:
-                in_fence_char = ""
-                in_fence_len = 0
+    namespace["__dir__"] = _dir
+    namespace["__getattribute__"] = _getattribute
 
-        if not in_fence_char:
-            if not in_details and re.search(r"<details>\s*<summary>\s*Thought Process\s*</summary>", line, re.IGNORECASE):
-                in_details = True
-            if in_details and "</details>" in line.lower():
-                if current_role is not None:
-                    current_body_lines.append(line)
-                in_details = False
-                continue
-
-            if current_role is None:
-                if not title:
-                    t_match = re.match(r"^#\s+(.+)$", line)
-                    if t_match:
-                        title = t_match.group(1).strip()
-                        continue
-                s_match = sys_start_re.match(line)
-                if s_match:
-                    collecting_sys_quote = True
-                    first_part = s_match.group(1).strip()
-                    if first_part:
-                        system_lines.append(first_part)
-                    continue
-                if collecting_sys_quote:
-                    if line.startswith(">"):
-                        cont = re.sub(r"^>\s?", "", line)
-                        system_lines.append(cont)
-                        continue
-                    else:
-                        collecting_sys_quote = False
-
-            if not in_details:
-                h_match = header_re.match(stripped)
-                if h_match:
-                    collecting_sys_quote = False
-                    _flush_current_message()
-                    if h_match.group(1).lower().startswith("user"):
-                        current_role = "user"
-                        current_model_id = ""
-                    else:
-                        current_role = "assistant"
-                        current_model_id = (h_match.group(2) or "").strip()
-                    current_body_lines = []
-                    continue
-
-        if current_role is not None:
-            current_body_lines.append(line)
-
-    _flush_current_message()
-
-    if not title:
-        title = (Path(filename).stem if filename else "") or "Imported Chat"
-    system_prompt = "\n".join(system_lines).strip()
-
-    if not messages:
-        messages.append({
-            "role": "user",
-            "content": content_str,
-            "thinking_content": "",
-            "provider_id": "",
-            "model_id": "",
-            "thinking_level": "none",
-        })
-
-    return {
-        "title": title,
-        "system_prompt": system_prompt,
-        "max_context": 30,
-        "messages": messages,
-    }
+    SealedBridgeApi = type("PublicBridgeApi", (object,), namespace)
+    return SealedBridgeApi()
 
 
 class DesktopBridge:
-    def __init__(self):
+    def __init__(self, *, allow_headless_rpc: bool = True):
         self._event_queue = collections.deque()
         self._queue_lock = threading.Lock()
         self._window: Optional[Any] = None
+        self._window_ever_attached: bool = False
+        self._allow_headless_rpc: bool = bool(allow_headless_rpc)
         self._index_url: str = ""
-        self._allowed_origin: Optional[tuple[str, str]] = None
+        self._allowed_origin: Optional[tuple[str, str, Optional[int]]] = None
         self._origin_trusted: bool = True
+        self._public_api: Optional[Any] = None
+        self._tabs_lock = threading.Lock()
+        self._latest_tabs_state: Optional[Dict[str, Any]] = None
+        self._tabs_state_dirty: bool = False
 
-    def attach_window(
+    def as_public_api(self) -> Any:
+        """Return the sealed `PublicBridgeApi` instance safe to pass to `webview.create_window(js_api=...)`."""
+        if self._public_api is None:
+            self._public_api = make_public_bridge_api(self)
+        return self._public_api
+
+    def _attach_window(
         self,
         window: Any,
         index_url: str,
-        allowed_origin: Optional[tuple[str, str]] = None,
-    ):
+        allowed_origin: Optional[tuple] = None,
+    ) -> None:
+        if window is not None:
+            self._window_ever_attached = True
         self._window = window
-        self._index_url = index_url
+        self._index_url = (index_url or "").strip()
         self._origin_trusted = True
         if allowed_origin is not None:
-            self._allowed_origin = allowed_origin
-        elif index_url:
-            parsed = urllib.parse.urlparse(index_url)
+            if len(allowed_origin) == 2:
+                scheme_s, netloc_s = str(allowed_origin[0]).lower(), str(allowed_origin[1]).lower()
+                parsed_nl = urllib.parse.urlparse(f"{scheme_s}://{netloc_s}") if netloc_s else None
+                host_s = (parsed_nl.hostname or "").lower() if parsed_nl else ""
+                port_i = parsed_nl.port if parsed_nl else None
+                self._allowed_origin = (scheme_s, host_s, port_i)
+            else:
+                self._allowed_origin = (
+                    str(allowed_origin[0]).lower(),
+                    str(allowed_origin[1] or "").lower(),
+                    allowed_origin[2],
+                )
+        elif self._index_url:
+            parsed = urllib.parse.urlparse(self._index_url)
             if parsed.scheme:
-                self._allowed_origin = (parsed.scheme.lower(), parsed.netloc.lower())
+                self._allowed_origin = (
+                    parsed.scheme.lower(),
+                    (parsed.hostname or "").lower(),
+                    parsed.port,
+                )
 
-    def set_origin_trusted(self, trusted: bool):
+    # Python-side backwards-compatible alias for unit tests (never exposed on PublicBridgeApi)
+    attach_window = _attach_window
+
+    def _set_origin_trusted(self, trusted: bool) -> None:
         self._origin_trusted = bool(trusted)
+
+    set_origin_trusted = _set_origin_trusted
 
     def _is_url_trusted(self, current_url: str) -> bool:
         if not current_url:
             return False
-        parsed = urllib.parse.urlparse(current_url)
-        scheme = parsed.scheme.lower()
-        netloc = parsed.netloc.lower()
-        if self._allowed_origin is not None:
-            if (scheme, netloc) == self._allowed_origin:
-                if scheme == "file":
-                    return urllib.parse.unquote(parsed.path).replace("\\", "/").lower().endswith("/ui/index.html")
-                return True
-            if self._allowed_origin[0] == "file" and parsed.hostname in ("127.0.0.1", "localhost"):
-                return urllib.parse.unquote(parsed.path).lower().endswith(("/index.html", "/"))
+        parsed = urllib.parse.urlparse(current_url.strip())
+        scheme = (parsed.scheme or "").lower()
+        host = (parsed.hostname or "").lower()
+        try:
+            port = parsed.port
+        except ValueError:
             return False
-        return current_url == self._index_url
 
-    def _require_trusted_origin(self):
+        if self._allowed_origin is None:
+            return bool(self._index_url) and current_url.strip() == self._index_url
+
+        allowed_scheme, allowed_host, allowed_port = self._allowed_origin
+
+        if allowed_scheme == "file":
+            if scheme != "file":
+                return False
+            if not self._index_url:
+                return False
+            return _normalize_file_uri_key(current_url) == _normalize_file_uri_key(self._index_url)
+
+        if scheme != allowed_scheme or host != allowed_host or port != allowed_port:
+            return False
+
+        clean_path = urllib.parse.unquote(parsed.path or "").replace("\\", "/")
+        return clean_path in ("", "/", "/index.html")
+
+    def _require_trusted_origin(self) -> None:
         if self._window is None:
+            if self._window_ever_attached or not self._allow_headless_rpc:
+                raise PermissionError("Blocked RPC call: window not attached.")
             return
         if not self._origin_trusted:
             raise PermissionError("Blocked RPC call from untrusted window state.")
@@ -305,8 +311,9 @@ class DesktopBridge:
             current_url = str(self._window.get_current_url() or "").strip()
         except Exception:
             current_url = ""
-        if current_url and not self._is_url_trusted(current_url):
-            _logger.warning("Blocked RPC from untrusted URL: %s", current_url)
+        # Fail CLOSED on empty/missing URL or origin mismatch (fixes C1 fail-open bug)
+        if not current_url or not self._is_url_trusted(current_url):
+            _logger.warning("Blocked RPC from untrusted or empty URL: %r", current_url)
             raise PermissionError("Blocked RPC call from untrusted origin.")
 
     @_guarded_rpc
@@ -319,29 +326,48 @@ class DesktopBridge:
 
     @_guarded_rpc
     def open_external_url(self, url: str = "") -> Dict[str, Any]:
-        """Validate and open an HTTP/HTTPS URL in the system's default browser."""
+        """Validate and open an HTTP/HTTPS/mailto URL in the system's default handler."""
         target = (url or "").strip()
         if not target or any(ch.isspace() or ord(ch) < 32 for ch in target):
             return {"success": False, "error": "Invalid URL."}
         parsed = urllib.parse.urlparse(target)
-        if parsed.scheme.lower() not in ("http", "https") or not parsed.netloc:
-            return {"success": False, "error": "Only HTTP/HTTPS URLs can be opened externally."}
+        scheme = parsed.scheme.lower()
+        if scheme in ("http", "https"):
+            if not parsed.netloc:
+                return {"success": False, "error": "Invalid HTTP/HTTPS URL."}
+        elif scheme == "mailto":
+            if not parsed.path or "@" not in parsed.path:
+                return {"success": False, "error": "Invalid mailto address."}
+        else:
+            return {"success": False, "error": "Only HTTP, HTTPS, or mailto links can be opened externally."}
         webbrowser.open(target)
         return {"success": True}
 
-    def push_event(self, event_data: Dict[str, Any]):
-        """
-        Thread-safe memory event append. Takes 0.001ms, never blocks or deadlocks.
-        """
+    @_guarded_rpc
+    def open_logs_folder(self) -> Dict[str, Any]:
+        """Open the application logs directory (`data/logs`) in the OS file manager."""
+        logs_dir = get_logs_dir()
+        try:
+            if sys.platform == "win32":
+                os.startfile(str(logs_dir))  # type: ignore[attr-defined]
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(logs_dir)])
+            else:
+                subprocess.Popen(["xdg-open", str(logs_dir)])
+            return {"success": True, "path": str(logs_dir)}
+        except Exception as exc:
+            _logger.warning("Failed to open logs folder %s: %s", logs_dir, exc)
+            return {"success": False, "error": f"Could not open logs folder: {exc}", "path": str(logs_dir)}
+
+    def _push_event(self, event_data: Dict[str, Any]) -> None:
         with self._queue_lock:
             self._event_queue.append(event_data)
 
+    push_event = _push_event
+
     @_guarded_rpc
     def get_pending_events(self) -> List[Dict[str, Any]]:
-        """
-        Frontend poll endpoint for real-time events.
-        Coalesces consecutive chunk events for the same tab and stream_id to minimize DOM re-renders.
-        """
+        """Drain queued events, coalescing consecutive chunks for the same tab, conversation, and stream_id."""
         with self._queue_lock:
             raw_events = list(self._event_queue)
             self._event_queue.clear()
@@ -392,9 +418,7 @@ class DesktopBridge:
         for m in history:
             role = m.get("role", "user")
             raw_content = m.get("content", "")
-            content = raw_content if (raw_content or "").strip() else (
-                "[Response stopped]" if role == "assistant" else ""
-            )
+            content = raw_content if (raw_content or "").strip() else ("[Response stopped]" if role == "assistant" else "")
             if not content:
                 continue
             if context_msgs and context_msgs[-1]["role"] == role and role in ("user", "assistant"):
@@ -407,10 +431,6 @@ class DesktopBridge:
 
     @_guarded_rpc
     def get_initial_data(self) -> Dict[str, Any]:
-        """
-        Loads all essential bootstrap data for the app instantly without blocking UI.
-        Launches background fetch with 60s TTL and auto-retry upon connectivity.
-        """
         providers = get_providers()
         settings = get_app_settings()
         conversations = get_conversations()
@@ -423,20 +443,45 @@ class DesktopBridge:
             "tabs_state": tabs_state,
             "google_search_totals": get_google_search_request_totals(),
             "web_search_models": get_web_search_models(),
+            "logs_dir": str(get_logs_dir()),
         }
 
     @_guarded_rpc
     def add_provider(self, provider: Dict[str, Any]) -> Dict[str, Any]:
-        """Adds a new custom provider."""
+        """Add a validated custom provider (fixes NEW-M6)."""
+        if not isinstance(provider, dict):
+            return {"success": False, "error": "Invalid provider payload."}
+        pname = str(provider.get("name") or "").strip()
+        if not is_valid_provider_name(pname):
+            return {
+                "success": False,
+                "error": (
+                    f"Invalid provider name '{pname}'. Provider names may only contain English alphabet letters "
+                    "(A-Z, a-z) with no spaces, dashes, underscores, numbers, or special characters."
+                ),
+            }
         providers = get_providers()
-        providers.append(provider)
+        if any((p.get("name") or "").strip().upper() == pname.upper() for p in providers):
+            return {
+                "success": False,
+                "error": f"Duplicate provider name '{pname}'. No two providers can share the same name.",
+            }
+        new_id = str(provider.get("id") or f"provider_{uuid.uuid4().hex[:10]}").strip()
+        clean_entry = {
+            "id": new_id,
+            "name": pname,
+            "base_url": str(provider.get("base_url") or "").strip(),
+            "api_key": provider.get("api_key", ""),
+            "is_enabled": bool(provider.get("is_enabled", True)),
+            "models": provider.get("models") if isinstance(provider.get("models"), list) else [],
+        }
+        providers.append(clean_entry)
         save_providers(providers)
-        BackgroundModelSyncer.start_background_sync(self)
+        BackgroundModelSyncer.start_background_sync(self, provider_ids=[new_id])
         return {"success": True, "providers": get_providers()}
 
     @_guarded_rpc
     def delete_provider(self, provider_id: str) -> Dict[str, Any]:
-        """Removes a provider."""
         db_delete_provider(provider_id)
         return {"success": True, "providers": get_providers()}
 
@@ -452,7 +497,6 @@ class DesktopBridge:
 
     @_guarded_rpc
     def set_theme(self, theme: str) -> Dict[str, Any]:
-        """Persist only the active theme without touching providers or triggering model sync."""
         clean_theme = "light" if str(theme or "").strip().lower() == "light" else "dark"
         save_app_settings({"theme": clean_theme})
         return {"success": True, "theme": clean_theme}
@@ -464,21 +508,32 @@ class DesktopBridge:
         settings: Dict[str, str],
         web_search_models: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
-        old_by_id = {p["id"]: p for p in get_providers()}
+        if not isinstance(providers, list) or not isinstance(settings, dict):
+            return {"success": False, "error": "Invalid settings payload."}
+
+        old_providers = get_providers()
+        old_by_id = {p["id"]: p for p in old_providers}
 
         seen_names = set()
         for p in providers:
+            if not isinstance(p, dict) or not p.get("id"):
+                return {"success": False, "error": "Invalid provider entry."}
             pname = (p.get("name") or "").strip()
             if not is_valid_provider_name(pname):
                 return {
                     "success": False,
-                    "error": f"Invalid provider name '{pname}'. Provider names may only contain English alphabet letters (A-Z, a-z) with no spaces, dashes, underscores, numbers, or special characters.",
+                    "error": (
+                        f"Invalid provider name '{pname}'. Provider names may only contain English alphabet letters "
+                        "(A-Z, a-z) with no spaces, dashes, underscores, numbers, or special characters."
+                    ),
                 }
             upper_name = pname.upper()
             if upper_name in seen_names:
                 return {
                     "success": False,
-                    "error": f"Duplicate provider name '{pname}'. No two providers can have the same name (case-insensitive).",
+                    "error": (
+                        f"Duplicate provider name '{pname}'. No two providers can have the same name (case-insensitive)."
+                    ),
                 }
             seen_names.add(upper_name)
 
@@ -489,9 +544,27 @@ class DesktopBridge:
             new_enabled = bool(p.get("is_enabled", True))
             pname = (p.get("name") or "").strip()
             is_native = pid.lower() in ("anthropic", "gemini") or pname.lower() in ("anthropic", "gemini")
-            new_url = "" if is_native else (p.get("base_url") or "")
+            new_url = "" if is_native else str(p.get("base_url") or "").strip()
 
-            key_changed = bool((p.get("api_key") is not None and str(p.get("api_key")).strip() != "") or p.get("clear_api_key"))
+            has_new_typed_key = p.get("api_key") is not None and str(p.get("api_key")).strip() != ""
+            is_clearing_key = bool(p.get("clear_api_key")) and not has_new_typed_key
+            key_changed = has_new_typed_key or is_clearing_key
+
+            # Host-bound secret protection (C2): block changing base_url host while keeping an existing saved secret!
+            if old_p is not None and not is_native:
+                old_origin = normalize_endpoint_origin(old_p.get("base_url"), pid)
+                new_origin = normalize_endpoint_origin(new_url, pid)
+                if old_origin != new_origin and not has_new_typed_key and not is_clearing_key:
+                    saved_secret = get_api_key_from_env(old_p.get("name", ""))
+                    if is_saved_secret_non_placeholder(saved_secret) and not is_loopback_endpoint(new_url):
+                        return {
+                            "success": False,
+                            "error": (
+                                f"Cannot change Base URL host for '{pname}' while keeping its existing saved API key. "
+                                "Please enter the API key for the new endpoint or click 'Clear Key' first."
+                            ),
+                        }
+
             url_changed = bool(old_p and not is_native and new_url != (old_p.get("base_url") or ""))
             name_changed = bool(old_p and pname.upper() != (old_p.get("name") or "").upper())
             enabled_changed = bool(old_p and new_enabled != bool(old_p.get("is_enabled", True)))
@@ -500,15 +573,23 @@ class DesktopBridge:
                 and old_p
                 and old_p.get("has_api_key")
                 and not BackgroundModelSyncer.is_provider_verified(pid)
-                and not p.get("clear_api_key")
+                and not is_clearing_key
             )
 
             if old_p is None or key_changed or url_changed or name_changed or enabled_changed or needs_initial_verify:
                 changed_provider_ids.append(pid)
 
+        try:
+            save_app_settings(settings)
+        except ValueError as exc:
+            return {"success": False, "error": str(exc)}
+
         save_providers(providers)
-        save_app_settings(settings)
-        saved_ws = save_web_search_models(web_search_models) if web_search_models is not None else get_web_search_models()
+        saved_ws = (
+            save_web_search_models(web_search_models)
+            if web_search_models is not None
+            else get_web_search_models()
+        )
         BackgroundModelSyncer.start_background_sync(self, provider_ids=changed_provider_ids)
         return {"success": True, "providers": get_providers(), "web_search_models": saved_ws}
 
@@ -520,16 +601,20 @@ class DesktopBridge:
         base_url: Optional[str] = None,
         is_enabled: Optional[bool] = None,
         clear_api_key: bool = False,
+        provider_name: Optional[str] = None,
     ) -> Dict[str, Any]:
-        models, err, is_net = ClientManager.fetch_remote_models(
-            provider_id,
-            timeout=60.0,
-            api_key=api_key,
-            base_url=base_url,
-            is_enabled=is_enabled,
-            clear_api_key=bool(clear_api_key),
-            update_sync_state=False,
-        )
+        kw: Dict[str, Any] = {
+            "timeout": 60.0,
+            "api_key": api_key,
+            "base_url": base_url,
+            "is_enabled": is_enabled,
+            "clear_api_key": bool(clear_api_key),
+            "update_sync_state": False,
+        }
+        if provider_name is not None:
+            kw["provider_name"] = provider_name
+
+        models, err, is_net = ClientManager.fetch_remote_models(provider_id, **kw)
         if err:
             sync_status, sync_error = BackgroundModelSyncer.classify_sync_error(err, is_net)
         elif not models:
@@ -548,12 +633,11 @@ class DesktopBridge:
     def create_conversation(
         self, title: str = "New Chat", system_prompt: str = "", max_context: int = 30
     ) -> Dict[str, Any]:
-        conv = create_conversation(
+        return create_conversation(
             title=title,
             system_prompt=system_prompt,
             max_context=_clamp_max_context(max_context, default=30),
         )
-        return conv
 
     @_guarded_rpc
     def get_conversations(self) -> List[Dict[str, Any]]:
@@ -600,19 +684,18 @@ class DesktopBridge:
                     selected = selected[0]
 
                 p = Path(str(selected))
-                if not p.exists():
-                    return {"error": "File does not exist."}
-                content = p.read_text(encoding="utf-8")
+                content = read_chat_file_safely(p)
                 parsed = parse_chat_file_content(content, filename=p.name)
                 new_conv = db_import_conversation_data(
                     title=parsed["title"],
                     system_prompt=parsed["system_prompt"],
                     max_context=parsed["max_context"],
                     messages=parsed["messages"],
+                    created_at=parsed.get("created_at"),
                 )
                 return {"success": True, "conversation": new_conv}
             except Exception as e:
-                return {"error": f"Failed to open file: {str(e)}"}
+                return {"error": f"Failed to open file: {e}"}
         return {"fallback": True}
 
     @_guarded_rpc
@@ -624,10 +707,11 @@ class DesktopBridge:
                 system_prompt=parsed["system_prompt"],
                 max_context=parsed["max_context"],
                 messages=parsed["messages"],
+                created_at=parsed.get("created_at"),
             )
             return {"success": True, "conversation": new_conv}
         except Exception as e:
-            return {"error": f"Failed to import chat: {str(e)}"}
+            return {"error": f"Failed to import chat: {e}"}
 
     @_guarded_rpc
     def update_conversation_settings(
@@ -658,22 +742,7 @@ class DesktopBridge:
             ext = "json"
             file_types = ("JSON Files (*.json)", "All files (*.*)")
         else:
-            # Markdown format
-            lines = [f"# {conv['title']}\n"]
-            if conv.get("system_prompt"):
-                sys_lines = str(conv["system_prompt"]).splitlines() or [""]
-                prefixed_sys = [f"> **System Prompt:** {sys_lines[0]}"]
-                prefixed_sys.extend(f"> {line}" for line in sys_lines[1:])
-                lines.append("\n".join(prefixed_sys) + "\n")
-
-            for msg in conv.get("messages", []):
-                role_title = "User" if msg["role"] == "user" else f"Assistant ({msg.get('model_id', 'Model')})"
-                lines.append(f"### {role_title}\n")
-                if msg.get("thinking_content"):
-                    lines.append(f"<details><summary>Thought Process</summary>\n\n{msg['thinking_content']}\n\n</details>\n")
-                lines.append(f"{msg['content']}\n")
-
-            content = "\n".join(lines)
+            content = format_conversation_markdown(conv)
             ext = "md"
             file_types = ("Markdown Files (*.md)", "All files (*.*)")
 
@@ -709,14 +778,31 @@ class DesktopBridge:
                     "format": format_type,
                 }
             except Exception as e:
-                return {"error": f"Failed to save file: {str(e)}"}
+                return {"error": f"Failed to save file: {e}"}
 
         return {"content": content, "format": format_type, "filename": default_filename}
 
     @_guarded_rpc
     def save_tabs_state(self, tabs_state: Dict[str, Any]) -> Dict[str, Any]:
-        save_tabs_state(tabs_state)
+        if isinstance(tabs_state, dict):
+            with self._tabs_lock:
+                self._latest_tabs_state = tabs_state
+                self._tabs_state_dirty = True
+            save_tabs_state(tabs_state)
+            with self._tabs_lock:
+                self._tabs_state_dirty = False
         return {"success": True}
+
+    def flush_tabs_state(self) -> None:
+        """Persist any cached dirty tab state synchronously during native window closing (fixes L3)."""
+        with self._tabs_lock:
+            pending = self._latest_tabs_state if self._tabs_state_dirty else None
+            self._tabs_state_dirty = False
+        if pending is not None:
+            try:
+                save_tabs_state(pending)
+            except Exception as exc:
+                _logger.warning("Failed flushing tab state on close: %s", exc)
 
     def _start_stream(
         self,
@@ -733,7 +819,6 @@ class DesktopBridge:
             return None
         sid = (str(stream_id or "").strip()) or str(uuid.uuid4())
         clean_thinking = _normalize_thinking_level(thinking_level)
-        # Pre-register stream synchronously before thread startup so Stop works immediately
         StreamManager.register_stream(tab_id, stream_id=sid, conversation_id=conversation_id)
         context_msgs = self._build_context_messages(conv)
         threading.Thread(
@@ -768,7 +853,6 @@ class DesktopBridge:
         web_search_enabled: bool = False,
         stream_id: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Adds user message and starts assistant streaming via bridge."""
         clean_provider = (provider_id or "").strip()
         clean_model = (model_id or "").strip()
         if not clean_provider or not clean_model:
@@ -786,7 +870,7 @@ class DesktopBridge:
             )
             conversation_id = conv["id"]
         else:
-            if title and title.strip().lower() != "new chat" and conv.get("title") == "New Chat":
+            if title and not is_default_conversation_title(title) and is_default_conversation_title(conv.get("title")):
                 update_conversation(conversation_id, title=title.strip())
             if system_prompt and not conv.get("system_prompt"):
                 update_conversation(conversation_id, system_prompt=system_prompt)
@@ -828,12 +912,20 @@ class DesktopBridge:
         web_search_enabled: bool = False,
         stream_id: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Deletes from message_id onwards and re-streams from previous user message."""
+        """Validate provider & abort active streams BEFORE deleting downstream messages (fixes NEW-H3)."""
         clean_provider = (provider_id or "").strip()
         clean_model = (model_id or "").strip()
         if not clean_provider or not clean_model:
             return {"error": "Please select a provider and model before regenerating."}
 
+        if not conversation_id or not get_conversation(conversation_id):
+            return {"error": "Conversation not found"}
+
+        prov_err = ClientManager.validate_provider_ready(clean_provider)
+        if prov_err:
+            return {"error": prov_err}
+
+        StreamManager.abort_conversation(conversation_id)
         clean_thinking = _normalize_thinking_level(thinking_level)
         delete_messages_from(conversation_id, message_id, include_self=True)
         active_sid = self._start_stream(
@@ -862,7 +954,7 @@ class DesktopBridge:
         web_search_enabled: bool = False,
         stream_id: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Edits user message, deletes any subsequent messages, and triggers new completion."""
+        """Validate message & provider readiness and abort active streams BEFORE mutating SQLite (fixes NEW-H3)."""
         clean_provider = (provider_id or "").strip()
         clean_model = (model_id or "").strip()
         if not clean_provider or not clean_model:
@@ -888,6 +980,11 @@ class DesktopBridge:
         if not existing:
             return {"error": "Message not found"}
 
+        prov_err = ClientManager.validate_provider_ready(clean_provider)
+        if prov_err:
+            return {"error": prov_err}
+
+        StreamManager.abort_conversation(conversation_id)
         delete_messages_from(conversation_id, message_id, include_self=False)
         update_message(
             message_id,

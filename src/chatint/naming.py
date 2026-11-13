@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import re
 from typing import Optional
-from chatint.client_manager import ClientManager, is_gemini_3_or_newer
+
+from chatint.catalog import is_gemini_3_or_newer
+from chatint.client_manager import ClientManager
 from chatint.logging_setup import get_logger
+from chatint.providers import get_provider_adapter
 
 _logger = get_logger("chatint.naming")
 
@@ -41,9 +44,8 @@ def generate_chat_title(
     model_id: Optional[str] = None,
 ) -> tuple[str, int, int, int]:
     """
-    Generates a concise, human-readable title from the initial user prompt.
-    Uses the active chat model via its provider's SDK if available and falls back to offline heuristic extraction.
-    Returns (title, prompt_tokens, completion_tokens, cached_tokens).
+    Generate a concise, human-readable title from the initial user prompt via the unified ProviderAdapter,
+    falling back cleanly to offline heuristic extraction on error.
     """
     if not prompt or not prompt.strip():
         return "New Chat", 0, 0, 0
@@ -52,124 +54,26 @@ def generate_chat_title(
         try:
             provider = ClientManager.get_provider(provider_id)
             sdk_type = ClientManager.get_sdk_type(provider, provider_id)
+            adapter = get_provider_adapter(sdk_type)
             user_snippet = prompt.strip()[:500]
 
             if sdk_type == "anthropic":
                 client, err = ClientManager.get_anthropic_client(provider_id, timeout=10.0)
-                if client and not err:
-                    try:
-                        resp = client.messages.create(
-                            model=model_id,
-                            system=_NAMING_SYSTEM_INSTRUCTION,
-                            messages=[{"role": "user", "content": user_snippet}],
-                            max_tokens=25,
-                        )
-                        if resp and getattr(resp, "content", None):
-                            text_blocks = [
-                                getattr(b, "text", "")
-                                for b in resp.content
-                                if getattr(b, "type", "") == "text"
-                            ]
-                            cleaned = _clean_generated_title(" ".join(text_blocks))
-                            if cleaned:
-                                usage = getattr(resp, "usage", None)
-                                return _finalize_title_usage(
-                                    cleaned,
-                                    user_snippet,
-                                    getattr(usage, "input_tokens", 0) or 0,
-                                    getattr(usage, "output_tokens", 0) or 0,
-                                    getattr(usage, "cache_read_input_tokens", 0) or 0,
-                                )
-                    finally:
-                        ClientManager.close_client(client)
-
             elif sdk_type == "gemini":
-                from google.genai import types as genai_types
-
                 client, err = ClientManager.get_gemini_client(provider_id, timeout=10.0)
-                if client and not err:
-                    try:
-                        level_cfg = genai_types.GenerateContentConfig(
-                            system_instruction=_NAMING_SYSTEM_INSTRUCTION,
-                            max_output_tokens=60,
-                            thinking_config=genai_types.ThinkingConfig(thinking_level="MINIMAL"),
-                        )
-                        budget_cfg = genai_types.GenerateContentConfig(
-                            system_instruction=_NAMING_SYSTEM_INSTRUCTION,
-                            max_output_tokens=40,
-                            thinking_config=genai_types.ThinkingConfig(thinking_budget=0),
-                        )
-                        plain_cfg = genai_types.GenerateContentConfig(
-                            system_instruction=_NAMING_SYSTEM_INSTRUCTION,
-                            max_output_tokens=120,
-                        )
-                        configs = (
-                            [level_cfg, budget_cfg, plain_cfg]
-                            if is_gemini_3_or_newer(model_id)
-                            else [budget_cfg, level_cfg, plain_cfg]
-                        )
-                        resp = None
-                        for cfg in configs:
-                            try:
-                                resp = client.models.generate_content(
-                                    model=model_id,
-                                    contents=user_snippet,
-                                    config=cfg,
-                                )
-                                if (getattr(resp, "text", "") or "").strip():
-                                    break
-                            except Exception:
-                                resp = None
-
-                        if resp:
-                            cleaned = _clean_generated_title((getattr(resp, "text", "") or "").strip())
-                            if cleaned:
-                                usage = getattr(resp, "usage_metadata", None)
-                                return _finalize_title_usage(
-                                    cleaned,
-                                    user_snippet,
-                                    getattr(usage, "prompt_token_count", 0) or 0,
-                                    getattr(usage, "candidates_token_count", 0) or 0,
-                                    getattr(usage, "cached_content_token_count", 0) or 0,
-                                )
-                    finally:
-                        ClientManager.close_client(client)
-
             else:
                 client, err = ClientManager.get_client(provider_id, timeout=10.0)
-                if client and not err:
-                    try:
-                        base_msgs = [
-                            {"role": "system", "content": _NAMING_SYSTEM_INSTRUCTION},
-                            {"role": "user", "content": user_snippet},
-                        ]
-                        resp = None
-                        for tok_kw in ({"max_completion_tokens": 60}, {"max_tokens": 40}):
-                            try:
-                                resp = client.chat.completions.create(
-                                    model=model_id,
-                                    messages=base_msgs,
-                                    stream=False,
-                                    **tok_kw,
-                                )
-                                break
-                            except Exception:
-                                resp = None
 
-                        if resp and resp.choices and resp.choices[0].message:
-                            cleaned = _clean_generated_title((resp.choices[0].message.content or "").strip())
-                            if cleaned:
-                                usage = getattr(resp, "usage", None)
-                                details = getattr(usage, "prompt_tokens_details", None)
-                                return _finalize_title_usage(
-                                    cleaned,
-                                    user_snippet,
-                                    getattr(usage, "prompt_tokens", 0) or 0,
-                                    getattr(usage, "completion_tokens", 0) or 0,
-                                    getattr(details, "cached_tokens", 0) if details else 0,
-                                )
-                    finally:
-                        ClientManager.close_client(client)
+            if client and not err:
+                try:
+                    res = adapter.complete_title(client, model_id, _NAMING_SYSTEM_INSTRUCTION, user_snippet)
+                    if res:
+                        raw_text, in_tok, out_tok, cache_tok = res
+                        cleaned = _clean_generated_title(raw_text)
+                        if cleaned:
+                            return _finalize_title_usage(cleaned, user_snippet, in_tok, out_tok, cache_tok)
+                finally:
+                    ClientManager.close_client(client)
         except Exception as exc:
             _logger.debug("Chat title generation fell back to heuristic: %s", exc)
 
@@ -177,21 +81,15 @@ def generate_chat_title(
 
 
 def _offline_heuristic_title(prompt: str) -> str:
-    """
-    Offline fallback that derives a clean, concise, human-readable title from the initial user prompt.
-    """
+    """Offline fallback that derives a clean, concise, human-readable title from the initial user prompt."""
     if not prompt:
         return "New Chat"
 
-    # Take first line if multi-line
     first_line = prompt.strip().split("\n")[0].strip()
-
-    # Strip code blocks, markdown punctuation
     cleaned = re.sub(r"[`#*~_>\[\]\(\)]", " ", first_line)
     cleaned = re.sub(r"https?://\S+", "", cleaned)
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
 
-    # Common conversational fillers and prefixes to strip
     prefixes = [
         r"^(please\s+)?(can\s+you\s+)?(could\s+you\s+)?(write|create|code|implement|generate|build)(\s+me)?(\s+a|\s+an)?\s+",
         r"^(please\s+)?(can\s+you\s+)?(could\s+you\s+)?(explain|tell\s+me\s+about|describe|summarize)(\s+to\s+me)?(\s+about)?\s+",
@@ -203,21 +101,25 @@ def _offline_heuristic_title(prompt: str) -> str:
     for p in prefixes:
         cleaned = re.sub(p, "", cleaned, flags=re.IGNORECASE).strip()
 
-    # Remove trailing punctuation (question marks, periods, colons)
     cleaned = re.sub(r"[?!.,:;]+$", "", cleaned).strip()
-
     if not cleaned:
         cleaned = first_line[:30]
 
-    # Split into words and limit length
     words = cleaned.split()
     if len(words) > 6:
         cleaned = " ".join(words[:6])
 
-    # Limit to max 38 characters
     if len(cleaned) > 38:
         cleaned = cleaned[:35].rsplit(" ", 1)[0]
 
-    # Title-case nicely
     title = cleaned.title().strip()
     return title or "New Chat"
+
+
+__all__ = [
+    "_clean_generated_title",
+    "_finalize_title_usage",
+    "_offline_heuristic_title",
+    "generate_chat_title",
+    "is_gemini_3_or_newer",
+]

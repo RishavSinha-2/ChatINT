@@ -12,6 +12,9 @@ from chatint.db import (
     record_google_search_requests,
     record_token_usage,
 )
+from chatint.logging_setup import get_logger
+
+_logger = get_logger("chatint.web_search")
 
 SEARCH_MODEL_ID = PRIMARY_WEB_SEARCH_MODEL
 WEB_SEARCH_TOOL_NAME = "web_search"
@@ -172,8 +175,8 @@ def execute_image_search(query: str, max_results: int = 3) -> Dict[str, Any]:
                     })
                 if len(images) >= max_count:
                     break
-    except Exception:
-        pass
+    except Exception as exc:
+        _logger.debug("Wikipedia image search lookup failed for %r: %s", clean_query, exc)
 
     # Step 2: Wikimedia Commons Search (for animals, diagrams, modern objects, etc.)
     if len(images) < max_count:
@@ -213,8 +216,8 @@ def execute_image_search(query: str, max_results: int = 3) -> Dict[str, Any]:
                         })
                     if len(images) >= max_count:
                         break
-        except Exception:
-            pass
+        except Exception as exc:
+            _logger.debug("Wikimedia Commons image search lookup failed for %r: %s", clean_query, exc)
 
     return {
         "ok": len(images) > 0,
@@ -293,7 +296,7 @@ def _extract_concise_facts(raw_text: str) -> tuple[str, List[str]]:
             summary = str(parsed.get("answer") or parsed.get("summary") or "").strip()
             facts = [str(f).strip() for f in (parsed.get("key_facts") or parsed.get("facts") or []) if str(f).strip()][:6]
             return summary, facts
-    except Exception:
+    except (json.JSONDecodeError, TypeError, ValueError):
         pass
 
     facts: List[str] = []

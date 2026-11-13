@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' https: http:; font-src 'self' data:; connect-src 'none'; object-src 'none'; base-uri 'none';">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self' data:; img-src 'self' data: blob: https://upload.wikimedia.org https://*.wikimedia.org https: http:; connect-src 'self' blob:; object-src 'none'; base-uri 'none'; form-action 'none';">
   <title>ChatInt</title>
   <link rel="icon" type="image/png" href="assets/logo.png">
   <link rel="stylesheet" href="assets/github-dark.min.css" id="hljs-theme">
@@ -236,7 +236,7 @@
   <script src="assets/highlight.min.js"></script>
   <script src="assets/katex.min.js"></script>
   <script src="assets/lucide.min.js"></script>
-  <!-- Main Application Script -->
-  <script src="app.js"></script>
+  <!-- Main Application ES Module Entry -->
+  <script type="module" src="app.js"></script>
 </body>
 </html>

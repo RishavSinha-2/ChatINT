@@ -888,9 +888,634 @@ Gradient descent minimizes the loss function step by step.
         katex_css = Path("src/chatint/ui/assets/katex.min.css").read_text(encoding="utf-8")
         self.assertNotIn("https://cdn.jsdelivr.net", katex_css)
         app_js = Path("src/chatint/ui/app.js").read_text(encoding="utf-8")
+        panes_js = Path("src/chatint/ui/js/panes.js").read_text(encoding="utf-8")
         self.assertNotIn("get_provider_api_key", app_js)
         self.assertIn("open_external_url", app_js)
-        self.assertIn("_resizeObserver", app_js)
+        self.assertIn("disconnectPaneResizeObservers", app_js)
+        self.assertIn("_resizeObserver", panes_js)
+
+    # ------------------------------------------------------------------
+    # Second-pass regression tests for all 33 audit & roadmap items
+    # ------------------------------------------------------------------
+
+    def test_c1_sealed_public_bridge_api_and_fail_closed_origin_guard(self):
+        from chatint.bridge import PUBLIC_RPC_METHODS
+
+        bridge = DesktopBridge(allow_headless_rpc=False)
+        public_api = bridge.as_public_api()
+
+        # Unattached headless calls are blocked when allow_headless_rpc=False
+        with self.assertRaises(PermissionError):
+            public_api.get_conversations()
+
+        # PublicBridgeApi blocks helper & internal attributes (attach_window, set_origin_trusted, push_event, _window, __dict__)
+        for forbidden in ("attach_window", "set_origin_trusted", "push_event", "_window", "_origin_trusted", "__dict__"):
+            with self.assertRaises(AttributeError):
+                getattr(public_api, forbidden)
+        self.assertEqual(set(dir(public_api)), set(PUBLIC_RPC_METHODS))
+
+        # Attach loopback HTTP window on specific port
+        dummy_window = MagicMock()
+        dummy_window.get_current_url.return_value = "http://127.0.0.1:43125/index.html"
+        bridge.attach_window(
+            dummy_window,
+            index_url="http://127.0.0.1:43125/index.html",
+            allowed_origin=("http", "127.0.0.1", 43125),
+        )
+        res_ok = public_api.set_theme("dark")
+        self.assertEqual(res_ok, {"ok": True, "data": {"success": True, "theme": "dark"}, "error": None})
+
+        # Empty URL fails CLOSED
+        dummy_window.get_current_url.return_value = ""
+        with self.assertRaises(PermissionError):
+            public_api.set_theme("light")
+
+        # Exception in get_current_url fails CLOSED
+        dummy_window.get_current_url.side_effect = RuntimeError("webview transitioning")
+        with self.assertRaises(PermissionError):
+            public_api.set_theme("light")
+        dummy_window.get_current_url.side_effect = None
+
+        # Different localhost port fails CLOSED
+        dummy_window.get_current_url.return_value = "http://127.0.0.1:9999/index.html"
+        with self.assertRaises(PermissionError):
+            public_api.set_theme("light")
+
+        # Exact file:// path matching rejects sibling/other local HTML files
+        bridge.attach_window(
+            dummy_window,
+            index_url="file:///C:/ChatInt/ui/index.html",
+            allowed_origin=("file", "", None),
+        )
+        dummy_window.get_current_url.return_value = "file:///C:/Users/Alice/Downloads/ui/index.html"
+        with self.assertRaises(PermissionError):
+            public_api.set_theme("light")
+
+        dummy_window.get_current_url.return_value = "file:///C:/ChatInt/ui/index.html"
+        self.assertTrue(public_api.set_theme("dark")["ok"])
+
+        # mailto: link validation
+        with patch("chatint.bridge.webbrowser.open") as mock_open:
+            self.assertTrue(public_api.open_external_url("mailto:support@example.com")["ok"])
+            self.assertFalse(public_api.open_external_url("mailto:not-an-email")["ok"])
+            mock_open.assert_called_once_with("mailto:support@example.com")
+
+    def test_c2_blocks_stored_api_key_exfiltration_on_base_url_override(self):
+        set_api_key_in_env("OpenAI", "sk-real-secret-key-9999")
+        bridge = DesktopBridge()
+
+        # 1. Previewing models against a different host WITHOUT entering a new key must NOT send saved .env secret
+        with patch("openai.OpenAI") as mock_openai_cls:
+            res_blocked = bridge.fetch_provider_models(
+                "openai",
+                api_key=None,
+                base_url="https://attacker.example/v1",
+                is_enabled=True,
+            )
+            mock_openai_cls.assert_not_called()
+        self.assertEqual(res_blocked["models"], [])
+        self.assertIn("enter the API key", res_blocked["error"])
+
+        # Explicit new key IS allowed for preview on the new host (and uses only the newly entered key)
+        fake_client = MagicMock()
+        fake_client.models.list.return_value = MagicMock(data=[MagicMock(id="m1", created=1)])
+        with patch("openai.OpenAI", return_value=fake_client) as mock_openai_cls:
+            res_explicit = bridge.fetch_provider_models(
+                "openai",
+                api_key="sk-temp-test-key-1111",
+                base_url="https://alt-host.example/v1",
+                is_enabled=True,
+            )
+            mock_openai_cls.assert_called_once()
+            self.assertEqual(mock_openai_cls.call_args.kwargs.get("api_key"), "sk-temp-test-key-1111")
+        self.assertIsNone(res_explicit["error"])
+
+        # Loopback localhost preview works keylessly without transmitting saved cloud secret
+        with patch("openai.OpenAI", return_value=fake_client) as mock_openai_cls:
+            res_local = bridge.fetch_provider_models(
+                "provider_new_local",
+                api_key=None,
+                base_url="http://127.0.0.1:1234/v1",
+                is_enabled=True,
+                provider_name="LMStudio",
+            )
+            mock_openai_cls.assert_called_once()
+            self.assertEqual(mock_openai_cls.call_args.kwargs.get("api_key"), "ollama")
+        self.assertIsNone(res_local["error"])
+
+        # 2. save_settings rejects changing base_url host when keeping existing saved secret
+        provs = get_providers()
+        settings = get_app_settings()
+        for p in provs:
+            if p["id"] == "openai":
+                p["base_url"] = "https://attacker.example/v1"
+        res_save_blocked = bridge.save_settings(provs, settings)
+        self.assertFalse(res_save_blocked.get("success", False))
+        self.assertIn("Clear Key", res_save_blocked.get("error", ""))
+
+        # Clearing key or supplying new key permits base_url change
+        for p in provs:
+            if p["id"] == "openai":
+                p["clear_api_key"] = True
+        with patch.object(BackgroundModelSyncer, "start_background_sync"):
+            res_save_ok = bridge.save_settings(provs, settings)
+        self.assertTrue(res_save_ok["success"])
+        self.assertEqual(get_api_key_from_env("OpenAI"), "")
+
+    def test_h4_r4_dpapi_encryption_clear_on_rename_whitespace_and_case_insensitivity(self):
+        from chatint.storage.dpapi import decrypt_secret_from_storage, encrypt_secret_for_storage, is_dpapi_enabled
+
+        # Whitespace preservation + DPAPI encryption at rest on Windows
+        padded_secret = "  sk-padded-secret-value  "
+        set_api_key_in_env("OpenAI", padded_secret)
+        self.assertEqual(get_api_key_from_env("OpenAI"), padded_secret)
+        raw_env_disk = self.env_path.read_text(encoding="utf-8")
+        if is_dpapi_enabled():
+            self.assertIn("dpapi:", raw_env_disk)
+            self.assertNotIn("sk-padded-secret-value", raw_env_disk)
+        enc = encrypt_secret_for_storage("my-secret-token")
+        self.assertEqual(decrypt_secret_from_storage(enc), "my-secret-token")
+
+        # Clear key while renaming provider in the same operation must NOT restore old_val
+        set_api_key_in_env("OldVendor", "sk-must-be-deleted")
+        set_api_key_in_env("NewVendor", "", old_provider_name="OldVendor", clear=True)
+        self.assertEqual(get_api_key_from_env("NewVendor"), "")
+        self.assertEqual(get_api_key_from_env("OldVendor"), "")
+
+        # Case-insensitive .env key lookup (lowercase openai_api_key=... in .env)
+        self.env_path.write_text("openai_api_key=sk-lowercase-entry\n", encoding="utf-8")
+        self.assertEqual(get_api_key_from_env("OpenAI"), "sk-lowercase-entry")
+
+    def test_h5_multiple_new_chats_auto_name_once_and_ignore_deleted_chats(self):
+        from chatint.services.stream_coordinator import run_auto_naming
+
+        # Multiple default "New Chat" drafts do NOT become "New Chat (1)" with broken auto-naming
+        c1 = create_conversation("New Chat")
+        c2 = create_conversation("New Chat")
+        self.assertEqual(c1["title"], "New Chat")
+        self.assertEqual(c2["title"], "New Chat")
+        self.assertFalse(c1["is_auto_named"])
+        self.assertFalse(c2["is_auto_named"])
+
+        # Auto-naming both produces unique titles and sets is_auto_named = True
+        self.assertEqual(update_conversation(c1["id"], title="Quantum Physics", only_if_default=True), "Quantum Physics")
+        self.assertEqual(update_conversation(c2["id"], title="Quantum Physics", only_if_default=True), "Quantum Physics (1)")
+        self.assertTrue(get_conversation(c1["id"])["is_auto_named"])
+        self.assertTrue(get_conversation(c2["id"])["is_auto_named"])
+
+        # Turn 2 on an already named conversation does NOT call _trigger_auto_naming
+        add_message(c1["id"], "user", "Follow-up question")
+        with (
+            patch.dict("chatint.streamer._SDK_STREAMERS", {"anthropic": MagicMock(return_value=(["Second reply."], [], 8, 4, 0, False, "none"))}),
+            patch("chatint.streamer._trigger_auto_naming") as mock_auto_name,
+        ):
+            stream_chat_completion(
+                bridge=DesktopBridge(),
+                tab_id="tab1",
+                conversation_id=c1["id"],
+                messages=[{"role": "user", "content": "Follow-up question"}],
+                provider_id="anthropic",
+                model_id="claude-sonnet-4-5",
+                thinking_level="none",
+                stream_id="s-turn2",
+            )
+            mock_auto_name.assert_not_called()
+
+        # Legacy "New Chat (1)" row with is_auto_named=0 still auto-names cleanly
+        with open_db() as conn:
+            conn.execute(
+                "INSERT INTO conversations (id, title, system_prompt, max_context_messages, is_imported, is_auto_named, created_at, updated_at) VALUES (?, ?, '', 30, 0, 0, 1.0, 1.0)",
+                ("legacy_nc1", "New Chat (1)"),
+            )
+            conn.commit()
+        self.assertEqual(update_conversation("legacy_nc1", title="Fixed Legacy Title", only_if_default=True), "Fixed Legacy Title")
+
+        # Deleted chat before run_auto_naming finishes does NOT emit chat_named
+        c_del = create_conversation("New Chat")
+        delete_conversation(c_del["id"])
+        emitted = []
+        mock_bridge = MagicMock()
+        mock_bridge.push_event.side_effect = emitted.append
+        with patch("chatint.services.stream_coordinator.generate_chat_title", return_value=("Ghost Title", 5, 2, 0)):
+            run_auto_naming(mock_bridge, "tab1", c_del["id"], "hello", "openai", "gpt-4o", stream_id="s1")
+        for t in threading.enumerate():
+            if t is not threading.current_thread() and t.daemon and t.is_alive():
+                t.join(timeout=0.5)
+        self.assertFalse(any(ev.get("type") == "chat_named" and ev.get("conversation_id") == c_del["id"] for ev in emitted))
+
+    def test_new_h3_regenerate_and_edit_validate_provider_before_deleting_messages(self):
+        bridge = DesktopBridge()
+        conv = create_conversation("Preserve History On Error")
+        u_msg = add_message(conv["id"], "user", "Important prompt")
+        a_msg = add_message(conv["id"], "assistant", "Important assistant answer")
+
+        # OpenAI has NO API key in .env right now -> provider readiness check must fail BEFORE deleting SQLite rows!
+        with patch.object(StreamManager, "abort_conversation") as mock_abort:
+            res_regen = bridge.regenerate_message("tab1", conv["id"], a_msg["id"], "openai", "gpt-4o", "none")
+            self.assertIn("error", res_regen)
+            mock_abort.assert_not_called()
+
+        still_there = get_conversation(conv["id"])
+        self.assertEqual(len(still_there["messages"]), 2)
+        self.assertEqual(still_there["messages"][1]["content"], "Important assistant answer")
+
+        res_edit = bridge.edit_message("tab1", conv["id"], u_msg["id"], "Edited prompt", "openai", "gpt-4o", "none")
+        self.assertIn("error", res_edit)
+        still_there_after_edit = get_conversation(conv["id"])
+        self.assertEqual(still_there_after_edit["messages"][0]["content"], "Important prompt")
+        self.assertEqual(len(still_there_after_edit["messages"]), 2)
+
+    def test_m4_gpt5_clamping_tool_retry_without_cache_poisoning_and_deepseek_replay(self):
+        from chatint.providers.openai_adapter import _stream_openai, _uses_deepseek_reasoning_replay
+
+        # 1. Effort clamping across gpt-5 and OpenAI-compatible providers
+        self.assertEqual(_clamp_openai_effort("openai", "gpt-5", "max"), "xhigh")
+        self.assertEqual(_clamp_openai_effort("openai", "gpt-5-mini", "minimal"), "minimal")
+        self.assertEqual(_clamp_openai_effort("openrouter", "deepseek/deepseek-r1", "max"), "high")
+        self.assertEqual(_clamp_openai_effort("deepseek", "deepseek-reasoner", "minimal"), "low")
+
+        # 2. reasoning_content replay only enabled for DeepSeek
+        self.assertTrue(_uses_deepseek_reasoning_replay("deepseek", "deepseek-reasoner"))
+        self.assertTrue(_uses_deepseek_reasoning_replay("openrouter", "deepseek/deepseek-r1"))
+        self.assertFalse(_uses_deepseek_reasoning_replay("openai", "gpt-5", "https://api.openai.com/v1"))
+
+        # 3. Tool-rejection 400 retries (effort, use_tools=False) BEFORE downgrading effort, preserving thinking cache
+        import httpx2
+        import openai
+
+        provs = get_providers()
+        for p in provs:
+            if p["id"] == "openai":
+                p["models"] = [{"id": "o3", "name": "o3"}]
+        save_providers(provs)
+
+        call_log = []
+
+        def fake_create(**kwargs):
+            has_tools = "tools" in kwargs
+            eff = kwargs.get("reasoning_effort")
+            call_log.append((eff, has_tools))
+            if has_tools:
+                req = httpx2.Request("POST", "https://api.openai.com/v1/chat/completions")
+                resp = httpx2.Response(400, request=req)
+                raise openai.BadRequestError("Unsupported parameter combination for this model", response=resp, body=None)
+            chunk = MagicMock()
+            chunk.usage = MagicMock(prompt_tokens=10, completion_tokens=5, prompt_tokens_details=None)
+            delta = MagicMock(content="Solved with high effort!", reasoning_content=None, reasoning=None, tool_calls=None)
+            chunk.choices = [MagicMock(delta=delta)]
+            return iter([chunk])
+
+        fake_client = MagicMock()
+        fake_client.chat.completions.create.side_effect = fake_create
+
+        with (
+            patch.object(ClientManager, "get_client", return_value=(fake_client, None)),
+            patch("chatint.providers.openai_adapter._resolve_search_enabled", return_value=True),
+        ):
+            text, _think, _in, _out, _cached, had_err, actual_lvl = _stream_openai(
+                bridge=DesktopBridge(),
+                tab_id="t1",
+                conversation_id="c1",
+                messages=[{"role": "user", "content": "test"}],
+                provider_id="openai",
+                model_id="o3",
+                thinking_level="high",
+                assistant_msg_id="m1",
+                abort_event=threading.Event(),
+                user_question="test",
+                web_search_enabled=True,
+            )
+        self.assertFalse(had_err)
+        self.assertEqual("".join(text), "Solved with high effort!")
+        self.assertEqual(actual_lvl, "high")
+        self.assertEqual(call_log[:2], [("high", True), ("high", False)])
+        self.assertEqual(get_model_resolved_thinking("openai", "o3", "high"), "high")
+
+    def test_m6_hung_fetch_remote_models_times_out_on_daemon_thread(self):
+        set_api_key_in_env("OpenAI", "sk-timeout-test")
+        block_ev = threading.Event()
+        fake_client = MagicMock()
+
+        def slow_list():
+            block_ev.wait(timeout=2.0)
+            return MagicMock(data=[])
+
+        fake_client.models.list.side_effect = slow_list
+        try:
+            with (
+                patch.object(ClientManager, "get_client", return_value=(fake_client, None)),
+                patch("chatint.client_manager._is_network_available", return_value=True),
+            ):
+                models, err, is_net_err = ClientManager.fetch_remote_models("openai", timeout=0.12)
+            self.assertEqual(models, [])
+            self.assertIn("timed out", (err or "").lower())
+            self.assertTrue(is_net_err)
+        finally:
+            block_ev.set()
+
+    def test_m8_markdown_roundtrip_details_unclosed_fence_system_role_and_json_tokens(self):
+        conv = create_conversation("Edge Case Export", system_prompt="Be concise.", max_context=42)
+        add_message(
+            conv["id"],
+            "user",
+            "Here is an unclosed fence:\n```python\ndef broken():\n    pass",
+        )
+        add_message(
+            conv["id"],
+            "assistant",
+            "And here is the real reply after an unclosed fence.",
+            thinking_content="Checking literal </details> inside thought block!\nStill thinking...",
+            provider_id="anthropic",
+            model_id="claude-sonnet-4-5",
+            thinking_level="high",
+        )
+        add_message(conv["id"], "system", "Mid-conversation system note")
+
+        bridge = DesktopBridge()
+        md_exported = bridge.export_conversation(conv["id"], "markdown")
+        parsed_md = parse_chat_file_content(md_exported["content"], "edge.md")
+        self.assertEqual(parsed_md["title"], "Edge Case Export")
+        self.assertEqual(parsed_md["max_context"], 42)
+        self.assertEqual(len(parsed_md["messages"]), 3)
+        self.assertEqual(parsed_md["messages"][0]["role"], "user")
+        self.assertEqual(parsed_md["messages"][1]["role"], "assistant")
+        self.assertIn("</details>", parsed_md["messages"][1]["thinking_content"])
+        self.assertIn("Still thinking...", parsed_md["messages"][1]["thinking_content"])
+        self.assertEqual(parsed_md["messages"][1]["provider_id"], "anthropic")
+        self.assertEqual(parsed_md["messages"][1]["thinking_level"], "high")
+        self.assertEqual(parsed_md["messages"][2]["role"], "system")
+        self.assertEqual(parsed_md["messages"][2]["content"], "Mid-conversation system note")
+
+        # JSON export/import preserves per-message token counts while keeping token_ledger spend at 0
+        json_payload = json.dumps({
+            "title": "Token Metadata Import",
+            "messages": [
+                {"role": "user", "content": "Hi"},
+                {
+                    "role": "assistant",
+                    "content": "Hello!",
+                    "prompt_tokens": 120,
+                    "completion_tokens": 45,
+                    "cached_tokens": 30,
+                },
+            ],
+        })
+        parsed_json = parse_chat_file_content(json_payload, "tokens.json")
+        imp = import_conversation_data(
+            title=parsed_json["title"],
+            messages=parsed_json["messages"],
+        )
+        self.assertEqual(imp["messages"][1]["prompt_tokens"], 120)
+        self.assertEqual(imp["messages"][1]["completion_tokens"], 45)
+        self.assertEqual(imp["messages"][1]["cached_tokens"], 30)
+        self.assertEqual(get_token_stats(imp["id"])["grand_total"]["total_tokens"], 0)
+
+    def test_m10_find_existing_chatint_hwnd_rejects_unrelated_winforms_exe(self):
+        from chatint.main import _find_existing_chatint_hwnd
+
+        def _make_mocks(exe_path: str, open_proc_handle: int = 99, query_ok: bool = True):
+            user32 = MagicMock()
+            kernel32 = MagicMock()
+
+            def fake_enum(cb, lparam):
+                cb(12345, lparam)
+                return True
+
+            user32.EnumWindows.side_effect = fake_enum
+            user32.IsWindowVisible.return_value = True
+            user32.GetWindowTextLengthW.return_value = len("ChatInt")
+
+            def fill_title(_hwnd, buf, _max_len):
+                buf.value = "ChatInt"
+                return len("ChatInt")
+
+            def fill_class(_hwnd, buf, _max_len):
+                buf.value = "WindowsForms10.Window.8.app.0.141b42a"
+                return len(buf.value)
+
+            def fill_pid(_hwnd, pid_ptr):
+                pid_ptr._obj.value = 4242
+                return 1
+
+            user32.GetWindowTextW.side_effect = fill_title
+            user32.GetClassNameW.side_effect = fill_class
+            user32.GetWindowThreadProcessId.side_effect = fill_pid
+            kernel32.OpenProcess.return_value = open_proc_handle
+
+            def fill_exe(_h, _flags, buf, _len_ptr):
+                if not query_ok:
+                    return False
+                buf.value = exe_path
+                return True
+
+            kernel32.QueryFullProcessImageNameW.side_effect = fill_exe
+            return user32, kernel32
+
+        # Unrelated WinForms app titled "ChatInt" -> MUST be rejected (returns 0)
+        u_bad, k_bad = _make_mocks(r"C:\Program Files\OtherTool\OtherTool.exe")
+        self.assertEqual(_find_existing_chatint_hwnd(u_bad, k_bad), 0)
+
+        # Genuine ChatInt.exe -> matched
+        u_good, k_good = _make_mocks(r"C:\ChatInt\dist\ChatInt.exe")
+        self.assertEqual(_find_existing_chatint_hwnd(u_good, k_good), 12345)
+
+        # OpenProcess blocked (returns 0) -> safe fallback to WindowsForms10 class
+        u_fb, k_fb = _make_mocks("", open_proc_handle=0)
+        self.assertEqual(_find_existing_chatint_hwnd(u_fb, k_fb), 12345)
+
+    def test_new_m1_think_tag_parser_only_opens_at_round_start(self):
+        from chatint.streamer import _process_text_with_think_tags
+
+        bridge = DesktopBridge()
+
+        # Case 1: Mid-prose or code-block <think> (even unclosed!) stays in visible content
+        c_vis, c_think = [], []
+        round_state = [False]
+        buf, in_think = _process_text_with_think_tags(
+            "Models like DeepSeek emit `<think>` at the start without closing:",
+            "",
+            False,
+            c_vis,
+            c_think,
+            bridge,
+            "t1",
+            "c1",
+            has_round_visible_text=round_state,
+        )
+        self.assertFalse(in_think)
+        self.assertEqual(buf, "")
+        self.assertEqual(c_think, [])
+        self.assertIn("<think>", "".join(c_vis))
+
+        # Case 2: Leading <think>...</think> followed immediately by literal <think>example</think> in answer
+        c_vis2, c_think2 = [], []
+        round_state2 = [False]
+        buf2, in_think2 = _process_text_with_think_tags(
+            "<think>User asked for literal tag.</think>\n\n<think>example</think>",
+            "",
+            False,
+            c_vis2,
+            c_think2,
+            bridge,
+            "t1",
+            "c1",
+            has_round_visible_text=round_state2,
+        )
+        self.assertFalse(in_think2)
+        self.assertEqual("".join(c_think2), "User asked for literal tag.")
+        self.assertEqual("".join(c_vis2), "<think>example</think>")
+
+    def test_new_m2_multi_round_thinking_separator_abort_suppression_and_aborted_tool_ledger(self):
+        from chatint.streamer import _ensure_post_tool_thinking_separator
+
+        bridge = DesktopBridge()
+        full_thinking = ["Round 0 thought."]
+        _ensure_post_tool_thinking_separator(full_thinking, bridge, "t1", "c1")
+        self.assertEqual("".join(full_thinking), "Round 0 thought.\n\n")
+
+        # Aborted tool call does NOT dispatch status="done"
+        events = []
+        abort_ev = threading.Event()
+
+        def aborting_search(*_args, **_kwargs):
+            abort_ev.set()
+            return {"ok": True, "images": []}
+
+        mock_b = MagicMock()
+        mock_b.push_event.side_effect = events.append
+        with patch("chatint.providers.base.execute_image_search", side_effect=aborting_search):
+            _run_web_search_tool_call(mock_b, "t1", "c1", IMAGE_SEARCH_TOOL_NAME, {"query": "mars"}, abort_ev)
+        self.assertFalse(any(ev.get("status") == "done" for ev in events))
+
+        # Aborted/empty Round 1 after billed Round 0 tool call still records tokens in token_ledger
+        conv = create_conversation("Aborted Tool Turn")
+        add_message(conv["id"], "user", "Search news")
+        with patch.dict(
+            "chatint.streamer._SDK_STREAMERS",
+            {"openai": MagicMock(return_value=([], [], 250, 40, 0, True, "none"))},
+        ):
+            stream_chat_completion(
+                bridge=DesktopBridge(),
+                tab_id="t1",
+                conversation_id=conv["id"],
+                messages=[{"role": "user", "content": "Search news"}],
+                provider_id="openai",
+                model_id="gpt-4o",
+                thinking_level="none",
+                stream_id="s-tool-abort",
+            )
+        stats = get_token_stats(conv["id"])
+        self.assertEqual(stats["grand_total"]["prompt_tokens"], 250)
+        self.assertEqual(stats["grand_total"]["completion_tokens"], 40)
+
+    def test_new_m3_r6_log_formatter_scrubs_tracebacks_provider_keys_and_custom_secrets(self):
+        import logging
+        from chatint.logging_setup import _SecretScrubFormatter, register_known_secrets
+
+        register_known_secrets(["custom-proprietary-secret-token-999"])
+        formatter = _SecretScrubFormatter("%(levelname)s: %(message)s")
+
+        try:
+            raise RuntimeError(
+                "Header leak: gsk_abcdef1234567890 xai-abcdef1234567890 pplx-abcdef1234567890 "
+                "hf_abcdef1234567890 csk-abcdef1234567890 custom-proprietary-secret-token-999"
+            )
+        except RuntimeError:
+            record = logging.LogRecord(
+                name="chatint.test",
+                level=logging.ERROR,
+                pathname=__file__,
+                lineno=1,
+                msg="Request failed",
+                args=(),
+                exc_info=sys.exc_info(),
+            )
+        formatted = formatter.format(record)
+        for leaked in (
+            "1234567890",
+            "custom-proprietary-secret-token-999",
+        ):
+            self.assertNotIn(leaked, formatted)
+        self.assertIn("gsk_abcdef***", formatted)
+        self.assertIn("cust***", formatted)
+
+        # open_logs_folder via PublicBridgeApi returns uniform {ok, data, error}
+        bridge = DesktopBridge()
+        with (
+            patch("os.startfile", create=True),
+            patch("chatint.bridge.subprocess.Popen"),
+        ):
+            env_res = bridge.as_public_api().open_logs_folder()
+        self.assertTrue(env_res["ok"])
+        self.assertIn("path", env_res["data"])
+
+    def test_new_m6_new_l3_r2_r5_r7_validation_bom_import_busy_timeout_and_migrations(self):
+        from chatint.db import save_app_settings
+        from chatint.providers import get_provider_adapter
+        from chatint.services.import_export import MAX_IMPORT_BYTES, read_chat_file_safely
+        from chatint.storage.connection import SCHEMA_VERSION
+
+        # 1. NEW-L3: SQLite busy_timeout == 30000 ms
+        with open_db() as conn:
+            bt = conn.execute("PRAGMA busy_timeout").fetchone()[0]
+            self.assertEqual(bt, 30000)
+
+        # 2. NEW-M6: add_provider & save_app_settings validation + UTF-8 BOM & size cap
+        bridge = DesktopBridge()
+        self.assertIn("error", bridge.add_provider({"name": "Bad Name 123!", "base_url": "https://example.com/v1"}))
+        self.assertIn("error", bridge.add_provider({"name": "OpenAI", "base_url": "https://example.com/v1"}))
+        with self.assertRaises(ValueError):
+            save_app_settings({"evil_injected_setting": "1"})
+
+        bom_path = Path(self.test_dir.name) / "bom_chat.json"
+        bom_payload = json.dumps({"title": "BOM Chat", "messages": [{"role": "user", "content": "Hello BOM"}]})
+        bom_path.write_bytes(b"\xef\xbb\xbf" + bom_payload.encode("utf-8"))
+        decoded = read_chat_file_safely(bom_path)
+        self.assertFalse(decoded.startswith("\ufeff"))
+        imp_res = bridge.import_conversation_content("\ufeff" + bom_payload, "bom_chat.json")
+        self.assertEqual(imp_res["conversation"]["title"], "BOM Chat")
+
+        oversized_res = bridge.import_conversation_content("x" * (MAX_IMPORT_BYTES + 10), "huge.md")
+        self.assertIn("error", oversized_res)
+
+        # 3. R2: Unified ProviderAdapter registry
+        self.assertEqual(get_provider_adapter("anthropic").sdk_type, "anthropic")
+        self.assertEqual(get_provider_adapter("gemini").sdk_type, "gemini")
+        self.assertEqual(get_provider_adapter("openai").sdk_type, "openai")
+        self.assertEqual(get_provider_adapter("custom_vllm").sdk_type, "openai")
+
+        # 4. R5: Sequential migration from v1 DB creates .bak backup and upgrades to SCHEMA_VERSION (2)
+        import contextlib
+
+        v1_db = Path(self.test_dir.name) / "legacy_v1.db"
+        with contextlib.closing(sqlite3.connect(v1_db)) as c_v1:
+            c_v1.execute(
+                "CREATE TABLE conversations (id TEXT PRIMARY KEY, title TEXT NOT NULL, system_prompt TEXT NOT NULL DEFAULT '', max_context_messages INTEGER NOT NULL DEFAULT 30, is_imported INTEGER NOT NULL DEFAULT 0, created_at REAL NOT NULL, updated_at REAL NOT NULL)"
+            )
+            c_v1.execute(
+                "INSERT INTO conversations (id, title, created_at, updated_at) VALUES ('c_old', 'Existing Named Topic', 1.0, 1.0), ('c_nc', 'New Chat (1)', 1.0, 1.0)"
+            )
+            c_v1.execute("PRAGMA user_version = 1")
+            c_v1.commit()
+
+        prev_db = db_mod.DB_PATH
+        try:
+            db_mod.DB_PATH = v1_db
+            cfg_mod.DB_PATH = v1_db
+            init_db()
+            bak_file = v1_db.with_name("legacy_v1.db.bak")
+            self.assertTrue(bak_file.exists())
+            with open_db() as c_up:
+                self.assertEqual(c_up.execute("PRAGMA user_version").fetchone()[0], SCHEMA_VERSION)
+                rows = {
+                    r["id"]: r["is_auto_named"]
+                    for r in c_up.execute("SELECT id, is_auto_named FROM conversations").fetchall()
+                }
+                self.assertEqual(rows["c_old"], 1)
+                self.assertEqual(rows["c_nc"], 0)
+        finally:
+            db_mod.DB_PATH = prev_db
+            cfg_mod.DB_PATH = prev_db
 
 
 if __name__ == "__main__":

@@ -1,8 +1,10 @@
 import ctypes
+from ctypes import wintypes
 import os
 import subprocess
 import sys
 import unittest
+import uuid
 
 sys.path.insert(0, os.path.abspath("src"))
 
@@ -15,14 +17,18 @@ class TestSingleInstanceMutex(unittest.TestCase):
     def tearDown(self):
         if getattr(main_mod, "_MUTEX_HANDLE", None):
             try:
-                ctypes.windll.kernel32.CloseHandle(main_mod._MUTEX_HANDLE)
+                kernel32 = ctypes.windll.kernel32
+                kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+                kernel32.CloseHandle.restype = wintypes.BOOL
+                kernel32.CloseHandle(main_mod._MUTEX_HANDLE)
             except Exception:
                 pass
             main_mod._MUTEX_HANDLE = None
 
     def test_mutex_prevents_second_instance(self):
-        first = _ensure_single_instance()
-        self.assertTrue(first, "First instance must acquire the single-instance mutex")
+        test_mutex = f"Local\\ChatInt_Test_Mutex_{os.getpid()}_{uuid.uuid4().hex[:8]}"
+        first = _ensure_single_instance(mutex_name=test_mutex)
+        self.assertTrue(first, "First instance must acquire the isolated single-instance mutex")
 
         proc = subprocess.run(
             [
@@ -31,7 +37,7 @@ class TestSingleInstanceMutex(unittest.TestCase):
                 (
                     "import sys; sys.path.insert(0, 'src'); "
                     "from chatint.main import _ensure_single_instance; "
-                    "res = _ensure_single_instance(); "
+                    f"res = _ensure_single_instance(mutex_name={test_mutex!r}); "
                     "sys.exit(0 if res is False else 1)"
                 ),
             ],

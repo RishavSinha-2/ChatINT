@@ -67,4 +67,46 @@ Press `Ctrl+,` or click the **Settings** gear icon in the sidebar to enter your 
 | `Ctrl + \` | Add side-by-side split pane (up to 5) |
 | `Ctrl + Shift + =` | Branch active tab into a split pane |
 | `Ctrl + ,` | Open Settings |
-| `Escape` | Close any open modal |
+| `Escape` | Close any open modal or cancel inline message edit |
+
+---
+
+## 📦 Building Standalone `.exe`
+
+ChatInt packages into a single portable Windows executable (`dist/ChatInt.exe`) via PyInstaller using [ChatInt.spec](ChatInt.spec):
+
+```bash
+uv run pyinstaller ChatInt.spec --noconfirm
+```
+
+To output directly into a versioned release directory (e.g., `dist/v0.4.0/ChatInt.exe`):
+
+```bash
+uv run pyinstaller ChatInt.spec --noconfirm --distpath dist/v0.4.0
+```
+
+---
+
+## 🗂️ Data & Logs
+
+All runtime data is stored next to the project root in development mode, or next to `ChatInt.exe` when running the standalone executable:
+
+- **`.env`** — Provider API keys, encrypted at rest on Windows using per-user Windows DPAPI (`dpapi:...` values) and managed through **Settings → Providers**.
+- **`data/chatint.db`** — SQLite WAL database containing conversations, messages, provider/model configurations, and token usage ledgers. Automatic pre-migration backups are written to **`data/chatint.db.bak`** whenever schema migrations run.
+- **`data/logs/chatint.log`** — Rotating diagnostic log file with automatic secret scrubbing. You can open this directory directly via **Settings → General → Open Logs Folder**.
+
+---
+
+## 🧪 Running Tests
+
+Run the automated backend and frontend unit test suites with `uv`:
+
+```bash
+uv run python -m unittest discover -s tests -v
+```
+
+To optionally run the live GUI smoke test against a built standalone executable (ensure no live `ChatInt` session is open first):
+
+```bash
+CHATINT_RUN_EXE_SMOKE=1 CHATINT_EXE_PATH=dist/ChatInt.exe uv run python -m unittest tests/test_dist_exe.py -v
+```

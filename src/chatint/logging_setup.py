@@ -6,25 +6,70 @@ import re
 import sys
 import threading
 from pathlib import Path
-from typing import Optional
+from typing import Iterable, Optional, Set
 
 from chatint.config import DATA_DIR
 
 _SECRET_PATTERNS = [
-    re.compile(r"(sk-[A-Za-z0-9_-]{8})[A-Za-z0-9_-]+"),
+    re.compile(r"(sk-[A-Za-z0-9_-]{6})[A-Za-z0-9_-]+"),
     re.compile(r"(AIza[A-Za-z0-9_-]{6})[A-Za-z0-9_-]+"),
-    re.compile(r"(Bearer\s+[A-Za-z0-9._-]{6})[A-Za-z0-9._-]+", re.IGNORECASE),
-    re.compile(r"([A-Z0-9_]*API_KEY\s*=\s*)([^\s\"']+|\"[^\"]*\"|'[^']*')", re.IGNORECASE),
+    re.compile(r"(gsk_[A-Za-z0-9_-]{6})[A-Za-z0-9_-]+"),
+    re.compile(r"(xai-[A-Za-z0-9_-]{6})[A-Za-z0-9_-]+"),
+    re.compile(r"(pplx-[A-Za-z0-9_-]{6})[A-Za-z0-9_-]+"),
+    re.compile(r"(hf_[A-Za-z0-9_-]{6})[A-Za-z0-9_-]+"),
+    re.compile(r"(csk-[A-Za-z0-9_-]{6})[A-Za-z0-9_-]+"),
+    re.compile(r"(dpapi:)[A-Za-z0-9+/=_-]{8,}"),
+    re.compile(r"(Bearer\s+[A-Za-z0-9._-]{4})[A-Za-z0-9._-]+", re.IGNORECASE),
+    re.compile(
+        r"((?:x-api-key|x-goog-api-key|authorization)\s*[:=]\s*['\"]?[A-Za-z0-9._-]{4})[A-Za-z0-9._-]+",
+        re.IGNORECASE,
+    ),
+    re.compile(r"([?&](?:api_)?key=)[A-Za-z0-9._%-]{6,}", re.IGNORECASE),
+    re.compile(
+        r"([A-Z0-9_]*API_KEY\s*=\s*)([^\s\"']+|\"(?:\\.|[^\"\\])*\"|'[^']*')",
+        re.IGNORECASE,
+    ),
 ]
+
+_NON_SENSITIVE_PLACEHOLDERS = {"ollama", "local", "none", "null", "true", "false"}
+_KNOWN_SECRETS_LOCK = threading.RLock()
+_KNOWN_SECRETS: Set[str] = set()
 
 _LOGGING_CONFIGURED = False
 _CONFIG_LOCK = threading.Lock()
+
+
+def register_known_secrets(secrets: Iterable[str]) -> None:
+    """Register configured API key values so custom-format keys are also redacted from logs."""
+    with _KNOWN_SECRETS_LOCK:
+        for raw in secrets:
+            if not raw:
+                continue
+            val = str(raw)
+            trimmed = val.strip()
+            if len(trimmed) >= 8 and trimmed.lower() not in _NON_SENSITIVE_PLACEHOLDERS:
+                _KNOWN_SECRETS.add(trimmed)
+                if val != trimmed:
+                    _KNOWN_SECRETS.add(val)
+
+
+def replace_known_secrets(secrets: Iterable[str]) -> None:
+    """Replace the active in-memory set of known secrets for log redaction."""
+    with _KNOWN_SECRETS_LOCK:
+        _KNOWN_SECRETS.clear()
+        register_known_secrets(secrets)
 
 
 def scrub_secrets(text: str) -> str:
     if not text:
         return text
     out = str(text)
+    with _KNOWN_SECRETS_LOCK:
+        known_snapshot = sorted(_KNOWN_SECRETS, key=len, reverse=True)
+    for secret in known_snapshot:
+        if secret in out:
+            prefix = secret[:4] if len(secret) >= 10 else ""
+            out = out.replace(secret, f"{prefix}***")
     for pat in _SECRET_PATTERNS:
         out = pat.sub(r"\1***", out)
     return out
@@ -41,6 +86,14 @@ class _SecretScrubFilter(logging.Filter):
         except Exception:
             pass
         return True
+
+
+class _SecretScrubFormatter(logging.Formatter):
+    """Formats the complete log entry (including exc_info tracebacks) and scrubs all secrets."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        rendered = super().format(record)
+        return scrub_secrets(rendered)
 
 
 def get_logs_dir() -> Path:
@@ -63,7 +116,7 @@ def configure_logging(log_dir: Optional[Path] = None) -> logging.Logger:
         target_dir.mkdir(parents=True, exist_ok=True)
         log_file = target_dir / "chatint.log"
 
-        formatter = logging.Formatter(
+        formatter = _SecretScrubFormatter(
             "%(asctime)s [%(levelname)s] %(name)s (%(threadName)s): %(message)s"
         )
         scrub_filter = _SecretScrubFilter()
@@ -79,7 +132,7 @@ def configure_logging(log_dir: Optional[Path] = None) -> logging.Logger:
             file_handler.setFormatter(formatter)
             file_handler.addFilter(scrub_filter)
             logger.addHandler(file_handler)
-        except Exception:
+        except OSError:
             pass
 
         if not getattr(sys, "frozen", False):

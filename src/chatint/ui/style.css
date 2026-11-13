@@ -713,6 +713,7 @@ body {
 
 /* KaTeX Math Blocks */
 .katex-display-block {
+  display: block;
   margin: 12px 0;
   overflow-x: auto;
   overflow-y: hidden;
@@ -821,6 +822,12 @@ body {
   white-space: pre-wrap;
   word-break: break-word;
   position: relative;
+}
+
+.user-bubble.editing {
+  white-space: normal;
+  width: 100%;
+  max-width: 100%;
 }
 
 .user-actions {
@@ -1018,6 +1025,24 @@ body {
   border-radius: 0 6px 6px 0;
 }
 
+.assistant-markdown-content li.task-list-item {
+  list-style: none;
+  margin-left: -16px;
+}
+
+.assistant-markdown-content li.task-list-item input[type="checkbox"] {
+  margin-right: 6px;
+  vertical-align: middle;
+  accent-color: var(--accent-color);
+}
+
+.markdown-table-scroll {
+  width: 100%;
+  max-width: 100%;
+  overflow-x: auto;
+  margin: 12px 0;
+}
+
 .assistant-markdown-content table {
   border-collapse: collapse;
   width: 100%;
@@ -1025,6 +1050,10 @@ body {
   border: 1px solid var(--border-color);
   border-radius: 6px;
   overflow: hidden;
+}
+
+.markdown-table-scroll > table {
+  margin: 0;
 }
 
 .assistant-markdown-content th,
@@ -1049,8 +1078,8 @@ body {
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
 }
 
-.assistant-markdown-content img,
-.user-bubble img {
+.assistant-markdown-content img:not(.katex img),
+.user-bubble img:not(.katex img) {
   max-width: 100%;
   max-height: 440px;
   object-fit: cover;
@@ -1062,10 +1091,32 @@ body {
   transition: transform 0.2s ease, box-shadow 0.2s ease;
 }
 
-.assistant-markdown-content img:hover,
-.user-bubble img:hover {
+.assistant-markdown-content img:not(.katex img):hover,
+.user-bubble img:not(.katex img):hover {
   transform: scale(1.01);
   box-shadow: 0 6px 18px rgba(0, 0, 0, 0.22);
+}
+
+.blocked-external-image {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  margin: 8px 0;
+  padding: 7px 12px;
+  border-radius: 8px;
+  border: 1px dashed var(--border-color);
+  background: var(--bg-secondary);
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-family: inherit;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s, color 0.15s;
+}
+
+.blocked-external-image:hover {
+  background: var(--bg-tertiary);
+  border-color: var(--accent-color);
+  color: var(--text-primary);
 }
 
 /* Code Blocks with Header and Copy Button */

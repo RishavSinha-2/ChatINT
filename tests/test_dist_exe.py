@@ -1,42 +1,58 @@
 import ctypes
+from ctypes import wintypes
+import os
+from pathlib import Path
 import sqlite3
 import subprocess
 import sys
 import time
 import unittest
-from pathlib import Path
 
-DIST_DIR = Path("dist/v0.4.0")
-DIST_EXE = DIST_DIR / "ChatInt.exe"
-DIST_DB = DIST_DIR / "data/chatint.db"
+
+def _resolve_dist_exe() -> Path:
+    override = os.environ.get("CHATINT_EXE_PATH", "").strip()
+    if override:
+        return Path(override)
+    default_candidate = Path("dist/v0.4.0/ChatInt.exe")
+    if default_candidate.exists():
+        return default_candidate
+    dist_root = Path("dist")
+    if dist_root.exists():
+        matches = sorted(dist_root.glob("**/ChatInt.exe"), key=lambda p: p.stat().st_mtime, reverse=True)
+        if matches:
+            return matches[0]
+    return default_candidate
+
+
+DIST_EXE = _resolve_dist_exe()
+RUN_EXE_SMOKE = os.environ.get("CHATINT_RUN_EXE_SMOKE", "").strip().lower() in ("1", "true", "yes") or bool(
+    os.environ.get("CHATINT_EXE_PATH", "").strip()
+)
 
 
 @unittest.skipUnless(
-    sys.platform == "win32" and DIST_EXE.exists() and DIST_DB.exists(),
-    "Built distribution dist/v0.4.0/ChatInt.exe not present",
+    sys.platform == "win32" and RUN_EXE_SMOKE and DIST_EXE.exists(),
+    "Set CHATINT_RUN_EXE_SMOKE=1 (or CHATINT_EXE_PATH) on Windows with built ChatInt.exe to run GUI exe smoke tests",
 )
 class TestDistExecutable(unittest.TestCase):
-    def test_dist_db_schema_and_providers(self):
-        with sqlite3.connect(DIST_DB) as conn:
-            c = conn.cursor()
-            c.execute("SELECT name FROM sqlite_master WHERE type='table'")
-            tables = {r[0] for r in c.fetchall()}
-            for required in ("conversations", "messages", "providers", "token_ledger", "app_settings"):
-                self.assertIn(required, tables)
-
-            c.execute("SELECT COUNT(*) FROM providers")
-            prov_count = c.fetchone()[0]
-            self.assertGreaterEqual(prov_count, 3)
-
-    def test_dist_exe_single_instance(self):
+    def test_dist_exe_launches_initializes_db_and_enforces_single_instance(self):
         user32 = ctypes.windll.user32
-        subprocess.run(["taskkill", "/F", "/IM", "ChatInt.exe"], capture_output=True)
-        time.sleep(0.5)
+        user32.FindWindowW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR]
+        user32.FindWindowW.restype = wintypes.HWND
+        user32.IsWindowVisible.argtypes = [wintypes.HWND]
+        user32.IsWindowVisible.restype = wintypes.BOOL
 
-        proc1 = subprocess.Popen([str(DIST_EXE)], cwd=str(DIST_DIR))
+        existing = user32.FindWindowW(None, "ChatInt")
+        if existing and user32.IsWindowVisible(existing):
+            self.skipTest("A live ChatInt window is already open; skipping exe smoke test to avoid colliding with user session.")
+
+        dist_dir = DIST_EXE.parent
+        dist_db = dist_dir / "data" / "chatint.db"
+
+        proc1 = subprocess.Popen([str(DIST_EXE)], cwd=str(dist_dir))
         try:
             hwnd = None
-            for _ in range(100):
+            for _ in range(120):
                 h = user32.FindWindowW(None, "ChatInt")
                 if h and user32.IsWindowVisible(h):
                     hwnd = h
@@ -44,16 +60,28 @@ class TestDistExecutable(unittest.TestCase):
                 time.sleep(0.05)
 
             self.assertIsNotNone(hwnd, "First executable instance must show a visible window")
+            self.assertTrue(dist_db.exists(), "Launching ChatInt.exe must initialize data/chatint.db even on a fresh build")
 
-            proc2 = subprocess.run([str(DIST_EXE)], cwd=str(DIST_DIR), capture_output=True, timeout=15)
+            with sqlite3.connect(dist_db) as conn:
+                c = conn.cursor()
+                c.execute("SELECT name FROM sqlite_master WHERE type='table'")
+                tables = {r[0] for r in c.fetchall()}
+                for required in ("conversations", "messages", "providers", "token_ledger", "app_settings"):
+                    self.assertIn(required, tables)
+
+                c.execute("SELECT COUNT(*) FROM providers")
+                prov_count = c.fetchone()[0]
+                self.assertGreaterEqual(prov_count, 3)
+
+            proc2 = subprocess.run([str(DIST_EXE)], cwd=str(dist_dir), capture_output=True, timeout=15)
             self.assertEqual(proc2.returncode, 0, "Second instance must exit cleanly with code 0")
         finally:
+            # Terminate ONLY the process tree we spawned (never `taskkill /IM ChatInt.exe`).
             subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc1.pid)], capture_output=True)
-            subprocess.run(["taskkill", "/F", "/IM", "ChatInt.exe"], capture_output=True)
             try:
                 proc1.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                pass
+                proc1.kill()
             time.sleep(0.3)
 
 

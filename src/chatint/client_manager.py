@@ -1,108 +1,83 @@
 from __future__ import annotations
 
-import concurrent.futures
 import json
 import os
-import re
 import socket
 import threading
 import time
-import urllib.parse
 from typing import Any, Dict, Iterable, List, Optional, Set
+import urllib.parse
 import warnings
 
 warnings.filterwarnings("ignore", category=SyntaxWarning)
 
+from chatint.catalog import (
+    is_gemini_3_or_newer,
+    model_recency_key,
+    sort_models_newer_first,
+    strip_model_prefix,
+)
 from chatint.db import (
     get_api_key_from_env,
     get_providers,
     get_web_search_models,
+    is_saved_secret_non_placeholder,
     open_db,
     sanitize_provider_name,
     save_web_search_models,
-    strip_model_prefix,
     update_provider_models,
 )
 from chatint.logging_setup import get_logger
 
 _logger = get_logger("chatint.client_manager")
 
-
-def is_gemini_3_or_newer(model_id: str) -> bool:
-    """Return True if Gemini model ID is generation 3 or newer (or unversioned modern alias)."""
-    mid = (model_id or "").lower()
-    m_ver = re.search(r"gemini[-_](\d+)", mid)
-    if m_ver:
-        return int(m_ver.group(1)) >= 3
-    return not any(legacy in mid for legacy in ("gemini-1", "gemini-2", "gemini/1", "gemini/2"))
+_DEFAULT_PROVIDER_URLS: Dict[str, str] = {
+    "openai": "https://api.openai.com/v1",
+    "openrouter": "https://openrouter.ai/api/v1",
+    "deepseek": "https://api.deepseek.com/v1",
+    "ollama": "http://localhost:11434/v1",
+}
 
 
-def model_recency_key(m: Any) -> tuple:
-    """
-    Ranks model dictionaries or IDs by estimated recency (newer models first).
-    Considers explicit creation timestamp, release date patterns (YYYY-MM-DD),
-    version numbers (e.g. 4.5 > 3.8 > 2.5), and capability tiers.
-    """
-    if isinstance(m, dict):
-        mid = (m.get("id") or "").lower()
-        created = m.get("created", 0)
+def normalize_endpoint_origin(url: Optional[str], provider_id: str = "") -> tuple[str, str, int]:
+    """Normalize an endpoint URL to its canonical (scheme, host, port) origin for host-bound key checks."""
+    raw = (url or "").strip()
+    if not raw:
+        raw = _DEFAULT_PROVIDER_URLS.get((provider_id or "").strip().lower(), "https://api.openai.com/v1")
+    if "://" not in raw:
+        lowered = raw.lower()
+        default_scheme = (
+            "http"
+            if lowered.startswith(("localhost", "127.0.0.1", "[::1]"))
+            else "https"
+        )
+        raw = f"{default_scheme}://{raw}"
+    parsed = urllib.parse.urlparse(raw)
+    scheme = (parsed.scheme or "https").lower()
+    host = (parsed.hostname or "").lower()
+    if host in ("127.0.0.1", "::1"):
+        norm_host = "localhost"
     else:
-        mid = str(m or "").lower()
-        created = 0
-
-    if not isinstance(created, (int, float)):
-        created = 0
-
-    date_val = 0
-    m_date = re.search(r"(202\d)[-_]?([01]\d)[-_]?([0-3]\d)", mid)
-    if m_date:
-        try:
-            date_val = int(m_date.group(1) + m_date.group(2) + m_date.group(3))
-        except Exception:
-            pass
-
-    ver_val = 0.0
-    m_dec = re.search(r"[-_v]?(\d+\.\d+)", mid)
-    if m_dec:
-        try:
-            ver_val = float(m_dec.group(1))
-        except Exception:
-            pass
-    else:
-        m_dash = re.search(r"[-_](\d+)[-_](\d+)(?:[-_]|$)", mid)
-        if m_dash and int(m_dash.group(1)) <= 10:
-            ver_val = float(f"{m_dash.group(1)}.{m_dash.group(2)}")
-        else:
-            m_single = re.search(r"(?:gpt|gemini|claude|llama|deepseek|qwen|v)[-_]?(\d+)", mid)
-            if m_single:
-                try:
-                    ver_val = float(m_single.group(1))
-                except Exception:
-                    pass
-
-    bonus = 0
-    if any(k in mid for k in ["o3", "o1", "r1", "reasoner"]):
-        bonus += 50
-    if any(k in mid for k in ["4o", "4.5", "argon", "carbon"]):
-        bonus += 40
-    if any(k in mid for k in ["latest", "preview"]):
-        bonus += 20
-    if any(k in mid for k in ["deprecated", "legacy", "0301", "0314", "0613"]):
-        bonus -= 100
-    if any(k in mid for k in ["embedding", "moderation", "tts", "whisper", "audio", "realtime"]):
-        bonus -= 500
-
-    return (created, date_val, ver_val, bonus)
+        norm_host = host
+    try:
+        port = parsed.port or (443 if scheme == "https" else 80)
+    except ValueError:
+        port = 443 if scheme == "https" else 80
+    return (scheme, norm_host, port)
 
 
-def sort_models_newer_first(models: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    return sorted(models, key=model_recency_key, reverse=True)
+def is_loopback_endpoint(url: Optional[str]) -> bool:
+    raw = (url or "").strip()
+    if not raw:
+        return False
+    if "://" not in raw:
+        raw = f"http://{raw}"
+    parsed = urllib.parse.urlparse(raw)
+    return (parsed.hostname or "").lower() in ("localhost", "127.0.0.1", "::1")
 
 
 def _is_network_available(base_urls: Optional[Iterable[str]] = None) -> bool:
-    """
-    Fast check whether local/proxy/internet connectivity is available without leaking sockets.
-    """
+    """Fast check whether local/proxy/internet connectivity is available without leaking sockets."""
     for raw_url in base_urls or ():
         url = (raw_url or "").strip()
         if not url:
@@ -156,7 +131,7 @@ def _is_transport_exception(exc: Exception) -> bool:
                 cls_obj = getattr(mod, cname, None)
                 if cls_obj and isinstance(exc, cls_obj):
                     return True
-        except Exception:
+        except ImportError:
             pass
 
     err_str = str(exc).lower()
@@ -165,7 +140,20 @@ def _is_transport_exception(exc: Exception) -> bool:
         "connection" in err_type
         or "timeout" in err_type
         or "transport" in err_type
-        or any(k in err_str for k in ("connect", "dns", "no such host", "network", "timeout", "timed out", "unreachable", "refused", "reset"))
+        or any(
+            k in err_str
+            for k in (
+                "connect",
+                "dns",
+                "no such host",
+                "network",
+                "timeout",
+                "timed out",
+                "unreachable",
+                "refused",
+                "reset",
+            )
+        )
     )
 
 
@@ -178,8 +166,9 @@ class ClientManager:
             close_fn = getattr(client, "close", None)
             if callable(close_fn):
                 close_fn()
-        except Exception:
-            pass
+        except Exception as exc:
+            _logger.debug("Ignored error closing SDK client: %s", exc)
+
     @classmethod
     def get_provider(cls, provider_id: str) -> Optional[Dict[str, Any]]:
         providers = get_providers()
@@ -190,9 +179,7 @@ class ClientManager:
 
     @classmethod
     def get_sdk_type(cls, provider: Optional[Dict[str, Any]], provider_id: str = "") -> str:
-        """
-        Determines which SDK to use: 'anthropic', 'gemini', or 'openai'.
-        """
+        """Determine which SDK adapter to use: 'anthropic', 'gemini', or 'openai'."""
         pid = (provider.get("id") if provider else provider_id or "").strip().lower()
         pname = sanitize_provider_name(provider.get("name", "") if provider else "").lower()
         if pid == "anthropic" or pname == "anthropic":
@@ -202,6 +189,12 @@ class ClientManager:
         return "openai"
 
     @classmethod
+    def validate_provider_ready(cls, provider_id: str) -> Optional[str]:
+        """Verify that a saved provider is enabled and has credentials configured before destructive edits."""
+        _, _, err = cls._resolve_provider_auth(provider_id)
+        return err
+
+    @classmethod
     def _resolve_provider_auth(
         cls,
         provider_id: str,
@@ -209,27 +202,87 @@ class ClientManager:
         override_base_url: Optional[str] = None,
         override_is_enabled: Optional[bool] = None,
         clear_api_key: bool = False,
+        provider_name: Optional[str] = None,
     ) -> tuple[Optional[Dict[str, Any]], Optional[str], Optional[str]]:
-        provider = cls.get_provider(provider_id)
-        if not provider:
-            provider = {"id": provider_id, "name": provider_id, "is_enabled": True}
-        else:
-            provider = dict(provider)
+        all_providers = get_providers()
+        db_provider = next((p for p in all_providers if p["id"] == provider_id), None)
 
-        if override_base_url is not None and str(override_base_url).strip():
-            provider["base_url"] = str(override_base_url).strip()
+        if db_provider is not None:
+            provider = dict(db_provider)
+            if provider_name and sanitize_provider_name(provider_name):
+                provider["name"] = sanitize_provider_name(provider_name)
+            sdk_type = cls.get_sdk_type(provider, provider_id)
+            saved_base_url = str(db_provider.get("base_url") or "").strip()
+            if override_base_url is not None:
+                effective_base_url = str(override_base_url).strip()
+                provider["base_url"] = effective_base_url
+                origin_changed = sdk_type == "openai" and (
+                    normalize_endpoint_origin(saved_base_url, provider_id)
+                    != normalize_endpoint_origin(effective_base_url, provider_id)
+                )
+            else:
+                effective_base_url = saved_base_url
+                origin_changed = False
+        else:
+            clean_name = sanitize_provider_name(provider_name or provider_id) or "Provider"
+            effective_base_url = str(override_base_url or "").strip()
+            provider = {
+                "id": provider_id,
+                "name": clean_name,
+                "base_url": effective_base_url,
+                "is_enabled": True,
+            }
+            sdk_type = cls.get_sdk_type(provider, provider_id)
+            # Prevent unsaved custom provider rows from borrowing an existing provider's .env key on a new host
+            matching_named = next(
+                (p for p in all_providers if sanitize_provider_name(p.get("name", "")).upper() == clean_name.upper()),
+                None,
+            )
+            if matching_named is not None and sdk_type == "openai":
+                origin_changed = normalize_endpoint_origin(
+                    matching_named.get("base_url"), matching_named["id"]
+                ) != normalize_endpoint_origin(effective_base_url, provider_id)
+            else:
+                origin_changed = False
 
         is_enabled = provider.get("is_enabled", True) if override_is_enabled is None else bool(override_is_enabled)
-        if not is_enabled and not override_api_key:
+        has_override_key = override_api_key is not None and str(override_api_key).strip() != ""
+        if not is_enabled and not has_override_key:
             return None, None, f"Provider '{provider['name']}' is currently disabled in Settings."
 
-        clean_override_key = (override_api_key or "").strip() if override_api_key is not None else ""
-        if clear_api_key and not clean_override_key:
+        if clear_api_key and not has_override_key:
+            if sdk_type == "openai" and is_loopback_endpoint(effective_base_url):
+                return provider, "ollama", None
             return None, None, f"API key for {provider['name']} is cleared. Enter an API key before fetching."
 
-        api_key = clean_override_key or get_api_key_from_env(provider.get("name", ""))
+        if has_override_key:
+            return provider, str(override_api_key), None
+
+        # Host-bound secret guard (C2): never transmit a saved .env key to a different base_url host!
+        if origin_changed:
+            if sdk_type == "openai" and is_loopback_endpoint(effective_base_url):
+                return provider, "ollama", None
+            saved_lookup_name = db_provider.get("name", "") if db_provider else provider.get("name", "")
+            saved_secret = get_api_key_from_env(saved_lookup_name)
+            if is_saved_secret_non_placeholder(saved_secret):
+                return (
+                    None,
+                    None,
+                    f"Base URL host changed for {provider['name']}. Please enter the API key for the new endpoint "
+                    "(saved keys are never sent to a different host).",
+                )
+            return None, None, f"API key for {provider['name']} is required for this endpoint."
+
+        lookup_name = db_provider.get("name", "") if db_provider else provider.get("name", "")
+        api_key = get_api_key_from_env(lookup_name)
+        if not api_key and sdk_type == "openai" and is_loopback_endpoint(effective_base_url):
+            api_key = "ollama"
         if not api_key:
-            return None, None, f"API key for {provider['name']} is missing in .env. Please set it in Settings (Ctrl+,)."
+            return (
+                None,
+                None,
+                f"API key for {provider['name']} is missing in .env. Please set it in Settings (Ctrl+,).",
+            )
         return provider, api_key, None
 
     @classmethod
@@ -240,7 +293,8 @@ class ClientManager:
         api_key: Optional[str] = None,
         is_enabled: Optional[bool] = None,
         clear_api_key: bool = False,
-    ) -> tuple[Optional[anthropic.Anthropic], Optional[str]]:
+        provider_name: Optional[str] = None,
+    ) -> tuple[Optional[Any], Optional[str]]:
         import anthropic
         import httpx2
 
@@ -249,6 +303,7 @@ class ClientManager:
             override_api_key=api_key,
             override_is_enabled=is_enabled,
             clear_api_key=clear_api_key,
+            provider_name=provider_name,
         )
         if err:
             return None, err
@@ -268,7 +323,8 @@ class ClientManager:
         api_key: Optional[str] = None,
         is_enabled: Optional[bool] = None,
         clear_api_key: bool = False,
-    ) -> tuple[Optional[genai.Client], Optional[str]]:
+        provider_name: Optional[str] = None,
+    ) -> tuple[Optional[Any], Optional[str]]:
         from google import genai
         from google.genai import types as genai_types
 
@@ -277,6 +333,7 @@ class ClientManager:
             override_api_key=api_key,
             override_is_enabled=is_enabled,
             clear_api_key=clear_api_key,
+            provider_name=provider_name,
         )
         if err:
             return None, err
@@ -297,10 +354,9 @@ class ClientManager:
         base_url: Optional[str] = None,
         is_enabled: Optional[bool] = None,
         clear_api_key: bool = False,
-    ) -> tuple[Optional[openai.OpenAI], Optional[str]]:
-        """
-        Returns (openai_client, error_message).
-        """
+        provider_name: Optional[str] = None,
+    ) -> tuple[Optional[Any], Optional[str]]:
+        """Return (openai_client, error_message)."""
         import httpx
         import openai
 
@@ -310,11 +366,16 @@ class ClientManager:
             override_base_url=base_url,
             override_is_enabled=is_enabled,
             clear_api_key=clear_api_key,
+            provider_name=provider_name,
         )
-        if err:
+        if err or not provider:
             return None, err
 
-        base_url_val = (base_url or provider.get("base_url") or "").strip() or "https://api.openai.com/v1"
+        raw_url = provider.get("base_url") if base_url is None else base_url
+        base_url_val = (
+            str(raw_url or "").strip()
+            or _DEFAULT_PROVIDER_URLS.get(provider_id.lower(), "https://api.openai.com/v1")
+        )
         client = openai.OpenAI(
             base_url=base_url_val,
             api_key=key,
@@ -333,129 +394,85 @@ class ClientManager:
         is_enabled: Optional[bool] = None,
         clear_api_key: bool = False,
         update_sync_state: bool = True,
+        provider_name: Optional[str] = None,
     ) -> tuple[List[Dict[str, Any]], Optional[str], bool]:
         """
-        Fetches models with a strict wall-clock TTL (default 60s).
-        Uses native SDK for Anthropic and Gemini, and OpenAI SDK for all other providers.
-        Returns (models_list, error_message, is_network_error).
+        Fetch models with a strict wall-clock timeout using a daemon worker thread (fixes M6).
+        The SDK client is closed inside the worker's own `finally:` block so a wall-clock timeout
+        never closes `httpx` out from under an active read or blocks Python's `atexit` shutdown.
         """
+        from chatint.providers import get_provider_adapter
+
         provider = cls.get_provider(provider_id)
         if not provider:
-            provider = {"id": provider_id, "name": provider_id, "is_enabled": True}
+            provider = {
+                "id": provider_id,
+                "name": sanitize_provider_name(provider_name or provider_id) or "Provider",
+                "is_enabled": True,
+            }
 
         sdk_type = cls.get_sdk_type(provider, provider_id)
+        adapter = get_provider_adapter(sdk_type)
+        per_call_timeout = max(1.0, min(float(timeout), 15.0))
 
         if sdk_type == "anthropic":
             client, err = cls.get_anthropic_client(
-                provider_id, timeout=timeout, api_key=api_key, is_enabled=is_enabled, clear_api_key=clear_api_key
+                provider_id,
+                timeout=per_call_timeout,
+                api_key=api_key,
+                is_enabled=is_enabled,
+                clear_api_key=clear_api_key,
+                provider_name=provider_name,
             )
-            if err or not client:
-                return [], err, False
-
-            def _do_fetch_anthropic():
-                page = client.models.list(limit=100)
-                items = getattr(page, "data", None) or list(page)
-                result = []
-                for m in items:
-                    mid = (getattr(m, "id", "") or "").strip()
-                    if mid:
-                        result.append(mid)
-                return result
-
-            fetch_fn = _do_fetch_anthropic
-
         elif sdk_type == "gemini":
             client, err = cls.get_gemini_client(
-                provider_id, timeout=timeout, api_key=api_key, is_enabled=is_enabled, clear_api_key=clear_api_key
+                provider_id,
+                timeout=per_call_timeout,
+                api_key=api_key,
+                is_enabled=is_enabled,
+                clear_api_key=clear_api_key,
+                provider_name=provider_name,
             )
-            if err or not client:
-                return [], err, False
-
-            def _do_fetch_gemini():
-                result = []
-                for m in client.models.list():
-                    raw_name = (getattr(m, "name", "") or "").strip()
-                    if not raw_name:
-                        continue
-                    mid = strip_model_prefix(raw_name)
-                    actions = getattr(m, "supported_actions", None) or getattr(m, "supported_generation_methods", None)
-                    if actions and isinstance(actions, (list, tuple, set)):
-                        if not any("generateContent" in str(a) or "generate" in str(a).lower() for a in actions):
-                            continue
-                    if any(skip in mid.lower() for skip in ("embedding", "aqa", "imagen", "veo")):
-                        continue
-                    result.append(mid)
-                return result
-
-            fetch_fn = _do_fetch_gemini
-
         else:
             client, err = cls.get_client(
                 provider_id,
-                timeout=timeout,
+                timeout=per_call_timeout,
                 api_key=api_key,
                 base_url=base_url,
                 is_enabled=is_enabled,
                 clear_api_key=clear_api_key,
+                provider_name=provider_name,
             )
-            if err or not client:
-                return [], err, False
 
-            def _do_fetch_openai():
-                model_list = client.models.list()
-                items = []
-                for m in model_list.data:
-                    mid = (getattr(m, "id", "") or "").strip()
-                    if mid:
-                        created = getattr(m, "created", 0) or 0
-                        items.append({"id": mid, "created": created})
-                return items
+        if err or not client:
+            return [], err, False
 
-            fetch_fn = _do_fetch_openai
+        result_box: Dict[str, Any] = {}
 
-        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-        future = executor.submit(fetch_fn)
-        try:
-            raw_items = future.result(timeout=timeout)
-            executor.shutdown(wait=False)
-            seen = set()
-            models = []
-            for item in raw_items:
-                if isinstance(item, dict):
-                    mid = (item.get("id") or "").strip()
-                    created = item.get("created", 0)
-                else:
-                    mid = str(item).strip()
-                    created = 0
-                if mid and mid not in seen:
-                    seen.add(mid)
-                    is_thinking = 1 if any(t in mid.lower() for t in ["o1", "o3", "r1", "reasoning", "thinking"]) else 0
-                    models.append({
-                        "id": mid,
-                        "name": mid,
-                        "supports_thinking": is_thinking,
-                        "input_price": 0.0,
-                        "cached_input_price": 0.0,
-                        "output_price": 0.0,
-                        "created": created,
-                    })
-            models = sort_models_newer_first(models)
-            if update_sync_state:
-                if models:
-                    BackgroundModelSyncer.mark_provider_verified(provider_id, {m["id"] for m in models})
-                    BackgroundModelSyncer.set_sync_status(provider_id, "ready", "")
-                else:
-                    BackgroundModelSyncer.clear_provider_verified(provider_id)
-                    BackgroundModelSyncer.set_sync_status(provider_id, "error", "NO MODELS")
-            return models, None, False
-        except concurrent.futures.TimeoutError:
-            executor.shutdown(wait=False, cancel_futures=True)
+        def _worker() -> None:
+            try:
+                result_box["items"] = adapter.list_raw_models(client)
+            except Exception as exc:
+                result_box["error"] = exc
+            finally:
+                cls.close_client(client)
+
+        worker = threading.Thread(
+            target=_worker,
+            daemon=True,
+            name=f"model-fetch-{provider_id}",
+        )
+        worker.start()
+        worker.join(timeout=max(0.1, float(timeout)))
+
+        if worker.is_alive():
             if update_sync_state:
                 BackgroundModelSyncer.clear_provider_verified(provider_id)
                 BackgroundModelSyncer.set_sync_status(provider_id, "network_error", "NETWORK ERROR")
             return [], f"Request timed out after {int(timeout)}s", True
-        except Exception as e:
-            executor.shutdown(wait=False)
+
+        if "error" in result_box:
+            e = result_box["error"]
             err_str = str(e).lower()
             err_type = type(e).__name__.lower()
             is_net = _is_transport_exception(e)
@@ -466,8 +483,38 @@ class ClientManager:
                 status, brief = BackgroundModelSyncer.classify_sync_error(msg, is_net)
                 BackgroundModelSyncer.set_sync_status(provider_id, status, brief)
             return [], msg, is_net
-        finally:
-            cls.close_client(client)
+
+        raw_items = result_box.get("items") or []
+        seen = set()
+        models = []
+        for item in raw_items:
+            if isinstance(item, dict):
+                mid = (item.get("id") or "").strip()
+                created = item.get("created", 0)
+            else:
+                mid = str(item).strip()
+                created = 0
+            if mid and mid not in seen:
+                seen.add(mid)
+                is_thinking = 1 if any(t in mid.lower() for t in ("o1", "o3", "r1", "reasoning", "thinking")) else 0
+                models.append({
+                    "id": mid,
+                    "name": mid,
+                    "supports_thinking": is_thinking,
+                    "input_price": 0.0,
+                    "cached_input_price": 0.0,
+                    "output_price": 0.0,
+                    "created": created,
+                })
+        models = sort_models_newer_first(models)
+        if update_sync_state:
+            if models:
+                BackgroundModelSyncer.mark_provider_verified(provider_id, {m["id"] for m in models})
+                BackgroundModelSyncer.set_sync_status(provider_id, "ready", "")
+            else:
+                BackgroundModelSyncer.clear_provider_verified(provider_id)
+                BackgroundModelSyncer.set_sync_status(provider_id, "error", "NO MODELS")
+        return models, None, False
 
 
 class BackgroundModelSyncer:
@@ -503,12 +550,12 @@ class BackgroundModelSyncer:
             )
         ):
             return "invalid_key", "INVALID KEY"
-        if "no api key" in low or "missing" in low:
+        if "no api key" in low or "missing" in low or "cleared" in low or "required" in low:
             return "no_key", "NO API KEY"
         return "error", "FETCH ERROR"
 
     @classmethod
-    def set_sync_status(cls, provider_id: str, status: str, reason: str = ""):
+    def set_sync_status(cls, provider_id: str, status: str, reason: str = "") -> None:
         with cls._lock:
             cls._sync_status[provider_id] = (status, reason)
 
@@ -528,20 +575,18 @@ class BackgroundModelSyncer:
         return ("checking", "CHECKING...") if has_api_key else ("no_key", "NO API KEY")
 
     @classmethod
-    def report_runtime_error(cls, provider_id: str, err_msg: str, is_network_error: bool = False):
-        """Update sync status if a runtime tool call (e.g. Web Search) hits an auth or network failure."""
+    def report_runtime_error(cls, provider_id: str, err_msg: str, is_network_error: bool = False) -> None:
+        """Update sync status if a runtime tool call hits an auth or network failure."""
         status, brief = cls.classify_sync_error(err_msg, is_network_error)
         cls.set_sync_status(provider_id, status, brief)
         if status in ("invalid_key", "no_key", "network_error"):
             cls.clear_provider_verified(provider_id)
-        from chatint.db import get_providers
-
         prov = next((p for p in get_providers() if p["id"] == provider_id), None)
         if prov:
             cls._emit_provider_update(prov)
 
     @classmethod
-    def _emit_provider_update(cls, provider_dict: Dict[str, Any]):
+    def _emit_provider_update(cls, provider_dict: Dict[str, Any]) -> None:
         pid = provider_dict.get("id", "")
         sig = (
             bool(provider_dict.get("is_accessible")),
@@ -571,10 +616,14 @@ class BackgroundModelSyncer:
                 return
             cls._last_emitted_sig[pid] = sig
         if cls._bridge:
-            cls._bridge.push_event({
+            ev = {
                 "type": "provider_models_updated",
                 "provider": provider_dict,
-            })
+            }
+            if hasattr(cls._bridge, "_push_event"):
+                cls._bridge._push_event(ev)
+            elif hasattr(cls._bridge, "push_event"):
+                cls._bridge.push_event(ev)
 
     @classmethod
     def is_provider_verified(cls, provider_id: str) -> bool:
@@ -587,32 +636,27 @@ class BackgroundModelSyncer:
             return set(cls._verified_model_ids.get(provider_id, set()))
 
     @classmethod
-    def mark_provider_verified(cls, provider_id: str, model_ids: Optional[Set[str]] = None):
+    def mark_provider_verified(cls, provider_id: str, model_ids: Optional[Set[str]] = None) -> None:
         with cls._lock:
             cls._verified_providers.add(provider_id)
             if model_ids is not None:
                 cls._verified_model_ids[provider_id] = set(model_ids)
 
     @classmethod
-    def clear_provider_verified(cls, provider_id: str):
+    def clear_provider_verified(cls, provider_id: str) -> None:
         with cls._lock:
             cls._verified_providers.discard(provider_id)
             cls._verified_model_ids.pop(provider_id, None)
             cls._last_emitted_sig.pop(provider_id, None)
 
     @classmethod
-    def set_bridge(cls, bridge: Any):
+    def set_bridge(cls, bridge: Any) -> None:
         cls._bridge = bridge
 
     @classmethod
     def start_background_sync(
         cls, bridge: Optional[Any] = None, provider_ids: Optional[Iterable[str]] = None
-    ):
-        """
-        Launches background fetch without blocking UI startup.
-        Each endpoint with an API key is fetched asynchronously with a 60s TTL.
-        If provider_ids is specified, only those providers are synced.
-        """
+    ) -> None:
         if bridge:
             cls._bridge = bridge
 
@@ -640,7 +684,7 @@ class BackgroundModelSyncer:
             threading.Thread(target=cls._sync_single_provider, args=(p["id"],), daemon=True).start()
 
     @classmethod
-    def _sync_single_provider(cls, provider_id: str):
+    def _sync_single_provider(cls, provider_id: str) -> None:
         with cls._lock:
             if provider_id in cls._in_flight:
                 return
@@ -654,7 +698,6 @@ class BackgroundModelSyncer:
             api_key = get_api_key_from_env(provider.get("name", ""))
             is_enabled = bool(provider.get("is_enabled", True))
 
-            # Strictly only fetch from endpoints that are enabled and have an API key associated with them
             if not is_enabled or not api_key:
                 cls.clear_provider_verified(provider_id)
                 status, brief = cls.get_sync_status(provider_id, has_api_key=bool(api_key), is_enabled=is_enabled)
@@ -670,7 +713,6 @@ class BackgroundModelSyncer:
                 cls._emit_provider_update(provider)
                 return
 
-            # Fetch with strict 60s TTL
             fetched, err, is_network_error = ClientManager.fetch_remote_models(provider_id, timeout=60.0)
 
             if err or not fetched:
@@ -692,7 +734,6 @@ class BackgroundModelSyncer:
                         cls._pending_network_retries.add(provider_id)
                 return
 
-            # Success: remove from pending retries and mark verified
             fetched_ids = {m["id"] for m in fetched}
             with cls._lock:
                 cls._pending_network_retries.discard(provider_id)
@@ -701,7 +742,6 @@ class BackgroundModelSyncer:
                 cls._verified_model_ids[provider_id] = set(fetched_ids)
                 cls._sync_status[provider_id] = ("ready", "")
 
-            # Re-read latest provider state from DB after network call to avoid overwriting concurrent user edits
             with open_db() as conn:
                 row = conn.execute("SELECT models_json FROM providers WHERE id = ?", (provider_id,)).fetchone()
             stored_models = json.loads(row["models_json"]) if row and row["models_json"] else []
@@ -710,7 +750,6 @@ class BackgroundModelSyncer:
             if not latest_provider:
                 return
 
-            # Sync models: retain existing configured models present in fetch (prune unavailable ones; no auto-fill)
             clean_fetched_lower = {strip_model_prefix(mid).lower() for mid in fetched_ids}
             retained = [
                 m
@@ -724,10 +763,8 @@ class BackgroundModelSyncer:
             latest_provider["sync_status"] = "ready"
             latest_provider["sync_error"] = ""
 
-            # Persist only this provider's models without touching or pruning other providers
             update_provider_models(provider_id, synced_models)
 
-            # Keep Web Search fallback models pruned against fetched Gemini models (no auto-add, fixed primary)
             if provider_id == "gemini":
                 ws_models = get_web_search_models()
                 kept_ws = [
@@ -737,24 +774,21 @@ class BackgroundModelSyncer:
                 ]
                 latest_provider["web_search_models"] = save_web_search_models([ws_models[0], *kept_ws])
 
-            # Push event to bridge memory queue if provider state actually changed
             cls._emit_provider_update(latest_provider)
         finally:
             with cls._lock:
                 cls._in_flight.discard(provider_id)
 
     @classmethod
-    def _network_watcher_loop(cls):
-        """
-        Periodically checks connectivity and retries pending network failures with exponential backoff.
-        """
+    def _network_watcher_loop(cls) -> None:
         while True:
             try:
                 time.sleep(5.0)
                 now = time.monotonic()
                 with cls._lock:
                     due = [
-                        pid for pid in cls._pending_network_retries
+                        pid
+                        for pid in cls._pending_network_retries
                         if cls._retry_backoff.get(pid, (0, 0.0))[1] <= now
                     ]
 
@@ -764,9 +798,13 @@ class BackgroundModelSyncer:
                 base_urls = []
                 try:
                     due_set = set(due)
-                    base_urls = [p.get("base_url", "") for p in get_providers() if p.get("id") in due_set and p.get("base_url")]
-                except Exception:
-                    pass
+                    base_urls = [
+                        p.get("base_url", "")
+                        for p in get_providers()
+                        if p.get("id") in due_set and p.get("base_url")
+                    ]
+                except Exception as exc:
+                    _logger.debug("Could not read provider base_urls in network watcher: %s", exc)
 
                 if _is_network_available(base_urls=base_urls):
                     for pid in due:

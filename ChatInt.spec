@@ -3,7 +3,29 @@ from PyInstaller.utils.hooks import collect_all, collect_submodules, copy_metada
 
 datas = [('src/chatint/ui', 'chatint/ui')]
 binaries = []
-hiddenimports = ['chatint.web_search_tool', 'ctypes', 'ctypes.wintypes', 'sqlite3']
+hiddenimports = [
+    'chatint.catalog',
+    'chatint.web_search_tool',
+    'chatint.storage',
+    'chatint.storage.connection',
+    'chatint.storage.conversations_repo',
+    'chatint.storage.dpapi',
+    'chatint.storage.ledger_repo',
+    'chatint.storage.providers_repo',
+    'chatint.storage.secrets',
+    'chatint.storage.settings_repo',
+    'chatint.providers',
+    'chatint.providers.base',
+    'chatint.providers.openai_adapter',
+    'chatint.providers.anthropic_adapter',
+    'chatint.providers.gemini_adapter',
+    'chatint.services',
+    'chatint.services.import_export',
+    'chatint.services.stream_coordinator',
+    'ctypes',
+    'ctypes.wintypes',
+    'sqlite3',
+]
 
 for pkg in ('webview', 'anthropic', 'openai', 'google.genai', 'google.auth', 'httpx2', 'httpx', 'certifi'):
     try:
@@ -64,4 +86,3 @@ exe = EXE(
     entitlements_file=None,
     icon=['src/chatint/ui/assets/logo.ico'],
 )
-
