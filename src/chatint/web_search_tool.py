@@ -4,6 +4,7 @@ import json
 import time
 from typing import Any, Dict, List, Optional
 
+from chatint import __version__
 from chatint.client_manager import BackgroundModelSyncer, ClientManager, is_gemini_3_or_newer, strip_model_prefix
 from chatint.db import (
     PRIMARY_WEB_SEARCH_MODEL,
@@ -139,7 +140,7 @@ def execute_image_search(query: str, max_results: int = 3) -> Dict[str, Any]:
         return {"ok": False, "query": "", "images": [], "error": "Query is empty."}
 
     max_count = max(1, min(int(max_results or 3), 3))
-    headers = {"User-Agent": "ChatInt/0.4.0 (Desktop Chat App; https://github.com/chatint)"}
+    headers = {"User-Agent": f"ChatInt/{__version__} (Desktop Chat App; https://github.com/chatint)"}
     images: List[Dict[str, str]] = []
     seen_urls: set[str] = set()
 

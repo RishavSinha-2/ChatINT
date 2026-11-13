@@ -1,3 +1,4 @@
+import contextlib
 import ctypes
 from ctypes import wintypes
 import os
@@ -6,6 +7,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+import tomllib
 import unittest
 
 
@@ -13,7 +15,7 @@ def _resolve_dist_exe() -> Path:
     override = os.environ.get("CHATINT_EXE_PATH", "").strip()
     if override:
         return Path(override)
-    default_candidate = Path("dist/v0.4.0/ChatInt.exe")
+    default_candidate = Path("dist/v0.5.0/ChatInt.exe")
     if default_candidate.exists():
         return default_candidate
     dist_root = Path("dist")
@@ -28,6 +30,27 @@ DIST_EXE = _resolve_dist_exe()
 RUN_EXE_SMOKE = os.environ.get("CHATINT_RUN_EXE_SMOKE", "").strip().lower() in ("1", "true", "yes") or bool(
     os.environ.get("CHATINT_EXE_PATH", "").strip()
 )
+
+
+class TestDistVersionInfo(unittest.TestCase):
+    @unittest.skipUnless(
+        sys.platform == "win32" and Path("dist/v0.5.0/ChatInt.exe").exists(),
+        "Requires built dist/v0.5.0/ChatInt.exe on Windows",
+    )
+    def test_v050_exe_embeds_windows_version_info(self):
+        from PyInstaller.utils.win32 import versioninfo
+
+        exe_path = Path("dist/v0.5.0/ChatInt.exe")
+        vi = versioninfo.read_version_info_from_executable(str(exe_path))
+        self.assertIsNotNone(vi, "ChatInt.exe must embed a VSVersionInfo RT_VERSION resource")
+
+        with Path("pyproject.toml").open("rb") as fh:
+            expected_version = tomllib.load(fh)["project"]["version"]
+
+        rendered = str(vi)
+        self.assertIn("StringStruct('ProductName', 'ChatInt')", rendered)
+        self.assertIn(f"StringStruct('ProductVersion', '{expected_version}')", rendered)
+        self.assertIn("StringStruct('OriginalFilename', 'ChatInt.exe')", rendered)
 
 
 @unittest.skipUnless(
@@ -62,7 +85,7 @@ class TestDistExecutable(unittest.TestCase):
             self.assertIsNotNone(hwnd, "First executable instance must show a visible window")
             self.assertTrue(dist_db.exists(), "Launching ChatInt.exe must initialize data/chatint.db even on a fresh build")
 
-            with sqlite3.connect(dist_db) as conn:
+            with contextlib.closing(sqlite3.connect(dist_db)) as conn:
                 c = conn.cursor()
                 c.execute("SELECT name FROM sqlite_master WHERE type='table'")
                 tables = {r[0] for r in c.fetchall()}
