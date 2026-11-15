@@ -112,6 +112,7 @@ export function applyTheme(theme, { persistState = true } = {}) {
     const iconName = theme === "light" ? "sun" : "moon";
     el.themeToggleBtn.innerHTML = `<i data-lucide="${iconName}" id="theme-icon" style="width: 16px; height: 16px;"></i>`;
     renderIcons(el.themeToggleBtn);
+    el.themeIcon = document.getElementById("theme-icon");
   } else if (el.themeIcon) {
     el.themeIcon.setAttribute("data-lucide", theme === "light" ? "sun" : "moon");
     renderIcons(document);

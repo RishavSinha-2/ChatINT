@@ -5,6 +5,9 @@ build/
 dist/
 wheels/
 *.egg-info
+*.bak
+.mypy_cache/
+.ruff_cache/
 
 # Virtual environments
 .venv
@@ -12,6 +15,9 @@ wheels/
 # Environment variables & secrets
 .env
 
-data/
-me.md
-bugs.md
+# Application data - track default baseline database, ignore logs & runtime artifacts
+data/logs/
+data/*.bak
+data/*.corrupted*
+data/*-wal
+data/*-shm

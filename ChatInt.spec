@@ -15,7 +15,7 @@ def _load_project_metadata() -> tuple[str, tuple[int, int, int, int], str, str]:
         with pyproject_path.open("rb") as fh:
             project = tomllib.load(fh).get("project", {})
 
-    raw_version = os.environ.get("CHATINT_VERSION", "").strip() or str(project.get("version", "0.5.0")).strip()
+    raw_version = os.environ.get("CHATINT_VERSION", "").strip() or str(project.get("version", "0.5.1")).strip()
     clean_version = raw_version.lstrip("vV")
     nums = [int(x) for x in re.findall(r"\d+", clean_version)[:4]]
     while len(nums) < 4:
@@ -23,7 +23,7 @@ def _load_project_metadata() -> tuple[str, tuple[int, int, int, int], str, str]:
     ver_tuple = (nums[0], nums[1], nums[2], nums[3])
 
     description = str(
-        project.get("description") or "Multi-tab, multi-provider desktop AI chat client built with Python and pywebview."
+        project.get("description") or "ChatInt App"
     )
     authors = project.get("authors") or []
     author_name = (
@@ -84,6 +84,14 @@ def _build_windows_version_info():
 
 
 datas = [('src/chatint/ui', 'chatint/ui')]
+
+spec_dir = Path(globals().get("SPECPATH", ".")).resolve()
+default_db_file = spec_dir / "build" / "default_data" / "chatint.db"
+if not default_db_file.is_file():
+    default_db_file = spec_dir / "data" / "chatint.db"
+if default_db_file.is_file():
+    datas.append((str(default_db_file), 'chatint/default_data'))
+
 binaries = []
 hiddenimports = [
     'chatint.catalog',
@@ -106,6 +114,7 @@ hiddenimports = [
     'chatint.services.stream_coordinator',
     'ctypes',
     'ctypes.wintypes',
+    'ipaddress',
     'sqlite3',
 ]
 
@@ -116,18 +125,39 @@ for pkg in ('webview', 'anthropic', 'openai', 'google.genai', 'google.auth', 'ht
         # so directory names on the build machine (e.g. "latest", "testing") never drop required package assets.
         clean_datas = [
             item for item in tmp_ret[0]
-            if not item[0].lower().endswith(('.py', '.pyc', '.pyi', '.md', '.txt', '.rst', '.keep', 'license', 'notice'))
+            if not item[0].lower().endswith(('.py', '.pyc', '.pyi', '.md', '.txt', '.rst', '.keep', 'license', 'notice', 'record', 'installer', 'direct_url.json'))
             and not any(part in ('test', 'tests', '__pycache__') for part in item[1].replace('\\', '/').lower().split('/'))
         ]
         datas += clean_datas
-        binaries += tmp_ret[1]
-        hiddenimports += tmp_ret[2]
+        binaries += [
+            b for b in tmp_ret[1]
+            if not any(arch in b[0].replace('\\', '/').lower() for arch in ('/win-arm64/', '/win-x86/'))
+        ]
+        clean_hidden = [
+            m for m in tmp_ret[2]
+            if not any(m.startswith(prefix) for prefix in (
+                'openai.cli',
+                'openai.resources.audio',
+                'openai.resources.fine_tuning',
+                'openai.resources.evals',
+                'openai.resources.batches',
+                'openai.resources.containers',
+                'openai.resources.uploads',
+                'openai.resources.vector_stores',
+                'anthropic.lib.tools._toolsets._browser',
+                'anthropic.lib.tools._toolsets._computer',
+            ))
+        ]
+        hiddenimports += clean_hidden
     except Exception:
         hiddenimports += collect_submodules(pkg)
 
 for dist_name in ('anthropic', 'google-genai', 'google-auth', 'openai', 'httpx', 'httpx2', 'pydantic', 'certifi'):
     try:
-        datas += copy_metadata(dist_name)
+        datas += [
+            item for item in copy_metadata(dist_name)
+            if not item[0].lower().endswith(('record', 'installer', 'direct_url.json'))
+        ]
     except Exception:
         pass
 
@@ -141,7 +171,16 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=['pytest', 'unittest', 'test', 'tkinter'],
+    excludes=[
+        'pytest', 'unittest', 'test', 'tests', 'tkinter', 'tcl', 'mypy', 'ast_serialize', 'librt',
+        'pydoc', 'pydoc_data', 'doctest', 'argcomplete',
+        'profile', 'cProfile', 'pdb', 'timeit', 'trace',
+        'pefile', 'PyInstaller',
+        'sqlite3.test', 'ctypes.test', 'email.test',
+        'smtplib', 'poplib', 'imaplib', 'ftplib', 'nntplib', 'telnetlib', 'xmlrpc',
+        'wave', 'sndhdr', 'sunau', 'aifc',
+        'turtle', 'turtledemo', 'idlelib',
+    ],
     noarchive=False,
     optimize=1,
 )

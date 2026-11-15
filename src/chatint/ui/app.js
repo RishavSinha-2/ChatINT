@@ -254,8 +254,11 @@ function importFileFromInput(file) {
 }
 
 function setupEventListeners() {
-  // Prevent top-level drag-and-drop navigation in WebView2 (`C1` bullet 4)
+  // Prevent top-level drag-and-drop navigation in WebView2 (`C1` bullet 4, `REF-L1`)
   window.addEventListener("dragover", (e) => {
+    const isTextInput = Boolean(e.target && (e.target.tagName === "TEXTAREA" || e.target.tagName === "INPUT"));
+    const isDraggingFiles = Boolean(e.dataTransfer && e.dataTransfer.types && Array.from(e.dataTransfer.types).includes("Files"));
+    if (isTextInput && !isDraggingFiles) return;
     e.preventDefault();
     if (e.dataTransfer) {
       const targetInSidebar = Boolean(e.target && e.target.closest && e.target.closest("#sidebar"));
@@ -264,6 +267,9 @@ function setupEventListeners() {
   });
 
   window.addEventListener("drop", (e) => {
+    const isTextInput = Boolean(e.target && (e.target.tagName === "TEXTAREA" || e.target.tagName === "INPUT"));
+    const isDraggingFiles = Boolean(e.dataTransfer && e.dataTransfer.types && Array.from(e.dataTransfer.types).includes("Files"));
+    if (isTextInput && !isDraggingFiles) return;
     e.preventDefault();
     const targetInSidebar = Boolean(e.target && e.target.closest && e.target.closest("#sidebar"));
     if (!targetInSidebar || document.querySelector(".modal-overlay.open")) return;

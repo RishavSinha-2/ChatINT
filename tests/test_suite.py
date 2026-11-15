@@ -3,7 +3,6 @@ import sys
 import tempfile
 import sqlite3
 import json
-import uuid
 import threading
 import unittest
 from pathlib import Path
@@ -17,7 +16,6 @@ import chatint.db as db_mod
 from chatint.db import (
     init_db,
     open_db,
-    get_connection,
     create_conversation,
     get_conversation,
     get_conversations,
@@ -26,40 +24,33 @@ from chatint.db import (
     delete_conversation,
     duplicate_conversation,
     import_conversation_data,
-    get_unique_conversation_title,
     get_branch_title,
     record_token_usage,
     get_token_stats,
     add_message,
     get_providers,
     save_providers,
-    update_provider_models,
     update_model_resolved_thinking,
     get_model_resolved_thinking,
-    remove_model_resolved_thinking,
     get_api_key_from_env,
     set_api_key_in_env,
-    read_env_dict,
-    write_env_dict,
     mask_api_key,
     get_app_settings,
 )
 from chatint.bridge import parse_chat_file_content, DesktopBridge
+from chatint.catalog import is_gemini_3_or_newer
 from chatint.client_manager import (
     BackgroundModelSyncer,
     ClientManager,
-    is_gemini_3_or_newer,
     _is_network_available,
     _is_transport_exception,
 )
 from chatint.naming import generate_chat_title
 from chatint.web_search_tool import (
     IMAGE_SEARCH_TOOL_NAME,
-    WEB_SEARCH_TOOL_NAME,
     MAX_TOOL_ROUNDS,
     get_openai_image_tool_spec,
     get_anthropic_image_tool_spec,
-    get_gemini_image_tool_declaration,
     get_web_search_system_hint,
     execute_image_search,
     execute_web_search,
@@ -111,6 +102,7 @@ class TestChatIntFeatures(unittest.TestCase):
             c.execute("DELETE FROM token_ledger")
             c.execute("DELETE FROM conversations")
             c.execute("DELETE FROM providers")
+            conn.commit()
         if self.env_path.exists():
             self.env_path.unlink()
         BackgroundModelSyncer._verified_providers.clear()
@@ -147,13 +139,13 @@ class TestChatIntFeatures(unittest.TestCase):
     def test_update_conversation_preserves_own_title(self):
         conv = create_conversation("Alpha")
         # Updating settings on the same conversation should NOT increment title
-        res_title = update_conversation(conv["id"], system_prompt="You are helpful.")
+        update_conversation(conv["id"], system_prompt="You are helpful.")
         updated = get_conversation(conv["id"])
         self.assertEqual(updated["title"], "Alpha")
         self.assertEqual(updated["system_prompt"], "You are helpful.")
 
     def test_update_conversation_rename_collision(self):
-        c1 = create_conversation("Original")
+        create_conversation("Original")
         c2 = create_conversation("Target")
 
         # Try renaming c2 to "Original"
@@ -182,8 +174,8 @@ class TestChatIntFeatures(unittest.TestCase):
     def test_duplicate_conversation(self):
         c1 = create_conversation("Research Topic", system_prompt="Expert Analyst", max_context=20)
         # Add messages and token usage to c1
-        m1 = add_message(c1["id"], "user", "What is quantum computing?", prompt_tokens=25)
-        m2 = add_message(
+        add_message(c1["id"], "user", "What is quantum computing?", prompt_tokens=25)
+        add_message(
             c1["id"],
             "assistant",
             "Quantum computing uses qubits...",
@@ -1516,6 +1508,106 @@ Gradient descent minimizes the loss function step by step.
         finally:
             db_mod.DB_PATH = prev_db
             cfg_mod.DB_PATH = prev_db
+
+    def test_ref_m1_image_search_null_thumbnail_and_empty_imageinfo(self):
+        """REF-M1: MediaWiki responses with null thumbnail and empty imageinfo do not raise AttributeError/IndexError."""
+        wiki_resp = MagicMock()
+        wiki_resp.status_code = 200
+        wiki_resp.json.return_value = {
+            "query": {
+                "pages": {
+                    "101": {
+                        "title": "Eiffel Tower",
+                        "thumbnail": None,  # Explicit None thumbnail
+                        "imageinfo": [],    # Explicit empty imageinfo
+                        "original": None,
+                        "extract": "Iron lattice tower in Paris.",
+                    },
+                    "102": {
+                        "title": "Eiffel Tower Base",
+                        "thumbnail": {"source": "https://upload.wikimedia.org/thumb.jpg"},
+                        "imageinfo": [{"thumburl": "https://upload.wikimedia.org/info.jpg"}],
+                        "original": {"source": "https://upload.wikimedia.org/orig.jpg"},
+                        "extract": "Base of tower.",
+                    },
+                }
+            }
+        }
+        with patch("httpx.get", return_value=wiki_resp):
+            res = execute_image_search("Eiffel Tower", max_results=3)
+        self.assertTrue(res["ok"])
+        self.assertGreaterEqual(len(res["images"]), 1)
+        self.assertEqual(res["images"][0]["title"], "Eiffel Tower Base")
+
+    def test_ref_l6_and_m3_loopback_endpoints(self):
+        """REF-L6 & REF-M3: is_loopback_endpoint supports scheme-less, 0.0.0.0, 127.*, and ipv6 loopback."""
+        from chatint.client_manager import is_loopback_endpoint
+        self.assertTrue(is_loopback_endpoint("localhost:11434"))
+        self.assertTrue(is_loopback_endpoint("http://localhost:11434"))
+        self.assertTrue(is_loopback_endpoint("127.0.0.1:8000"))
+        self.assertTrue(is_loopback_endpoint("http://127.0.0.2:8000"))
+        self.assertTrue(is_loopback_endpoint("http://127.12.34.56:5000"))
+        self.assertTrue(is_loopback_endpoint("0.0.0.0:11434"))
+        self.assertTrue(is_loopback_endpoint("http://0.0.0.0:8000"))
+        self.assertTrue(is_loopback_endpoint("http://[::1]:11434"))
+        self.assertTrue(is_loopback_endpoint("::1"))
+
+        self.assertFalse(is_loopback_endpoint("https://api.openai.com/v1"))
+        self.assertFalse(is_loopback_endpoint("http://192.168.1.1:8080"))
+        self.assertFalse(is_loopback_endpoint("http://10.0.0.1:8000"))
+        self.assertFalse(is_loopback_endpoint(""))
+        self.assertFalse(is_loopback_endpoint(None))
+
+    def test_ref_l5_and_ref_m4_tool_limits_and_token_stats(self):
+        """REF-L5 & REF-M4: MAX_TOOL_CALLS_PER_PROMPT is 10 and get_token_stats returns active_turn_tokens."""
+        from chatint.web_search_tool import MAX_TOOL_CALLS_PER_PROMPT
+        self.assertEqual(MAX_TOOL_CALLS_PER_PROMPT, 10)
+
+        conv = create_conversation("Token Stats Active Test")
+        stats_empty = get_token_stats(conv["id"])
+        self.assertIn("active_turn_tokens", stats_empty)
+        self.assertEqual(stats_empty["active_turn_tokens"]["total_tokens"], 0)
+
+        # Add message with tokens and verify active_turn_tokens reflects it
+        add_message(conv["id"], "user", "Hello")
+        add_message(conv["id"], "assistant", "Hi there", prompt_tokens=15, completion_tokens=8, cached_tokens=5)
+        stats_turn = get_token_stats(conv["id"])
+        self.assertEqual(stats_turn["active_turn_tokens"]["prompt_tokens"], 15)
+        self.assertEqual(stats_turn["active_turn_tokens"]["completion_tokens"], 8)
+        self.assertEqual(stats_turn["active_turn_tokens"]["cached_tokens"], 5)
+        self.assertEqual(stats_turn["active_turn_tokens"]["total_tokens"], 23)
+
+    def test_unique_conversation_title_number_only_base_and_empty_update(self):
+        """Verify number-only candidate like '(1)' increments cleanly without leading whitespace, and empty update defaults to 'New Chat'."""
+        from chatint.storage.conversations_repo import get_unique_conversation_title
+
+        self.assertEqual(get_unique_conversation_title(""), "New Chat")
+        self.assertEqual(get_unique_conversation_title("   "), "New Chat")
+
+        c1 = create_conversation("(1)")
+        self.assertEqual(c1["title"], "(1)")
+
+        # Candidate "(1)" collision should increment to "(1) (1)", NEVER leading space " (2)"
+        c2 = create_conversation("(1)")
+        self.assertEqual(c2["title"], "(1) (1)")
+
+        # Candidate "(1) (1)" collision increments to "(1) (2)"
+        c3 = create_conversation("(1) (1)")
+        self.assertEqual(c3["title"], "(1) (2)")
+
+        # update_conversation with empty string, whitespace, or None should never store empty title
+        c4 = create_conversation("Valid Name")
+        res_empty = update_conversation(c4["id"], title="")
+        self.assertTrue(res_empty and res_empty.startswith("New Chat"))
+        c4_data = get_conversation(c4["id"])
+        self.assertTrue(c4_data["title"] and not c4_data["title"].startswith(" "))
+
+        res_ws = update_conversation(c4["id"], title="   ")
+        self.assertTrue(res_ws and res_ws.startswith("New Chat"))
+
+        res_none = update_conversation(c4["id"], title=None)
+        self.assertTrue(res_none and res_none.startswith("New Chat"))
+
 
 
 if __name__ == "__main__":

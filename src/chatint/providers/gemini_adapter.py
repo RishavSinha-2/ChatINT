@@ -27,6 +27,7 @@ from chatint.providers.base import (
     record_resolved_thinking_level,
 )
 from chatint.web_search_tool import (
+    MAX_TOOL_CALLS_PER_PROMPT,
     MAX_TOOL_ROUNDS,
     get_gemini_image_tool_declaration,
     get_gemini_tool_declaration,
@@ -68,10 +69,11 @@ class GeminiAdapter(ProviderAdapter):
     ) -> Optional[tuple[str, int, int, int]]:
         from google.genai import types as genai_types
 
+        min_lvl = getattr(genai_types.ThinkingLevel, "MINIMAL", None)
         level_cfg = genai_types.GenerateContentConfig(
             system_instruction=system_instruction,
             max_output_tokens=60,
-            thinking_config=genai_types.ThinkingConfig(thinking_level="MINIMAL"),
+            thinking_config=genai_types.ThinkingConfig(thinking_level=min_lvl) if min_lvl is not None else None,
         )
         budget_cfg = genai_types.GenerateContentConfig(
             system_instruction=system_instruction,
@@ -209,9 +211,10 @@ def _stream_gemini(
                 cfg_kwargs["tools"] = gemini_fn_tools
             if effort is not None:
                 if mode == "level":
+                    parsed_lvl = getattr(genai_types.ThinkingLevel, str(effort).upper(), None)
                     cfg_kwargs["thinking_config"] = genai_types.ThinkingConfig(
                         include_thoughts=True,
-                        thinking_level=effort,
+                        thinking_level=parsed_lvl,
                     )
                 elif mode == "budget":
                     budget = _GEMINI_THINKING_BUDGETS.get(effort, 4096)
@@ -272,6 +275,7 @@ def _stream_gemini(
         has_emitted_start = False
         stream_had_error = False
         actual_thinking_level = "none"
+        total_executed_tool_calls = 0
 
         for tool_round in range(MAX_TOOL_ROUNDS + 1):
             if abort_event.is_set():
@@ -284,7 +288,15 @@ def _stream_gemini(
             else:
                 effort_chain = [None if actual_thinking_level == "none" else actual_thinking_level]
 
-            use_tools_opts = [True, False] if (gemini_fn_tools and tool_round < MAX_TOOL_ROUNDS) else [False]
+            use_tools_opts = (
+                [True, False]
+                if (
+                    gemini_fn_tools
+                    and tool_round < MAX_TOOL_ROUNDS
+                    and total_executed_tool_calls < MAX_TOOL_CALLS_PER_PROMPT
+                )
+                else [False]
+            )
             active_stream = None
             last_err = None
 
@@ -308,7 +320,7 @@ def _stream_gemini(
                                     first_chunk = next(stream_iter)
                                     active_stream = itertools.chain([first_chunk], stream_iter)
                                 except StopIteration:
-                                    active_stream = iter([])
+                                    active_stream = itertools.chain()
                                 actual_thinking_level = effort if effort is not None else "none"
                                 record_resolved_thinking_level(
                                     provider_id, model_id, thinking_level, actual_thinking_level
@@ -376,9 +388,11 @@ def _stream_gemini(
             round_parts: List[Any] = []
             round_fn_calls: List[Any] = []
 
-            def _consume_gemini_stream(stream_iter):
-                nonlocal is_in_think_tag, think_buffer, round_in, round_out, round_cached, has_round_emitted_thinking
-                for chunk in stream_iter:
+            if active_stream is None:
+                break
+
+            try:
+                for chunk in active_stream:
                     if abort_event.is_set():
                         break
 
@@ -440,9 +454,6 @@ def _stream_gemini(
                                     stream_id=stream_id,
                                     has_round_visible_text=has_round_visible_text,
                                 )
-
-            try:
-                _consume_gemini_stream(active_stream)
             except Exception as e:
                 stream_had_error = True
                 _logger.warning("Gemini streaming loop exception: %s", e)
@@ -487,18 +498,43 @@ def _stream_gemini(
             if not round_fn_calls or abort_event.is_set() or tool_round >= MAX_TOOL_ROUNDS:
                 break
 
-            valid_parts = [
-                p
-                for p in round_parts
-                if getattr(p, "text", None)
-                or getattr(p, "thought", False)
-                or getattr(p, "function_call", None)
-                or getattr(p, "thought_signature", None)
-            ]
-            contents.append(genai_types.Content(role="model", parts=valid_parts or round_parts))
+            # Coalesce contiguous streamed text chunks into consolidated Part objects (`REF-L3`)
+            coalesced_parts = []
+            text_accumulator: List[str] = []
+
+            for p in round_parts:
+                fc = getattr(p, "function_call", None)
+                is_thought = getattr(p, "thought", False)
+                has_thought_sig = getattr(p, "thought_signature", None)
+                p_text = getattr(p, "text", None)
+
+                if fc or is_thought or has_thought_sig:
+                    if text_accumulator:
+                        combined_text = "".join(text_accumulator)
+                        if combined_text:
+                            coalesced_parts.append(genai_types.Part.from_text(text=combined_text))
+                        text_accumulator.clear()
+                    coalesced_parts.append(p)
+                elif isinstance(p_text, str) and p_text:
+                    text_accumulator.append(p_text)
+                else:
+                    if text_accumulator:
+                        combined_text = "".join(text_accumulator)
+                        if combined_text:
+                            coalesced_parts.append(genai_types.Part.from_text(text=combined_text))
+                        text_accumulator.clear()
+                    coalesced_parts.append(p)
+
+            if text_accumulator:
+                combined_text = "".join(text_accumulator)
+                if combined_text:
+                    coalesced_parts.append(genai_types.Part.from_text(text=combined_text))
+                text_accumulator.clear()
+
+            contents.append(genai_types.Content(role="model", parts=coalesced_parts or round_parts))
             fn_response_parts = []
             for fc in round_fn_calls:
-                if abort_event.is_set():
+                if abort_event.is_set() or total_executed_tool_calls >= MAX_TOOL_CALLS_PER_PROMPT:
                     break
                 fc_name = getattr(fc, "name", "") or ""
                 fc_args = getattr(fc, "args", None) or {}
@@ -510,6 +546,7 @@ def _stream_gemini(
                 res = _run_web_search_tool_call(
                     bridge, tab_id, conversation_id, fc_name, fc_args, abort_event, stream_id=stream_id
                 )
+                total_executed_tool_calls += 1
                 fn_response_parts.append(genai_types.Part.from_function_response(name=fc_name, response=res))
 
             if not fn_response_parts or abort_event.is_set():

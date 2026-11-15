@@ -22,7 +22,7 @@ BUILTIN_PROVIDER_ORDER = {p["id"]: idx for idx, p in enumerate(DEFAULT_PROVIDERS
 
 
 def get_providers() -> List[Dict[str, Any]]:
-    from chatint.client_manager import BackgroundModelSyncer, is_loopback_endpoint
+    from chatint.client_manager import BackgroundModelSyncer
 
     with open_db() as conn:
         cursor = conn.cursor()

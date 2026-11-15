@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import socket
@@ -12,8 +13,6 @@ import warnings
 warnings.filterwarnings("ignore", category=SyntaxWarning)
 
 from chatint.catalog import (
-    is_gemini_3_or_newer,
-    model_recency_key,
     sort_models_newer_first,
     strip_model_prefix,
 )
@@ -70,10 +69,27 @@ def is_loopback_endpoint(url: Optional[str]) -> bool:
     raw = (url or "").strip()
     if not raw:
         return False
+    if raw in ("::1", "[::1]"):
+        return True
     if "://" not in raw:
-        raw = f"http://{raw}"
-    parsed = urllib.parse.urlparse(raw)
-    return (parsed.hostname or "").lower() in ("localhost", "127.0.0.1", "::1")
+        if raw.startswith("["):
+            raw = f"http://{raw}"
+        elif raw.count(":") >= 2:
+            raw = f"http://[{raw}]"
+        else:
+            raw = f"http://{raw}"
+    try:
+        parsed = urllib.parse.urlparse(raw)
+        host = (parsed.hostname or "").lower()
+        if host in ("localhost", "0.0.0.0"):
+            return True
+        try:
+            ip = ipaddress.ip_address(host)
+            return ip.is_loopback or ip.is_unspecified
+        except ValueError:
+            return False
+    except Exception:
+        return False
 
 
 def _is_network_available(base_urls: Optional[Iterable[str]] = None) -> bool:
@@ -180,8 +196,10 @@ class ClientManager:
     @classmethod
     def get_sdk_type(cls, provider: Optional[Dict[str, Any]], provider_id: str = "") -> str:
         """Determine which SDK adapter to use: 'anthropic', 'gemini', or 'openai'."""
-        pid = (provider.get("id") if provider else provider_id or "").strip().lower()
-        pname = sanitize_provider_name(provider.get("name", "") if provider else "").lower()
+        raw_pid = provider.get("id") if provider else provider_id
+        pid = str(raw_pid or "").strip().lower()
+        raw_pname = provider.get("name") if provider else ""
+        pname = sanitize_provider_name(str(raw_pname or "")).lower()
         if pid == "anthropic" or pname == "anthropic":
             return "anthropic"
         if pid == "gemini" or pname == "gemini":
@@ -296,7 +314,6 @@ class ClientManager:
         provider_name: Optional[str] = None,
     ) -> tuple[Optional[Any], Optional[str]]:
         import anthropic
-        import httpx2
 
         _, key, err = cls._resolve_provider_auth(
             provider_id,
@@ -308,9 +325,14 @@ class ClientManager:
         if err:
             return None, err
 
+        timeout_obj = (
+            anthropic.Timeout(timeout, connect=min(10.0, timeout))
+            if hasattr(anthropic, "Timeout")
+            else timeout
+        )
         client = anthropic.Anthropic(
             api_key=key,
-            timeout=httpx2.Timeout(timeout, connect=min(10.0, timeout)),
+            timeout=timeout_obj,
             max_retries=0,
         )
         return client, None
@@ -357,7 +379,6 @@ class ClientManager:
         provider_name: Optional[str] = None,
     ) -> tuple[Optional[Any], Optional[str]]:
         """Return (openai_client, error_message)."""
-        import httpx
         import openai
 
         provider, key, err = cls._resolve_provider_auth(
@@ -376,10 +397,15 @@ class ClientManager:
             str(raw_url or "").strip()
             or _DEFAULT_PROVIDER_URLS.get(provider_id.lower(), "https://api.openai.com/v1")
         )
+        timeout_obj = (
+            openai.Timeout(timeout, connect=min(10.0, timeout))
+            if hasattr(openai, "Timeout")
+            else timeout
+        )
         client = openai.OpenAI(
             base_url=base_url_val,
             api_key=key,
-            timeout=httpx.Timeout(timeout, connect=min(10.0, timeout)),
+            timeout=timeout_obj,
             max_retries=0,
         )
         return client, None

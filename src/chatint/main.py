@@ -104,6 +104,28 @@ def _find_existing_chatint_hwnd(user32: Any, kernel32: Any) -> int:
     return matched_hwnd
 
 
+def _release_single_instance() -> None:
+    """
+    Explicitly release and close the single-instance mutex handle so subsequent launches are never blocked.
+    """
+    global _MUTEX_HANDLE
+    if sys.platform != "win32" or _MUTEX_HANDLE is None:
+        return
+    try:
+        kernel32 = ctypes.windll.kernel32
+        kernel32.ReleaseMutex.argtypes = [wintypes.HANDLE]
+        kernel32.ReleaseMutex.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+
+        kernel32.ReleaseMutex(_MUTEX_HANDLE)
+        kernel32.CloseHandle(_MUTEX_HANDLE)
+    except Exception as exc:
+        _logger.debug("Failed releasing single-instance mutex: %s", exc)
+    finally:
+        _MUTEX_HANDLE = None
+
+
 def _ensure_single_instance(mutex_name: str = DEFAULT_MUTEX_NAME) -> bool:
     """
     Enforce a single running instance of ChatInt on Windows.
@@ -121,6 +143,8 @@ def _ensure_single_instance(mutex_name: str = DEFAULT_MUTEX_NAME) -> bool:
         kernel32.CreateMutexW.restype = wintypes.HANDLE
         kernel32.GetLastError.argtypes = []
         kernel32.GetLastError.restype = wintypes.DWORD
+        kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel32.WaitForSingleObject.restype = wintypes.DWORD
 
         user32.IsIconic.argtypes = [wintypes.HWND]
         user32.IsIconic.restype = wintypes.BOOL
@@ -138,6 +162,24 @@ def _ensure_single_instance(mutex_name: str = DEFAULT_MUTEX_NAME) -> bool:
                     if user32.IsIconic(hwnd):
                         user32.ShowWindow(hwnd, 9)  # SW_RESTORE only if minimized
                     user32.SetForegroundWindow(hwnd)
+                    return False
+
+                # If no visible window was found, a previous instance is likely closing/shutting down.
+                # Wait briefly (up to 1.5s) for the mutex to be released or abandoned.
+                WAIT_OBJECT_0 = 0x00000000
+                WAIT_ABANDONED = 0x00000080
+                wait_res = kernel32.WaitForSingleObject(_MUTEX_HANDLE, 1500)
+                if wait_res in (WAIT_OBJECT_0, WAIT_ABANDONED):
+                    _logger.info("Acquired single-instance mutex after previous instance closed.")
+                    return True
+
+                # If wait timed out, check once more if an existing window appeared
+                hwnd = _find_existing_chatint_hwnd(user32, kernel32)
+                if hwnd:
+                    if user32.IsIconic(hwnd):
+                        user32.ShowWindow(hwnd, 9)
+                    user32.SetForegroundWindow(hwnd)
+                    return False
             return False
     except Exception as exc:
         _logger.warning("Single-instance check skipped: %s", exc)
@@ -145,6 +187,10 @@ def _ensure_single_instance(mutex_name: str = DEFAULT_MUTEX_NAME) -> bool:
 
 
 def _prewarm_sdks() -> None:
+    try:
+        import httpx  # noqa: F401
+    except Exception:
+        pass
     try:
         import openai  # noqa: F401
     except Exception:
@@ -285,6 +331,7 @@ def _attach_origin_guard(window: webview.Window, bridge: DesktopBridge, index_ht
     # on the WinForms STA UI thread before `loaded` is set. `NavigationStarting` + `loaded` cover both pre/post load.
     window.events.loaded += _verify_current_url
     window.events.closing += bridge.flush_tabs_state
+    window.events.closed += _release_single_instance
 
 
 def main() -> None:
@@ -326,11 +373,28 @@ def main() -> None:
         min_size=(800, 580),
         background_color="#131314",
     )
+    if window is None:
+        _logger.error("Failed to create webview window.")
+        return
     bridge._attach_window(window, index_html.resolve().as_uri())
     _attach_origin_guard(window, bridge, index_html)
 
     icon_path = UI_DIR / "assets" / "logo.ico"
-    webview.start(debug=False, icon=str(icon_path) if icon_path.exists() else None)
+    try:
+        webview.start(debug=False, icon=str(icon_path) if icon_path.exists() else None)
+    finally:
+        bridge.flush_tabs_state()
+        _release_single_instance()
+
+    # Fast shutdown: prevent lingering background threads, socket teardown, or unstopped HTTP servers
+    # from delaying process termination or blocking immediate reopen.
+    try:
+        import logging
+        logging.shutdown()
+    except Exception:
+        pass
+    import os
+    os._exit(0)
 
 
 if __name__ == "__main__":

@@ -27,6 +27,7 @@ from chatint.providers.base import (
     record_resolved_thinking_level,
 )
 from chatint.web_search_tool import (
+    MAX_TOOL_CALLS_PER_PROMPT,
     MAX_TOOL_ROUNDS,
     get_anthropic_image_tool_spec,
     get_anthropic_tool_spec,
@@ -185,6 +186,7 @@ def _stream_anthropic(
         has_emitted_start = False
         stream_had_error = False
         actual_thinking_level = "none"
+        total_executed_tool_calls = 0
 
         for tool_round in range(MAX_TOOL_ROUNDS + 1):
             if abort_event.is_set():
@@ -212,7 +214,11 @@ def _stream_anthropic(
                     effort_candidates = _build_anthropic_effort_candidates(model_id, effort)
                     attempt_list: List[Dict[str, Any]] = []
                     for cand in effort_candidates:
-                        if anthropic_tools and tool_round < MAX_TOOL_ROUNDS:
+                        if (
+                            anthropic_tools
+                            and tool_round < MAX_TOOL_ROUNDS
+                            and total_executed_tool_calls < MAX_TOOL_CALLS_PER_PROMPT
+                        ):
                             attempt_list.append({**base_kwargs, **cand, "tools": anthropic_tools})
                         attempt_list.append({**base_kwargs, **cand})
 
@@ -284,6 +290,9 @@ def _stream_anthropic(
             round_out = 0
             round_cached = 0
             blocks_by_idx: Dict[int, Dict[str, Any]] = {}
+
+            if response_stream is None:
+                break
 
             try:
                 for event in response_stream:
@@ -510,7 +519,7 @@ def _stream_anthropic(
             for tb in assistant_blocks:
                 if tb.get("type") != "tool_use":
                     continue
-                if abort_event.is_set():
+                if abort_event.is_set() or total_executed_tool_calls >= MAX_TOOL_CALLS_PER_PROMPT:
                     break
                 res = _run_web_search_tool_call(
                     bridge,
@@ -521,6 +530,7 @@ def _stream_anthropic(
                     abort_event,
                     stream_id=stream_id,
                 )
+                total_executed_tool_calls += 1
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": tb["id"],

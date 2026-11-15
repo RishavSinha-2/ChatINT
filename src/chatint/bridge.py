@@ -241,7 +241,7 @@ def read_window_current_url(window: Any) -> str:
 
 class DesktopBridge:
     def __init__(self, *, allow_headless_rpc: bool = True):
-        self._event_queue = collections.deque()
+        self._event_queue: collections.deque[Dict[str, Any]] = collections.deque()
         self._queue_lock = threading.Lock()
         self._window: Optional[Any] = None
         self._window_ever_attached: bool = False
@@ -697,9 +697,9 @@ class DesktopBridge:
                 dialog_type = getattr(webview, "FileDialog", None)
                 open_mode = dialog_type.OPEN if dialog_type and hasattr(dialog_type, "OPEN") else webview.OPEN_DIALOG
                 file_types = (
-                    "Supported Files (*.json;*.md)",
+                    "Supported Files (*.json;*.md;*.markdown)",
                     "JSON Files (*.json)",
-                    "Markdown Files (*.md)",
+                    "Markdown Files (*.md;*.markdown)",
                     "All files (*.*)",
                 )
                 selected = win.create_file_dialog(open_mode, file_types=file_types)

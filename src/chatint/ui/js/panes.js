@@ -523,6 +523,7 @@ export function createPaneElement(tab, index, totalPanes) {
         ${totalPanes > 1 ? `<span class="pane-pos-indicator">${index + 1}/${totalPanes}</span>` : ""}
         ${!isFirst ? `<button class="icon-btn pane-move-left" title="Move Left"><i data-lucide="chevron-left" style="width: 14px; height: 14px;"></i></button>` : ""}
         ${!isLast ? `<button class="icon-btn pane-move-right" title="Move Right"><i data-lucide="chevron-right" style="width: 14px; height: 14px;"></i></button>` : ""}
+        <button class="icon-btn pane-branch-btn" title="Branch Chat (Ctrl+Shift+=)"><i data-lucide="git-branch" style="width: 14px; height: 14px;"></i></button>
         <button class="icon-btn pane-conv-settings-btn" title="Settings & Context"><i data-lucide="sliders-horizontal" style="width: 14px; height: 14px;"></i></button>
         <button class="icon-btn pane-export-btn" title="Export Chat"><i data-lucide="download" style="width: 14px; height: 14px;"></i></button>
         ${showClose ? `<button class="icon-btn pane-close-btn" title="Close this Pane"><i data-lucide="x" style="width: 14px; height: 14px;"></i></button>` : ""}
@@ -1100,11 +1101,19 @@ export async function populatePaneContent(pane, tab) {
   const chatInput = pane.querySelector(`#input-${tab.id}`);
   const sendBtn = pane.querySelector(`#send-btn-${tab.id}`);
   const stopBtn = pane.querySelector(`#stop-btn-${tab.id}`);
+  const branchBtn = pane.querySelector(".pane-branch-btn");
   const convSettingsBtn = pane.querySelector(".pane-conv-settings-btn");
   const exportBtn = pane.querySelector(".pane-export-btn");
 
   updatePaneModelDropdown(pane, tab);
   updatePaneWebSearchButton(pane, tab);
+
+  if (branchBtn) {
+    branchBtn.onclick = () => {
+      state.activeTabId = tab.id;
+      branchActiveTabToSplitPane();
+    };
+  }
 
   const webSearchBtn = pane.querySelector(`#web-search-btn-${tab.id}`);
   if (webSearchBtn) {
@@ -1654,12 +1663,25 @@ export function renderTokenStats(pane, tabId, stats) {
     state.googleSearchTotals = stats.google_search_totals;
   }
   const gt = (stats && stats.grand_total) || {};
+  const actTurn = stats && stats.active_turn_tokens;
+  if (summaryEl) {
+    if (actTurn && actTurn.total_tokens && actTurn.total_tokens !== gt.total_tokens) {
+      summaryEl.title = `Click to view breakdown (Active messages: ${formatTokens(actTurn.total_tokens)} | Cumulative spend: ${formatTokens(gt.total_tokens)})`;
+    } else {
+      summaryEl.title = "Click to view cache breakdown";
+    }
+  }
   const chatSearches = Number(gt.google_search_requests || 0);
   const gTotals =
     (stats && stats.google_search_totals) || state.googleSearchTotals || { monthly: 0, all_time: 0 };
   const monthSearches = Number(gTotals.monthly || 0);
   const allTimeSearches = Number(gTotals.all_time || 0);
+  const activeBreakdownHtml =
+    actTurn && actTurn.total_tokens && actTurn.total_tokens !== gt.total_tokens
+      ? `<div style="font-size: 11px; color: var(--text-muted); padding: 4px 0 2px 0;">Active messages: ${actTurn.prompt_tokens.toLocaleString()} in / ${actTurn.completion_tokens.toLocaleString()} out (${formatTokens(actTurn.total_tokens)} context) · Cumulative chat spend: ${formatTokens(gt.total_tokens)} total</div>`
+      : "";
   const searchSummaryHtml = `
+    ${activeBreakdownHtml}
     <div class="search-requests-row">
       <span class="search-requests-label"><i data-lucide="globe" style="width: 12px; height: 12px;"></i> Google Search Requests</span>
       <span class="search-requests-values">${chatSearches.toLocaleString()} this chat · ${monthSearches.toLocaleString()} / 5,000 this month · ${allTimeSearches.toLocaleString()} total</span>

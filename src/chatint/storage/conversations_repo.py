@@ -63,7 +63,7 @@ def get_unique_conversation_title(
         return candidate
 
     match = re.search(r"^(.*?)(?:\s*\((\d+)\))?$", candidate)
-    if match and match.group(2) and int(match.group(2)) <= 500:
+    if match and match.group(1) and match.group(1).strip() and match.group(2) and int(match.group(2)) <= 500:
         base = match.group(1).strip()
         start_num = int(match.group(2)) + 1
     else:
@@ -243,8 +243,10 @@ def update_conversation(conv_id: str, only_if_default: bool = False, **kwargs) -
                 conn.rollback()
                 return None
 
-        if "title" in kwargs and kwargs["title"]:
-            kwargs["title"] = get_unique_conversation_title(kwargs["title"], exclude_conv_id=conv_id, conn=conn)
+        if "title" in kwargs:
+            raw_title = (kwargs["title"] or "").strip() if isinstance(kwargs["title"], str) else ""
+            clean_title = raw_title or "New Chat"
+            kwargs["title"] = get_unique_conversation_title(clean_title, exclude_conv_id=conv_id, conn=conn)
             kwargs.setdefault("is_auto_named", 1)
 
         fields = [f"{k} = ?" for k in kwargs]
@@ -325,7 +327,7 @@ def import_conversation_data(
     max_context: int = 30,
     messages: Optional[List[Dict[str, Any]]] = None,
     created_at: Optional[float] = None,
-) -> Dict[str, Any]:
+) -> Optional[Dict[str, Any]]:
     """
     Import a conversation from parsed JSON/Markdown data with a deduplicated title.
     Preserves per-message token metadata while starting token_ledger spend at 0.

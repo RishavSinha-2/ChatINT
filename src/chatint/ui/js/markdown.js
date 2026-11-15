@@ -304,10 +304,10 @@ export function renderMarkdownWithEnhancements(markdownText, options = {}) {
     linkTokens.push(match);
     return `@@CIT_${nonce}_LINK_${idx}@@`;
   };
-  // Full Markdown image syntax `![alt](url)`
-  protectedText = protectedText.replace(/!\[(?:[^\[\]\\]|\\.)*\]\((?:[^()\n]|\\\(|\\\))*\)/g, stashLinkPiece);
+  // Full Markdown image syntax `![alt](url)` (supports balanced inner parentheses in URLs)
+  protectedText = protectedText.replace(/!\[(?:[^\[\]\\]|\\.)*\]\((?:\([^()\n]*\)|[^()\n]|\\\(|\\\))*\)/g, stashLinkPiece);
   // Markdown link destination `](url)` (leaving `[label]` open so math inside link text still renders!)
-  protectedText = protectedText.replace(/\]\((?:[^()\n]|\\\(|\\\))*\)/g, stashLinkPiece);
+  protectedText = protectedText.replace(/\]\((?:\([^()\n]*\)|[^()\n]|\\\(|\\\))*\)/g, stashLinkPiece);
   // Angle-bracket autolinks & HTML attributes (`href="..."`, `src="..."`, `alt="..."`, `title="..."`)
   protectedText = protectedText.replace(/<https?:\/\/[^>\s]+>/gi, stashLinkPiece);
   protectedText = protectedText.replace(/\b(?:href|src|alt|title)\s*=\s*(?:"[^"]*"|'[^']*')/gi, stashLinkPiece);

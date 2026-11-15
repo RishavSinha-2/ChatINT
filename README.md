@@ -76,7 +76,7 @@ Press `Ctrl+,` or click the **Settings** gear icon in the sidebar to enter your 
 ChatInt packages into a single portable Windows executable via PyInstaller using [ChatInt.spec](ChatInt.spec), automatically embedding Windows PE version metadata (`VSVersionInfo`) from `pyproject.toml`:
 
 ```bash
-uv run pyinstaller ChatInt.spec --noconfirm --clean --distpath dist/v0.5.0
+uv run pyinstaller ChatInt.spec --noconfirm --clean --distpath dist/v0.5.1
 ```
 
 ---

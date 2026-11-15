@@ -148,7 +148,7 @@ def configure_logging(log_dir: Optional[Path] = None) -> logging.Logger:
         def _sys_excepthook(exc_type, exc_value, exc_tb):
             if not issubclass(exc_type, KeyboardInterrupt):
                 logger.critical("Uncaught exception", exc_info=(exc_type, exc_value, exc_tb))
-            if orig_sys_hook:
+            if orig_sys_hook is not None:
                 orig_sys_hook(exc_type, exc_value, exc_tb)
 
         def _thread_excepthook(args):
@@ -158,7 +158,7 @@ def configure_logging(log_dir: Optional[Path] = None) -> logging.Logger:
                     getattr(args.thread, "name", "unknown"),
                     exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
                 )
-            if orig_thread_hook:
+            if orig_thread_hook is not None:
                 orig_thread_hook(args)
 
         sys.excepthook = _sys_excepthook

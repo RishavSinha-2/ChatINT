@@ -669,14 +669,10 @@ export function renderSettingsContent(options = {}) {
               : `Saved in .env (${envKeyName}) — type a new key to replace`)
           : `Saved in .env as ${envKeyName}...`;
 
-      const provModelsVisible = canShowProviderModels(activeProv);
-      const provModelsHtml = provModelsVisible
-        ? (activeProv.models || []).map((m, idx, list) => renderConfiguredModelRow(m, idx, list.length, false)).join("")
-        : `<div style="padding: 10px; font-size: 11.5px; color: var(--text-muted); text-align: center;">${escapeHtml(
-            !activeProv.has_api_key || activeProv.clear_api_key
-              ? "Enter a valid API key (or local endpoint) and fetch models to view configured models. Any previously saved models remain preserved."
-              : `Configured models are hidden until verification succeeds (${activeProv.sync_error || activeProv.sync_status || "UNVERIFIED"}). Saved models & pricing remain preserved.`
-          )}</div>`;
+      const provModelsList = activeProv.models || [];
+      const provModelsHtml = provModelsList.length > 0
+        ? provModelsList.map((m, idx, list) => renderConfiguredModelRow(m, idx, list.length, false)).join("")
+        : `<div style="padding: 10px; font-size: 11.5px; color: var(--text-muted); text-align: center;">No models configured for this provider. Click "Auto add" or add a model below.</div>`;
 
       detailHtml = `
         <div class="provider-detail-pane">

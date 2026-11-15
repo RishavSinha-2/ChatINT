@@ -4,8 +4,10 @@ from __future__ import annotations
 import contextlib
 import json
 from pathlib import Path
+import shutil
 import sqlite3
 import sys
+import time
 from typing import Callable, List, Tuple
 
 from chatint.catalog import PRIMARY_WEB_SEARCH_MODEL
@@ -26,7 +28,7 @@ SCHEMA_VERSION = 2
 def _get_db_path() -> Path:
     db_mod = sys.modules.get("chatint.db")
     if db_mod is not None and hasattr(db_mod, "DB_PATH"):
-        return getattr(db_mod, "DB_PATH")
+        return db_mod.DB_PATH
     return _DEFAULT_DB_PATH
 
 
@@ -210,9 +212,98 @@ _REQUIRED_CORE_TABLES = {
 }
 
 
-def init_db() -> None:
-    db_path = _get_db_path()
+def _quarantine_file(src: Path, dest: Path) -> None:
+    if not src.exists():
+        return
+    try:
+        src.rename(dest)
+    except Exception:
+        try:
+            shutil.move(str(src), str(dest))
+        except Exception as exc:
+            _logger.warning("Could not quarantine file %s -> %s: %s", src, dest, exc)
+
+
+def _restore_from_backup(db_path: Path) -> bool:
+    """Attempt to restore the database from an intact backup."""
+    candidates: List[Path] = []
+    default_bak = db_path.with_name(f"{db_path.name}.bak")
+    if default_bak.is_file():
+        candidates.append(default_bak)
+
+    if db_path.parent.is_dir():
+        for p in sorted(db_path.parent.glob(f"{db_path.name}*.bak"), key=lambda x: x.stat().st_mtime, reverse=True):
+            if p not in candidates and p.is_file():
+                candidates.append(p)
+
+    for cand in candidates:
+        if cand.stat().st_size == 0:
+            continue
+        try:
+            with contextlib.closing(sqlite3.connect(cand, timeout=5.0)) as test_conn:
+                res = test_conn.execute("PRAGMA quick_check(1);").fetchone()
+                if res and res[0] == "ok":
+                    shutil.copy2(cand, db_path)
+                    _logger.info("Successfully restored database from intact backup %s -> %s", cand, db_path)
+                    return True
+        except Exception as exc:
+            _logger.warning("Candidate backup %s failed check: %s", cand, exc)
+    return False
+
+
+def _handle_corrupted_database(db_path: Path, error: Exception, try_restore: bool = True) -> bool:
+    import gc
+    gc.collect()
+
+    ts = int(time.time())
+    corrupt_dest = db_path.with_name(f"{db_path.name}.corrupted.{ts}")
+    _logger.critical("Database corruption detected at %s (%s). Quarantining to %s", db_path, error, corrupt_dest)
+
+    wal = db_path.with_name(f"{db_path.name}-wal")
+    shm = db_path.with_name(f"{db_path.name}-shm")
+    if wal.exists():
+        _quarantine_file(wal, corrupt_dest.with_name(f"{corrupt_dest.name}-wal"))
+    if shm.exists():
+        _quarantine_file(shm, corrupt_dest.with_name(f"{corrupt_dest.name}-shm"))
+    if db_path.exists():
+        _quarantine_file(db_path, corrupt_dest)
+
+    if try_restore:
+        restored = _restore_from_backup(db_path)
+        if restored:
+            return True
+
+    _logger.warning("No intact backup available to restore %s. Clean database will be initialized.", db_path)
+    return False
+
+
+def _seed_bundled_default_db(target_path: Path) -> bool:
+    """If target_path does not exist, copy from the bundled default database template."""
+    candidate_paths: list[Path] = []
+    if getattr(sys, "frozen", False):
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            candidate_paths.append(Path(meipass) / "chatint" / "default_data" / "chatint.db")
+        exe_dir = Path(sys.executable).resolve().parent
+        candidate_paths.append(exe_dir / "data" / "chatint.db")
+
+    for cand in candidate_paths:
+        if cand.is_file() and cand.stat().st_size > 0:
+            try:
+                if cand.resolve() != target_path.resolve():
+                    target_path.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(cand, target_path)
+                    _logger.info("Initialized default database from template: %s -> %s", cand, target_path)
+                    return True
+            except Exception as exc:
+                _logger.warning("Could not copy bundled default database from %s: %s", cand, exc)
+    return False
+
+
+def _run_db_init(db_path: Path) -> None:
     db_path.parent.mkdir(parents=True, exist_ok=True)
+    if not db_path.exists() or db_path.stat().st_size == 0:
+        _seed_bundled_default_db(db_path)
     pre_existed = db_path.exists() and db_path.stat().st_size > 0
 
     with open_db() as conn:
@@ -221,6 +312,11 @@ def init_db() -> None:
             cursor.execute("PRAGMA journal_mode=WAL;")
         except sqlite3.Error as exc:
             _logger.warning("Could not enable SQLite WAL mode: %s", exc)
+
+        if pre_existed:
+            check_row = cursor.execute("PRAGMA quick_check(1);").fetchone()
+            if not check_row or check_row[0] != "ok":
+                raise sqlite3.DatabaseError(f"Database failed quick_check: {check_row[0] if check_row else 'empty'}")
 
         cur_ver_row = cursor.execute("PRAGMA user_version").fetchone()
         cur_ver = int(cur_ver_row[0]) if cur_ver_row else 0
@@ -261,7 +357,7 @@ def init_db() -> None:
         existing_upper_names = {sanitize_provider_name(r["name"]).upper() for r in existing_prov_rows if r["name"]}
 
         for p in DEFAULT_PROVIDERS:
-            clean_name = sanitize_provider_name(p["name"]) or "Provider"
+            clean_name = sanitize_provider_name(str(p.get("name") or "")) or "Provider"
             if p["id"] not in existing_ids and clean_name.upper() not in existing_upper_names:
                 cursor.execute(
                     """
@@ -355,3 +451,19 @@ def init_db() -> None:
         )
 
         conn.commit()
+
+
+def init_db() -> None:
+    """Initialize SQLite database, safely recovering from corruption via backup or quarantine."""
+    db_path = _get_db_path()
+    try:
+        _run_db_init(db_path)
+    except sqlite3.DatabaseError as exc:
+        _logger.error("Database initialization failed due to corruption or database error: %s", exc)
+        _handle_corrupted_database(db_path, exc, try_restore=True)
+        try:
+            _run_db_init(db_path)
+        except sqlite3.DatabaseError as second_exc:
+            _logger.critical("Restored database also failed: %s. Quarantining and starting fresh.", second_exc)
+            _handle_corrupted_database(db_path, second_exc, try_restore=False)
+            _run_db_init(db_path)

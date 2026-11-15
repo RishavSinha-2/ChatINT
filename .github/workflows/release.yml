@@ -1,0 +1,62 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build Release Artifacts (Installer + Portable)
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Install Inno Setup
+        run: choco install innosetup --no-progress
+
+      - name: Add Inno Setup to PATH
+        run: |
+          echo "C:\Program Files (x86)\Inno Setup 6" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.14
+
+      - name: Install Dependencies
+        run: uv sync --all-groups
+
+      - name: Build Standalone Executable, Portable ZIP, and Inno Setup Installer
+        run: uv run python packaging/build_release.py
+
+      - name: Upload Build Artifacts to Actions Run
+        uses: actions/upload-artifact@v4
+        with:
+          name: chatint-release-artifacts
+          path: |
+            dist/installer/ChatInt-Setup-x64.exe
+            dist/v*/ChatInt-Portable-*.zip
+            dist/v*/ChatInt.exe
+          if-no-files-found: error
+
+      - name: Create GitHub Release & Upload Assets
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: |
+            dist/installer/ChatInt-Setup-x64.exe
+            dist/v*/ChatInt-Portable-*.zip
+            dist/v*/ChatInt.exe
+          draft: false
+          prerelease: false
+          generate_release_notes: true

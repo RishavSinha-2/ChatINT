@@ -1,5 +1,3 @@
-import ctypes
-from ctypes import wintypes
 import os
 import subprocess
 import sys
@@ -9,21 +7,13 @@ import uuid
 sys.path.insert(0, os.path.abspath("src"))
 
 import chatint.main as main_mod
-from chatint.main import _ensure_single_instance
+from chatint.main import _ensure_single_instance, _release_single_instance
 
 
 @unittest.skipUnless(sys.platform == "win32", "Windows single-instance mutex test requires win32")
 class TestSingleInstanceMutex(unittest.TestCase):
     def tearDown(self):
-        if getattr(main_mod, "_MUTEX_HANDLE", None):
-            try:
-                kernel32 = ctypes.windll.kernel32
-                kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-                kernel32.CloseHandle.restype = wintypes.BOOL
-                kernel32.CloseHandle(main_mod._MUTEX_HANDLE)
-            except Exception:
-                pass
-            main_mod._MUTEX_HANDLE = None
+        _release_single_instance()
 
     def test_mutex_prevents_second_instance(self):
         test_mutex = f"Local\\ChatInt_Test_Mutex_{os.getpid()}_{uuid.uuid4().hex[:8]}"
@@ -50,6 +40,19 @@ class TestSingleInstanceMutex(unittest.TestCase):
             0,
             f"Second instance must return False (stdout={proc.stdout!r}, stderr={proc.stderr!r})",
         )
+
+    def test_release_single_instance_allows_immediate_reacquisition(self):
+        test_mutex = f"Local\\ChatInt_Test_Release_{os.getpid()}_{uuid.uuid4().hex[:8]}"
+        first = _ensure_single_instance(mutex_name=test_mutex)
+        self.assertTrue(first, "Initial instance must acquire the mutex")
+        self.assertIsNotNone(main_mod._MUTEX_HANDLE)
+
+        _release_single_instance()
+        self.assertIsNone(main_mod._MUTEX_HANDLE, "_release_single_instance must clear _MUTEX_HANDLE")
+
+        second = _ensure_single_instance(mutex_name=test_mutex)
+        self.assertTrue(second, "Subsequent instance must immediately acquire mutex after release without delay")
+        self.assertIsNotNone(main_mod._MUTEX_HANDLE)
 
 
 if __name__ == "__main__":

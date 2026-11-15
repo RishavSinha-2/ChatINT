@@ -117,6 +117,12 @@ def get_token_stats(conversation_id: str) -> Dict[str, Any]:
                 "total_cost": 0.0,
                 "google_search_requests": 0,
             },
+            "active_turn_tokens": {
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "cached_tokens": 0,
+                "total_tokens": 0,
+            },
             "google_search_totals": global_search_totals,
         }
 
@@ -167,6 +173,27 @@ def get_token_stats(conversation_id: str) -> Dict[str, Any]:
                 (conversation_id,),
             )
             rows = cursor.fetchall()
+
+        cursor.execute(
+            """
+            SELECT COALESCE(SUM(prompt_tokens), 0) as act_in,
+                   COALESCE(SUM(completion_tokens), 0) as act_out,
+                   COALESCE(SUM(cached_tokens), 0) as act_cached
+            FROM messages
+            WHERE conversation_id = ? AND role = 'assistant'
+            """,
+            (conversation_id,),
+        )
+        act_row = cursor.fetchone()
+        active_in = int((act_row["act_in"] if act_row else 0) or 0)
+        active_out = int((act_row["act_out"] if act_row else 0) or 0)
+        active_cached = int((act_row["act_cached"] if act_row else 0) or 0)
+        active_turn_tokens = {
+            "prompt_tokens": active_in,
+            "completion_tokens": active_out,
+            "cached_tokens": active_cached,
+            "total_tokens": active_in + active_out,
+        }
 
         cursor.execute("SELECT id, models_json FROM providers")
         prov_rows = cursor.fetchall()
@@ -298,5 +325,6 @@ def get_token_stats(conversation_id: str) -> Dict[str, Any]:
             "total_cost": grand_cost,
             "google_search_requests": conv_search_requests,
         },
+        "active_turn_tokens": active_turn_tokens,
         "google_search_totals": global_search_totals,
     }

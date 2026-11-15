@@ -5,7 +5,8 @@ import time
 from typing import Any, Dict, List, Optional
 
 from chatint import __version__
-from chatint.client_manager import BackgroundModelSyncer, ClientManager, is_gemini_3_or_newer, strip_model_prefix
+from chatint.catalog import is_gemini_3_or_newer, strip_model_prefix
+from chatint.client_manager import BackgroundModelSyncer, ClientManager
 from chatint.db import (
     PRIMARY_WEB_SEARCH_MODEL,
     get_api_key_from_env,
@@ -21,6 +22,7 @@ SEARCH_MODEL_ID = PRIMARY_WEB_SEARCH_MODEL
 WEB_SEARCH_TOOL_NAME = "web_search"
 IMAGE_SEARCH_TOOL_NAME = "search_images"
 MAX_TOOL_ROUNDS = 10
+MAX_TOOL_CALLS_PER_PROMPT = 10
 
 _TOOL_DESCRIPTION = (
     "Search the live web using Google Search for current events, real-time data, recent facts, "
@@ -140,7 +142,7 @@ def execute_image_search(query: str, max_results: int = 3) -> Dict[str, Any]:
         return {"ok": False, "query": "", "images": [], "error": "Query is empty."}
 
     max_count = max(1, min(int(max_results or 3), 3))
-    headers = {"User-Agent": f"ChatInt/{__version__} (Desktop Chat App; https://github.com/chatint)"}
+    headers = {"User-Agent": f"ChatInt/{__version__} (Desktop Chat App; https://github.com/RishavSinha-2/ChatINT)"}
     images: List[Dict[str, str]] = []
     seen_urls: set[str] = set()
 
@@ -163,9 +165,12 @@ def execute_image_search(query: str, max_results: int = 3) -> Dict[str, Any]:
             timeout=5.0,
         )
         if r.status_code == 200:
-            pages = r.json().get("query", {}).get("pages", {})
-            for pid, p in sorted(pages.items(), key=lambda x: x[1].get("index", 99)):
-                thumb = p.get("thumbnail", {}).get("source") or p.get("original", {}).get("source")
+            q1 = (r.json() or {}).get("query") or {}
+            pages = q1.get("pages") or {}
+            for _pid, p in sorted(pages.items(), key=lambda x: (x[1] or {}).get("index", 99)):
+                if not isinstance(p, dict):
+                    continue
+                thumb = (p.get("thumbnail") or {}).get("source") or (p.get("original") or {}).get("source")
                 title = p.get("title", clean_query)
                 if thumb and thumb not in seen_urls:
                     seen_urls.add(thumb)
@@ -200,9 +205,15 @@ def execute_image_search(query: str, max_results: int = 3) -> Dict[str, Any]:
                 timeout=5.0,
             )
             if r2.status_code == 200:
-                pages2 = r2.json().get("query", {}).get("pages", {})
-                for pid, p in sorted(pages2.items(), key=lambda x: x[1].get("index", 99)):
-                    info = p.get("imageinfo", [{}])[0]
+                q2 = (r2.json() or {}).get("query") or {}
+                pages2 = q2.get("pages") or {}
+                for _pid, p in sorted(pages2.items(), key=lambda x: (x[1] or {}).get("index", 99)):
+                    if not isinstance(p, dict):
+                        continue
+                    imageinfo = p.get("imageinfo") or [{}]
+                    info = imageinfo[0] if isinstance(imageinfo, list) and imageinfo else {}
+                    if not isinstance(info, dict):
+                        info = {}
                     url = info.get("thumburl") or info.get("url")
                     raw_title = p.get("title", "").replace("File:", "")
                     if "." in raw_title:
@@ -258,12 +269,13 @@ def is_web_search_available() -> tuple[bool, str]:
 
 def _build_search_configs(genai_types: Any, model_id: str, search_sys_prompt: str, search_tool: Any) -> List[Any]:
     """Build ordered minimal-thinking GenerateContentConfig attempts for a Gemini search model."""
+    min_lvl = getattr(genai_types.ThinkingLevel, "MINIMAL", None)
     level_cfg = genai_types.GenerateContentConfig(
         system_instruction=search_sys_prompt,
         tools=[search_tool],
         temperature=0.1,
         max_output_tokens=600,
-        thinking_config=genai_types.ThinkingConfig(thinking_level="MINIMAL"),
+        thinking_config=genai_types.ThinkingConfig(thinking_level=min_lvl) if min_lvl is not None else None,
     )
     budget_cfg = genai_types.GenerateContentConfig(
         system_instruction=search_sys_prompt,
@@ -295,12 +307,16 @@ def _extract_concise_facts(raw_text: str) -> tuple[str, List[str]]:
         parsed = json.loads(text)
         if isinstance(parsed, dict):
             summary = str(parsed.get("answer") or parsed.get("summary") or "").strip()
-            facts = [str(f).strip() for f in (parsed.get("key_facts") or parsed.get("facts") or []) if str(f).strip()][:6]
-            return summary, facts
+            parsed_facts: List[str] = [
+                str(f).strip()
+                for f in (parsed.get("key_facts") or parsed.get("facts") or [])
+                if str(f).strip()
+            ][:6]
+            return summary, parsed_facts
     except (json.JSONDecodeError, TypeError, ValueError):
         pass
 
-    facts: List[str] = []
+    fallback_facts: List[str] = []
     other_lines: List[str] = []
     for line in text.splitlines():
         stripped = line.strip()
@@ -309,13 +325,13 @@ def _extract_concise_facts(raw_text: str) -> tuple[str, List[str]]:
         if stripped[0] in ("-", "*", "•"):
             item = stripped.lstrip("-*• ").strip()
             if item:
-                facts.append(item)
+                fallback_facts.append(item)
         else:
             other_lines.append(stripped)
     summary = " ".join(other_lines).strip()
-    if not summary and facts:
-        summary = facts[0]
-    return summary, facts[:6]
+    if not summary and fallback_facts:
+        summary = fallback_facts[0]
+    return summary, fallback_facts[:6]
 
 
 def execute_web_search(query: str, conversation_id: Optional[str] = None) -> Dict[str, Any]:

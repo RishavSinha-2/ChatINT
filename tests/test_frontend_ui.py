@@ -5,7 +5,6 @@ Microsoft Edge Chromium (WebView2's engine) over a local Python HTTP server — 
 """
 from __future__ import annotations
 
-import functools
 import http.server
 import json
 import os

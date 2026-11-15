@@ -15,9 +15,12 @@ def _resolve_dist_exe() -> Path:
     override = os.environ.get("CHATINT_EXE_PATH", "").strip()
     if override:
         return Path(override)
-    default_candidate = Path("dist/v0.5.0/ChatInt.exe")
+    default_candidate = Path("dist/v0.5.1/ChatInt.exe")
     if default_candidate.exists():
         return default_candidate
+    fallback_v050 = Path("dist/v0.5.0/ChatInt.exe")
+    if fallback_v050.exists():
+        return fallback_v050
     dist_root = Path("dist")
     if dist_root.exists():
         matches = sorted(dist_root.glob("**/ChatInt.exe"), key=lambda p: p.stat().st_mtime, reverse=True)
@@ -34,23 +37,26 @@ RUN_EXE_SMOKE = os.environ.get("CHATINT_RUN_EXE_SMOKE", "").strip().lower() in (
 
 class TestDistVersionInfo(unittest.TestCase):
     @unittest.skipUnless(
-        sys.platform == "win32" and Path("dist/v0.5.0/ChatInt.exe").exists(),
-        "Requires built dist/v0.5.0/ChatInt.exe on Windows",
+        sys.platform == "win32" and DIST_EXE.exists(),
+        "Requires built ChatInt.exe on Windows",
     )
-    def test_v050_exe_embeds_windows_version_info(self):
+    def test_dist_exe_embeds_windows_version_info(self):
         from PyInstaller.utils.win32 import versioninfo
 
-        exe_path = Path("dist/v0.5.0/ChatInt.exe")
+        exe_path = DIST_EXE
         vi = versioninfo.read_version_info_from_executable(str(exe_path))
         self.assertIsNotNone(vi, "ChatInt.exe must embed a VSVersionInfo RT_VERSION resource")
 
         with Path("pyproject.toml").open("rb") as fh:
-            expected_version = tomllib.load(fh)["project"]["version"]
+            project_meta = tomllib.load(fh)["project"]
+            expected_version = project_meta["version"]
+            expected_description = project_meta.get("description", "ChatInt App")
 
         rendered = str(vi)
         self.assertIn("StringStruct('ProductName', 'ChatInt')", rendered)
         self.assertIn(f"StringStruct('ProductVersion', '{expected_version}')", rendered)
         self.assertIn("StringStruct('OriginalFilename', 'ChatInt.exe')", rendered)
+        self.assertIn(f"StringStruct('FileDescription', '{expected_description}')", rendered)
 
 
 @unittest.skipUnless(

@@ -57,9 +57,12 @@ export function isLoopbackBaseUrl(rawUrl) {
   const s = String(rawUrl || "").trim();
   if (!s) return false;
   try {
-    const parsed = new URL(s);
-    const host = (parsed.hostname || "").toLowerCase();
-    return host === "localhost" || host === "127.0.0.1" || host === "::1" || host === "[::1]";
+    const normalized = s.includes("://") ? s : `http://${s}`;
+    const parsed = new URL(normalized);
+    const host = (parsed.hostname || "").toLowerCase().replace(/^\[|\]$/g, "");
+    if (host === "localhost" || host === "0.0.0.0" || host === "::1") return true;
+    if (/^127(?:\.(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}$/.test(host)) return true;
+    return false;
   } catch (e) {
     return false;
   }

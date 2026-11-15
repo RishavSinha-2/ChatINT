@@ -28,6 +28,7 @@ from chatint.providers.base import (
     record_resolved_thinking_level,
 )
 from chatint.web_search_tool import (
+    MAX_TOOL_CALLS_PER_PROMPT,
     MAX_TOOL_ROUNDS,
     get_openai_image_tool_spec,
     get_openai_tool_spec,
@@ -192,6 +193,7 @@ def _stream_openai(
         stream_had_error = False
         actual_thinking_level = "none"
         include_stream_options = True
+        total_executed_tool_calls = 0
 
         for tool_round in range(MAX_TOOL_ROUNDS + 1):
             if abort_event.is_set():
@@ -199,7 +201,11 @@ def _stream_openai(
             if tool_round > 0:
                 _ensure_post_tool_separator(full_content, bridge, tab_id, conversation_id, stream_id=stream_id)
 
-            round_tools = openai_tools if tool_round < MAX_TOOL_ROUNDS else []
+            round_tools = (
+                openai_tools
+                if (tool_round < MAX_TOOL_ROUNDS and total_executed_tool_calls < MAX_TOOL_CALLS_PER_PROMPT)
+                else []
+            )
             response_stream = None
             last_api_err = None
 
@@ -221,7 +227,11 @@ def _stream_openai(
                 except StopIteration:
                     return iter([])
 
-            def _try_openai_create(eff_val: Optional[str], use_tools: bool):
+            def _try_openai_create(
+                eff_val: Optional[str],
+                use_tools: bool,
+                active_tools: Optional[List[Dict[str, Any]]] = None,
+            ):
                 nonlocal include_stream_options, actual_thinking_level, last_api_err
                 kw: Dict[str, Any] = {
                     "model": model_id,
@@ -232,8 +242,8 @@ def _stream_openai(
                     kw["stream_options"] = {"include_usage": True}
                 if eff_val is not None:
                     kw["reasoning_effort"] = eff_val
-                if use_tools and round_tools:
-                    kw["tools"] = round_tools
+                if use_tools and active_tools:
+                    kw["tools"] = active_tools
                     kw["tool_choice"] = "auto"
 
                 try:
@@ -262,23 +272,23 @@ def _stream_openai(
                                 raise
                             last_api_err = retry_err
                     # Only clear cached thinking level if the attempt without tools also failed
-                    if not (use_tools and round_tools):
+                    if not (use_tools and active_tools):
                         clear_resolved_thinking_cache(provider_id, model_id, thinking_level)
                     return None
 
             try:
                 for effort in effort_chain:
                     if round_tools:
-                        response_stream = _try_openai_create(effort, True)
+                        response_stream = _try_openai_create(effort, True, round_tools)
                         if response_stream is not None:
                             break
                         # Test same effort WITHOUT tools before downgrading effort so tool-unsupported 400s
                         # never poison resolved_thinking to 'none'!
-                        response_stream = _try_openai_create(effort, False)
+                        response_stream = _try_openai_create(effort, False, None)
                         if response_stream is not None:
                             break
                     else:
-                        response_stream = _try_openai_create(effort, False)
+                        response_stream = _try_openai_create(effort, False, None)
                         if response_stream is not None:
                             break
 
@@ -330,6 +340,9 @@ def _stream_openai(
             round_text_parts: List[str] = []
             round_reasoning_parts: List[str] = []
             tool_calls_acc: Dict[int, Dict[str, str]] = {}
+
+            if response_stream is None:
+                break
 
             try:
                 for chunk in response_stream:
@@ -468,7 +481,7 @@ def _stream_openai(
             normalized_messages.append(assistant_msg)
 
             for idx, tc in enumerate(ordered_calls):
-                if abort_event.is_set():
+                if abort_event.is_set() or total_executed_tool_calls >= MAX_TOOL_CALLS_PER_PROMPT:
                     break
                 call_id = tc["id"] or f"call_{tool_round}_{idx}"
                 res = _run_web_search_tool_call(
@@ -480,6 +493,7 @@ def _stream_openai(
                     abort_event,
                     stream_id=stream_id,
                 )
+                total_executed_tool_calls += 1
                 normalized_messages.append({
                     "role": "tool",
                     "tool_call_id": call_id,

@@ -19,7 +19,7 @@ _logger = get_logger("chatint.storage.secrets")
 def _get_env_path() -> Path:
     db_mod = sys.modules.get("chatint.db")
     if db_mod is not None and hasattr(db_mod, "ENV_PATH"):
-        return getattr(db_mod, "ENV_PATH")
+        return db_mod.ENV_PATH
     return _DEFAULT_ENV_PATH
 
 
@@ -143,9 +143,10 @@ def _ensure_env_text_locked(env_path: Path) -> str:
     if not raw_text.strip():
         lines = []
         for p in DEFAULT_PROVIDERS:
-            clean = sanitize_provider_name(p.get("name", ""))
+            clean = sanitize_provider_name(str(p.get("name") or ""))
             if clean:
-                default_val = "ollama" if clean.lower() == "ollama" else (p.get("api_key") or "")
+                raw_api_key = str(p.get("api_key") or "")
+                default_val = "ollama" if clean.lower() == "ollama" else raw_api_key
                 stored_val = encrypt_secret_for_storage(default_val) if default_val else ""
                 lines.append(f"{clean.upper()}_API_KEY={_format_env_value(stored_val)}")
         new_content = "\n".join(lines) + ("\n" if lines else "")
@@ -160,11 +161,11 @@ def _ensure_env_text_locked(env_path: Path) -> str:
 
     appended = []
     for p in DEFAULT_PROVIDERS:
-        clean = sanitize_provider_name(p.get("name", ""))
+        clean = sanitize_provider_name(str(p.get("name") or ""))
         if clean:
             env_k = f"{clean.upper()}_API_KEY"
             if env_k not in existing_keys:
-                default_val = "ollama" if clean.lower() == "ollama" else (p.get("api_key") or "")
+                default_val = "ollama" if clean.lower() == "ollama" else str(p.get("api_key") or "")
                 stored_val = encrypt_secret_for_storage(default_val) if default_val else ""
                 appended.append(f"{env_k}={_format_env_value(stored_val)}")
 
