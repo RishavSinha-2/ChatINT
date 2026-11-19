@@ -38,9 +38,40 @@ A minimalist, multi-tab, multi-provider desktop chat interface built with **Pyth
 
 ---
 
-## 🚀 Quick Start
+## 📥 Installation
 
-Ensure you have [uv](https://docs.astral.sh/uv/) installed.
+### 1. One-Line PowerShell Web Installer (Fastest & Recommended)
+Install ChatInt seamlessly with zero setup and no SmartScreen warnings:
+
+```powershell
+irm https://is.gd/chatint | iex
+```
+*(Or via direct GitHub CDN: `irm https://raw.githubusercontent.com/RishavSinha-2/ChatINT/main/install.ps1 | iex`)*
+
+This downloads the latest release, installs silently to `%LOCALAPPDATA%\Programs\ChatInt`, creates Start Menu and Desktop shortcuts, and registers standard uninstallation in Windows Settings.
+
+---
+
+### 2. Direct Downloads (GitHub Releases)
+Grab the standalone files directly from [GitHub Releases](https://github.com/RishavSinha-2/ChatINT/releases/latest):
+
+* **[ChatInt-Setup-x64.exe](https://github.com/RishavSinha-2/ChatINT/releases/latest)** — Standard Windows installer.
+* **[ChatInt-Portable-v0.5.1.zip](https://github.com/RishavSinha-2/ChatINT/releases/latest)** — Zero-install portable edition. Extract anywhere and run `ChatInt.exe`.
+
+---
+
+### 3. Windows Package Manager (WinGet)
+*Submission under community review in [PR #480977](https://github.com/microsoft/winget-pkgs/pull/480977):*
+
+```powershell
+winget install chatint
+```
+
+---
+
+## 🚀 Developer Quick Start
+
+If running directly from the source code, ensure you have [uv](https://docs.astral.sh/uv/) installed:
 
 ### 1. Run ChatInt
 ```bash
@@ -71,36 +102,44 @@ Press `Ctrl+,` or click the **Settings** gear icon in the sidebar to enter your 
 
 ---
 
-## 📦 Building Standalone `.exe`
+## 📦 Building Releases
 
-ChatInt packages into a single portable Windows executable via PyInstaller using [ChatInt.spec](ChatInt.spec), automatically embedding Windows PE version metadata (`VSVersionInfo`) from `pyproject.toml`:
+To compile the standalone `.exe`, package the portable `.zip`, and build the Inno Setup installer:
 
-```bash
-uv run pyinstaller ChatInt.spec --noconfirm --clean --distpath dist/v0.5.1
+```powershell
+uv run python packaging/build_release.py
 ```
+
+This automatically prepares the sanitized baseline template database, packages the portable archive, and prints SHA-256 checksums for all release artifacts.
 
 ---
 
-## 🗂️ Data & Logs
+## 🗂️ Data & Storage Architecture
 
-All runtime data is stored next to the project root in development mode, or next to `ChatInt.exe` when running the standalone executable:
+ChatInt features deterministic multi-mode path resolution and automatic database self-healing:
 
-- **`.env`** — Provider API keys, encrypted at rest on Windows using per-user Windows DPAPI (`dpapi:...` values) and managed through **Settings → Providers**.
-- **`data/chatint.db`** — SQLite WAL database containing conversations, messages, provider/model configurations, and token usage ledgers. Automatic pre-migration backups are written to **`data/chatint.db.bak`** whenever schema migrations run.
-- **`data/logs/chatint.log`** — Rotating diagnostic log file with automatic secret scrubbing. You can open this directory directly via **Settings → General → Open Logs Folder**.
+* **Installed Mode (`%LOCALAPPDATA%\Programs\ChatInt`)**:
+  - Chat history and databases persist across updates in **`%APPDATA%\ChatInt\data\chatint.db`**.
+  - Provider API keys are encrypted at rest using Windows DPAPI in **`%APPDATA%\ChatInt\.env`**.
+* **Portable Mode (Custom folder or alongside `data/`)**:
+  - Completely self-contained next to `ChatInt.exe` in **`<exe_dir>\data\chatint.db`** and **`<exe_dir>\.env`**.
+* **Database Self-Healing**:
+  - Automatically checks SQLite integrity on launch. If corruption is detected, safely quarantines the corrupted database to `chatint.db.corrupted.<timestamp>`, restores from an intact `.bak` backup if available, or cleanly re-initializes from the bundled template without crashing.
+* **Diagnostic Logs**:
+  - Rotating logs with automatic secret scrubbing are stored in `data/logs/chatint.log` (accessible directly via **Settings → General → Open Logs Folder**).
 
 ---
 
 ## 🧪 Running Tests
 
-Run the automated backend and frontend unit test suites with `uv`:
+Run the automated backend, frontend, path resolution, and self-healing test suites with `uv`:
 
 ```bash
 uv run python -m unittest discover -s tests -v
 ```
 
-To optionally run the live GUI smoke test against a built standalone executable (ensure no live `ChatInt` session is open first):
+To run the live GUI smoke test against a built standalone executable (ensure no live `ChatInt` session is open first):
 
 ```bash
-CHATINT_RUN_EXE_SMOKE=1 CHATINT_EXE_PATH=dist/ChatInt.exe uv run python -m unittest tests/test_dist_exe.py -v
+CHATINT_RUN_EXE_SMOKE=1 CHATINT_EXE_PATH=dist/v0.5.1/ChatInt.exe uv run python -m unittest tests/test_dist_exe.py -v
 ```
