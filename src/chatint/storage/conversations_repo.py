@@ -21,11 +21,13 @@ _ALLOWED_MSG_COLUMNS = {
     "content",
     "thinking_content",
     "provider_id",
+    "provider_name",
     "model_id",
     "thinking_level",
     "prompt_tokens",
     "completion_tokens",
     "cached_tokens",
+    "duration_ms",
 }
 
 
@@ -202,11 +204,13 @@ def get_conversation(conv_id: str) -> Optional[Dict[str, Any]]:
             "content": m["content"],
             "thinking_content": m["thinking_content"],
             "provider_id": m["provider_id"],
+            "provider_name": m["provider_name"],
             "model_id": m["model_id"],
             "thinking_level": m["thinking_level"],
             "prompt_tokens": m["prompt_tokens"],
             "completion_tokens": m["completion_tokens"],
             "cached_tokens": m["cached_tokens"],
+            "duration_ms": m["duration_ms"],
             "created_at": m["created_at"],
         }
         for m in msg_rows
@@ -300,9 +304,9 @@ def duplicate_conversation(conv_id: str) -> Optional[Dict[str, Any]]:
                 """
                 INSERT INTO messages (
                     id, conversation_id, role, content, thinking_content,
-                    provider_id, model_id, thinking_level,
-                    prompt_tokens, completion_tokens, cached_tokens, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, ?)
+                    provider_id, provider_name, model_id, thinking_level,
+                    prompt_tokens, completion_tokens, cached_tokens, duration_ms, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, ?)
                 """,
                 (
                     new_msg_id,
@@ -311,6 +315,7 @@ def duplicate_conversation(conv_id: str) -> Optional[Dict[str, Any]]:
                     m.get("content", ""),
                     m.get("thinking_content", ""),
                     m.get("provider_id", ""),
+                    m.get("provider_name", ""),
                     m.get("model_id", ""),
                     m.get("thinking_level", "none"),
                     msg_time,
@@ -367,13 +372,14 @@ def import_conversation_data(
                 p_tok = max(0, int(m.get("prompt_tokens") or 0))
                 c_tok = max(0, int(m.get("completion_tokens") or 0))
                 cache_tok = max(0, int(m.get("cached_tokens") or 0))
+                dur_ms = max(0, int(m.get("duration_ms") or 0))
                 cursor.execute(
                     """
                     INSERT INTO messages (
                         id, conversation_id, role, content, thinking_content,
-                        provider_id, model_id, thinking_level,
-                        prompt_tokens, completion_tokens, cached_tokens, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        provider_id, provider_name, model_id, thinking_level,
+                        prompt_tokens, completion_tokens, cached_tokens, duration_ms, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         new_msg_id,
@@ -382,11 +388,13 @@ def import_conversation_data(
                         m.get("content", ""),
                         m.get("thinking_content", ""),
                         m.get("provider_id", ""),
+                        str(m.get("provider_name", "") or ""),
                         m.get("model_id", ""),
                         m.get("thinking_level", "none"),
                         p_tok,
                         c_tok,
                         cache_tok,
+                        dur_ms,
                         msg_time,
                     ),
                 )
@@ -451,12 +459,16 @@ def add_message(
     completion_tokens: int = 0,
     cached_tokens: int = 0,
     msg_id: Optional[str] = None,
+    duration_ms: int = 0,
+    provider_name: str = "",
 ) -> Optional[Dict[str, Any]]:
     if not conversation_id:
         return None
     if not msg_id:
         msg_id = str(uuid.uuid4())
     now = time.time()
+    clean_duration_ms = max(0, int(duration_ms or 0))
+    resolved_provider_name = (provider_name or "").strip()
 
     try:
         with open_db() as conn:
@@ -465,13 +477,18 @@ def add_message(
                 _logger.debug("Skipped add_message; conversation %s no longer exists", conversation_id)
                 return None
 
+            if not resolved_provider_name and provider_id:
+                prov_row = cursor.execute("SELECT name FROM providers WHERE id = ?", (provider_id,)).fetchone()
+                if prov_row and prov_row["name"]:
+                    resolved_provider_name = prov_row["name"]
+
             cursor.execute(
                 """
                 INSERT INTO messages (
                     id, conversation_id, role, content, thinking_content,
-                    provider_id, model_id, thinking_level,
-                    prompt_tokens, completion_tokens, cached_tokens, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    provider_id, provider_name, model_id, thinking_level,
+                    prompt_tokens, completion_tokens, cached_tokens, duration_ms, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     msg_id,
@@ -480,11 +497,13 @@ def add_message(
                     content,
                     thinking_content,
                     provider_id,
+                    resolved_provider_name,
                     model_id,
                     thinking_level,
                     prompt_tokens,
                     completion_tokens,
                     cached_tokens,
+                    clean_duration_ms,
                     now,
                 ),
             )
@@ -522,11 +541,13 @@ def add_message(
         "content": content,
         "thinking_content": thinking_content,
         "provider_id": provider_id,
+        "provider_name": resolved_provider_name,
         "model_id": model_id,
         "thinking_level": thinking_level,
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
         "cached_tokens": cached_tokens,
+        "duration_ms": clean_duration_ms,
         "created_at": now,
     }
 
@@ -555,7 +576,7 @@ def delete_messages_from(conversation_id: str, from_msg_id: str, include_self: b
             (from_msg_id, conversation_id),
         )
         target = cursor.fetchone()
-        if not target and (from_msg_id.startswith("user_temp_") or not from_msg_id):
+        if not target and from_msg_id and from_msg_id.startswith("user_temp_"):
             cursor.execute(
                 "SELECT rowid, id, created_at FROM messages WHERE conversation_id = ? AND role = 'user' ORDER BY rowid DESC LIMIT 1",
                 (conversation_id,),

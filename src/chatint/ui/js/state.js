@@ -93,6 +93,26 @@ export function formatTokens(count) {
   return count.toString();
 }
 
+export function resolveProviderDisplayName(providerId, fallbackName = "") {
+  const pid = String(providerId || "").trim();
+  if (pid.toLowerCase() === "system") return "SYSTEM";
+  const matched = pid ? state.providers.find((p) => p.id === pid) : null;
+  if (matched && matched.name) return matched.name;
+  const cleanFallback = String(fallbackName || "").trim();
+  if (cleanFallback) return cleanFallback;
+  if (!pid || /^provider_[a-z0-9_-]+$/i.test(pid)) return pid ? "Custom" : "API";
+  return pid;
+}
+
+export function formatTokenSpeed(completionTokens, durationMs) {
+  const out = Number(completionTokens) || 0;
+  const ms = Number(durationMs) || 0;
+  if (out <= 0 || ms <= 0) return "";
+  const tps = out / (ms / 1000);
+  if (!Number.isFinite(tps) || tps <= 0) return "";
+  return `${tps >= 100 ? Math.round(tps) : tps.toFixed(1)} tok/s`;
+}
+
 export function generateClientStreamId() {
   return "stream_" + Date.now() + "_" + Math.random().toString(36).slice(2, 10);
 }
@@ -218,7 +238,9 @@ export function getVerifiedProviderModels(prov, limit = null) {
 export function getDropdownProviders() {
   return state.providers.filter((p) => {
     if (!p.is_enabled) return false;
-    const hasKey = Boolean(p.has_api_key || (p.api_key && p.api_key.trim()));
+    const hasKey = Boolean(
+      p.has_api_key || (p.api_key && p.api_key.trim()) || (!p.clear_api_key && isLoopbackBaseUrl(p.base_url))
+    );
     if (!hasKey) return false;
     const validModels = getVerifiedProviderModels(p);
     return p.is_accessible === true && validModels.length > 0;

@@ -13,6 +13,7 @@ import {
   el,
   escapeHtml,
   formatCost,
+  formatTokenSpeed,
   formatTokens,
   generateClientStreamId,
   getDefaultThinkingLevel,
@@ -22,6 +23,7 @@ import {
   refreshPaneHeaderLabels,
   renderIcons,
   resetTabStreamBuffers,
+  resolveProviderDisplayName,
   sanitizeSplitTabIds,
   state,
   uiHooks,
@@ -29,6 +31,8 @@ import {
 
 export const pendingStreamRenderTabs = new Set();
 let streamRenderRaf = null;
+let streamRenderTimer = null;
+let lastHeavyStreamRenderAt = 0;
 
 export function disconnectPaneResizeObservers(root = el.panesContainer) {
   if (!root) return;
@@ -52,16 +56,47 @@ export function clearWelcomeAndStaleBanners(messagesContainer) {
   });
 }
 
-function removeDownstreamSiblings(anchorRow, preserveLiveId = null, removeAnchor = false) {
+function removeDownstreamSiblings(anchorRow, preserveLiveId = null, removeAnchor = false, preserveStreamId = null) {
   if (!anchorRow || !anchorRow.parentElement) return;
   let cursor = removeAnchor ? anchorRow : anchorRow.nextElementSibling;
   while (cursor) {
     const next = cursor.nextElementSibling;
-    if (!preserveLiveId || cursor.id !== preserveLiveId) {
+    const isLiveNode = Boolean(preserveLiveId && cursor.id === preserveLiveId);
+    const isCurrentStreamNode = Boolean(
+      preserveStreamId && cursor.dataset && cursor.dataset.streamId === preserveStreamId
+    );
+    if (!isLiveNode && !isCurrentStreamNode) {
       cursor.remove();
     }
     cursor = next;
   }
+}
+
+function reconcileRestartedStream(tab, pane, anchorRow, removeAnchor, res, clientStreamId) {
+  const preserveStreamId = res.stream_id || clientStreamId;
+  const streamStillActive =
+    tab.activeStreamId === clientStreamId ||
+    (Boolean(res.stream_id) && tab.activeStreamId === res.stream_id);
+  removeDownstreamSiblings(anchorRow, `live-msg-${tab.id}`, removeAnchor, preserveStreamId);
+  if (res.conversation_id && (!tab.conversationId || tab.conversationId === res.conversation_id)) {
+    const changed = tab.conversationId !== res.conversation_id;
+    tab.conversationId = res.conversation_id;
+    tab.pendingUserDraft = null;
+    if (changed) persistTabsState();
+  }
+  if (!streamStillActive) {
+    return false;
+  }
+  tab.lastStreamError = null;
+  renderTabs();
+  if (res.stream_id) {
+    tab.activeStreamId = res.stream_id;
+  }
+  if (res.token_stats) {
+    tab.tokenStats = res.token_stats;
+    renderTokenStats(pane, tab.id, res.token_stats);
+  }
+  return true;
 }
 
 export function focusTabInUI(tabId) {
@@ -126,10 +161,13 @@ export async function closeTab(tabId, { skipConfirm = false } = {}) {
   if (!skipConfirm && !hasDraftWork && isUnlistedDraftConv) {
     try {
       const draftConv = await callApi("get_conversation", candidateTab.conversationId);
+      const draftTitle = (draftConv && draftConv.title ? draftConv.title : "").trim();
+      const hasCustomDraftTitle = Boolean(draftTitle) && !/^New Chat(?:\s*\(\d+\))?$/i.test(draftTitle);
       if (
         draftConv &&
         ((Array.isArray(draftConv.messages) && draftConv.messages.length > 0) ||
-          Boolean((draftConv.system_prompt || "").trim()))
+          Boolean((draftConv.system_prompt || "").trim()) ||
+          hasCustomDraftTitle)
       ) {
         hasDraftWork = true;
       }
@@ -840,7 +878,8 @@ export function createLiveStreamingRow(tab) {
   liveRow.className = "message-row assistant-message-row live-streaming-row";
   liveRow.id = `live-msg-${tab.id}`;
 
-  const provTag = (tab.streamingProviderId || tab.providerId || "API").toUpperCase();
+  const rawProvId = tab.streamingProviderId || tab.providerId || "";
+  const provTag = resolveProviderDisplayName(rawProvId).toUpperCase();
   const modelTag = tab.streamingModelId || tab.modelId || "Model";
   const thinkLvl =
     tab.streamingThinkingLevel !== undefined && tab.streamingThinkingLevel !== null
@@ -854,7 +893,7 @@ export function createLiveStreamingRow(tab) {
 
   liveRow.innerHTML = `
     <div class="assistant-header-badge">
-      <span class="provider-tag">${escapeHtml(provTag)}</span>
+      <span class="provider-tag" data-provider-id="${escapeHtml(rawProvId)}">${escapeHtml(provTag)}</span>
       <span>${escapeHtml(modelTag)}${escapeHtml(thinkBadge)}</span>
     </div>
     <div class="thinking-accordion${isCollapsed ? " collapsed" : ""}" id="live-thinking-${tab.id}" style="display: ${hasThinking ? "block" : "none"};">
@@ -944,17 +983,32 @@ function flushPendingStreamRenders() {
   const tabIds = Array.from(pendingStreamRenderTabs);
   pendingStreamRenderTabs.clear();
   for (const tabId of tabIds) {
+    const tab = state.tabs.find((t) => t.id === tabId);
+    if (tab && (tab.streamingContent?.length || 0) + (tab.streamingThinking?.length || 0) > 4000) {
+      lastHeavyStreamRenderAt = Date.now();
+    }
     applyLiveStreamRender(tabId);
   }
 }
 
 export function scheduleStreamRender(tabId) {
   pendingStreamRenderTabs.add(tabId);
-  if (streamRenderRaf !== null) return;
-  if (typeof requestAnimationFrame === "function") {
-    streamRenderRaf = requestAnimationFrame(flushPendingStreamRenders);
+  if (streamRenderRaf !== null || streamRenderTimer !== null) return;
+  const tab = state.tabs.find((t) => t.id === tabId);
+  const bufLen = tab ? (tab.streamingContent?.length || 0) + (tab.streamingThinking?.length || 0) : 0;
+  const waitMs = bufLen > 4000 ? Math.max(0, 80 - (Date.now() - lastHeavyStreamRenderAt)) : 0;
+  const dispatchRaf = () => {
+    streamRenderTimer = null;
+    if (typeof requestAnimationFrame === "function") {
+      streamRenderRaf = requestAnimationFrame(flushPendingStreamRenders);
+    } else {
+      flushPendingStreamRenders();
+    }
+  };
+  if (waitMs > 16) {
+    streamRenderTimer = setTimeout(dispatchRaf, waitMs);
   } else {
-    flushPendingStreamRenders();
+    dispatchRaf();
   }
 }
 
@@ -1014,6 +1068,7 @@ export function appendStreamErrorBanner(tab, pane, messagesContainer, errorText,
       retryBtn.disabled = true;
       const clientStreamId = generateClientStreamId();
       resetTabStreamBuffers(tab);
+      tab.lastStreamError = null;
       tab.activeStreamId = clientStreamId;
       setTabStreamingUI(pane, tab, true);
       const useWebSearch = Boolean(tab.webSearchEnabled && getWebSearchAvailability().available);
@@ -1059,30 +1114,10 @@ export function appendStreamErrorBanner(tab, pane, messagesContainer, errorText,
           return;
         }
 
-        // Remove any orphaned partial assistant rows AND the error banner row AFTER RPC succeeds (`NEW-H3`)
-        removeDownstreamSiblings(prevRow, `live-msg-${tab.id}`, false);
-        tab.lastStreamError = null;
-        renderTabs();
-
-        if (res.conversation_id && (!tab.conversationId || tab.conversationId === res.conversation_id)) {
-          const changed = tab.conversationId !== res.conversation_id;
-          tab.conversationId = res.conversation_id;
-          tab.pendingUserDraft = null;
-          if (changed) persistTabsState();
-        }
         if (res.user_message && res.user_message.id && prevRow) {
           prevRow.dataset.msgId = res.user_message.id;
         }
-        if (tab.activeStreamId !== clientStreamId && tab.activeStreamId !== res.stream_id) {
-          return;
-        }
-        if (res.stream_id) {
-          tab.activeStreamId = res.stream_id;
-        }
-        if (res.token_stats) {
-          tab.tokenStats = res.token_stats;
-          renderTokenStats(pane, tab.id, res.token_stats);
-        }
+        reconcileRestartedStream(tab, pane, prevRow, false, res, clientStreamId);
       } catch (err) {
         retryBtn.disabled = false;
         if (tab.activeStreamId === clientStreamId) {
@@ -1284,7 +1319,11 @@ export function createMessageElement(tab, msg, pane) {
     row.querySelector(".edit-msg-btn").onclick = () => inlineEditUserMessage(row, tab, msg, pane);
   } else {
     const isSystemMsg = msg.role === "system";
-    const provTag = isSystemMsg ? "SYSTEM" : (msg.provider_id ? msg.provider_id.toUpperCase() : "API");
+    const rawProvId = isSystemMsg ? "" : (msg.provider_id || "");
+    const rawProvName = isSystemMsg ? "" : (msg.provider_name || "");
+    const provTag = isSystemMsg
+      ? "SYSTEM"
+      : resolveProviderDisplayName(rawProvId, rawProvName).toUpperCase();
     const modelTag = isSystemMsg ? "Context Note" : (msg.model_id || "Assistant");
     const thinkBadge =
       !isSystemMsg && msg.thinking_level && msg.thinking_level !== "none"
@@ -1310,12 +1349,20 @@ export function createMessageElement(tab, msg, pane) {
     let tokensTag = "";
     if (msg.prompt_tokens || msg.completion_tokens) {
       const cachedStr = msg.cached_tokens ? ` (${formatTokens(msg.cached_tokens)} cached)` : "";
-      tokensTag = `<span style="font-size: 11px; color: var(--text-muted);">${formatTokens(msg.prompt_tokens)} in / ${formatTokens(msg.completion_tokens)} out${cachedStr}</span>`;
+      const speedStr = formatTokenSpeed(msg.completion_tokens, msg.duration_ms);
+      const speedPart = speedStr ? ` · ${speedStr}` : "";
+      const durTitle =
+        msg.duration_ms > 0 ? ` title="Response time: ${(msg.duration_ms / 1000).toFixed(2)}s"` : "";
+      tokensTag = `<span class="msg-token-meta"${durTitle}>${formatTokens(msg.prompt_tokens)} in / ${formatTokens(msg.completion_tokens)} out${cachedStr}${speedPart}</span>`;
     }
+
+    const provDataAttrs = isSystemMsg
+      ? ""
+      : ` data-provider-id="${escapeHtml(rawProvId)}" data-provider-name="${escapeHtml(rawProvName)}"`;
 
     row.innerHTML = `
       <div class="assistant-header-badge">
-        <span class="provider-tag">${escapeHtml(provTag)}</span>
+        <span class="provider-tag"${provDataAttrs}>${escapeHtml(provTag)}</span>
         <span>${escapeHtml(modelTag)}${escapeHtml(thinkBadge)}</span>
         ${tokensTag}
       </div>
@@ -1350,6 +1397,7 @@ export function createMessageElement(tab, msg, pane) {
         regenBtn.disabled = true;
         const clientStreamId = generateClientStreamId();
         resetTabStreamBuffers(tab);
+        tab.lastStreamError = null;
         tab.activeStreamId = clientStreamId;
         setTabStreamingUI(pane, tab, true);
         const realMsgId = row.dataset.msgId || msg.id;
@@ -1376,21 +1424,7 @@ export function createMessageElement(tab, msg, pane) {
             return;
           }
 
-          // Remove this assistant row & downstream rows ONLY after RPC succeeds (`NEW-H3`)
-          removeDownstreamSiblings(row, `live-msg-${tab.id}`, true);
-          tab.lastStreamError = null;
-          renderTabs();
-
-          if (tab.activeStreamId !== clientStreamId && tab.activeStreamId !== res.stream_id) {
-            return;
-          }
-          if (res.stream_id) {
-            tab.activeStreamId = res.stream_id;
-          }
-          if (res.token_stats) {
-            tab.tokenStats = res.token_stats;
-            renderTokenStats(pane, tab.id, res.token_stats);
-          }
+          reconcileRestartedStream(tab, pane, row, true, res, clientStreamId);
         } catch (err) {
           regenBtn.disabled = false;
           if (tab.activeStreamId === clientStreamId) {
@@ -1480,6 +1514,7 @@ export function inlineEditUserMessage(row, tab, msg, pane) {
     cancelBtn.disabled = true;
     const clientStreamId = generateClientStreamId();
     resetTabStreamBuffers(tab);
+    tab.lastStreamError = null;
     tab.activeStreamId = clientStreamId;
     setTabStreamingUI(pane, tab, true);
     const realMsgId = row.dataset.msgId || msg.id;
@@ -1517,20 +1552,7 @@ export function inlineEditUserMessage(row, tab, msg, pane) {
       bubble.classList.remove("editing");
       delete bubble._cancelInlineEdit;
       bubble.textContent = newText;
-      removeDownstreamSiblings(row, `live-msg-${tab.id}`, false);
-      tab.lastStreamError = null;
-      renderTabs();
-
-      if (tab.activeStreamId !== clientStreamId && tab.activeStreamId !== res.stream_id) {
-        return;
-      }
-      if (res.stream_id) {
-        tab.activeStreamId = res.stream_id;
-      }
-      if (res.token_stats) {
-        tab.tokenStats = res.token_stats;
-        renderTokenStats(pane, tab.id, res.token_stats);
-      }
+      reconcileRestartedStream(tab, pane, row, false, res, clientStreamId);
     } catch (err) {
       saveBtn.disabled = false;
       cancelBtn.disabled = false;
@@ -1595,6 +1617,18 @@ export async function sendMessageFromPane(pane, tab) {
   tab._preferredThinkingLevel = tab.thinkingLevel;
   tab._usingTempFallback = false;
 
+  const rollbackPendingSend = () => {
+    if (userRow && userRow.parentElement) userRow.remove();
+    if (tab.pendingUserDraft === tempUserMsg) tab.pendingUserDraft = null;
+    if (!tab.conversationId || !state.conversations.some((c) => c.id === tab.conversationId)) {
+      tab.hasUnansweredPrompt = false;
+    }
+    if (chatInput && !chatInput.value.trim()) {
+      chatInput.value = text;
+      tab.draftInput = text;
+    }
+  };
+
   const useWebSearch = Boolean(tab.webSearchEnabled && getWebSearchAvailability().available);
   try {
     const res = await callApi(
@@ -1612,10 +1646,12 @@ export async function sendMessageFromPane(pane, tab) {
       clientStreamId
     );
     if (!res || res.error) {
+      rollbackPendingSend();
       if (tab.activeStreamId === clientStreamId) {
         tab.activeStreamId = null;
         setTabStreamingUI(pane, tab, false);
       }
+      renderTabs();
       showNoticeDialog((res && res.error) || "Failed to send message.");
       return;
     }
@@ -1637,10 +1673,12 @@ export async function sendMessageFromPane(pane, tab) {
       tab.activeStreamId = res.stream_id;
     }
   } catch (err) {
+    rollbackPendingSend();
     if (tab.activeStreamId === clientStreamId) {
       tab.activeStreamId = null;
       setTabStreamingUI(pane, tab, false);
     }
+    renderTabs();
     showNoticeDialog(`Failed to send message: ${err.message || err}`);
   }
 }
@@ -1721,7 +1759,7 @@ export function renderTokenStats(pane, tabId, stats) {
       (m) => `
       <tr>
         <td style="font-weight: 500;">${escapeHtml(m.model_id)}</td>
-        <td>${escapeHtml(m.provider_id)}</td>
+        <td>${escapeHtml(resolveProviderDisplayName(m.provider_id, m.provider_name))}</td>
         <td>${m.prompt_tokens.toLocaleString()}</td>
         <td>${m.completion_tokens.toLocaleString()}</td>
         <td style="color: #34a853;">${m.cached_tokens.toLocaleString()}</td>

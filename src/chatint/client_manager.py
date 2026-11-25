@@ -722,16 +722,19 @@ class BackgroundModelSyncer:
                 return
 
             api_key = get_api_key_from_env(provider.get("name", ""))
+            sdk_type = ClientManager.get_sdk_type(provider, provider_id)
+            is_loopback = sdk_type == "openai" and is_loopback_endpoint(provider.get("base_url", ""))
+            has_auth = bool(api_key) or is_loopback
             is_enabled = bool(provider.get("is_enabled", True))
 
-            if not is_enabled or not api_key:
+            if not is_enabled or not has_auth:
                 cls.clear_provider_verified(provider_id)
-                status, brief = cls.get_sync_status(provider_id, has_api_key=bool(api_key), is_enabled=is_enabled)
+                status, brief = cls.get_sync_status(provider_id, has_api_key=has_auth, is_enabled=is_enabled)
                 cls.set_sync_status(provider_id, status, brief)
                 with cls._lock:
                     cls._pending_network_retries.discard(provider_id)
                     cls._retry_backoff.pop(provider_id, None)
-                provider["has_api_key"] = bool(api_key)
+                provider["has_api_key"] = has_auth
                 provider["is_accessible"] = False
                 provider["fetched_model_ids"] = []
                 provider["sync_status"] = status
@@ -770,7 +773,8 @@ class BackgroundModelSyncer:
 
             with open_db() as conn:
                 row = conn.execute("SELECT models_json FROM providers WHERE id = ?", (provider_id,)).fetchone()
-            stored_models = json.loads(row["models_json"]) if row and row["models_json"] else []
+            raw_models_json = row["models_json"] if row else None
+            stored_models = json.loads(raw_models_json) if raw_models_json else []
 
             latest_provider = ClientManager.get_provider(provider_id)
             if not latest_provider:
@@ -783,13 +787,15 @@ class BackgroundModelSyncer:
                 if m.get("id") in fetched_ids or strip_model_prefix(m.get("id", "")).lower() in clean_fetched_lower
             ]
             synced_models = retained[:5]
+            if raw_models_json is not None and synced_models != stored_models:
+                if not update_provider_models(provider_id, synced_models, expected_models_json=raw_models_json):
+                    latest_provider = ClientManager.get_provider(provider_id) or latest_provider
+                    synced_models = latest_provider.get("models", synced_models)
             latest_provider["models"] = synced_models
             latest_provider["fetched_model_ids"] = sorted(list(fetched_ids))
             latest_provider["is_accessible"] = len(synced_models) > 0
             latest_provider["sync_status"] = "ready"
             latest_provider["sync_error"] = ""
-
-            update_provider_models(provider_id, synced_models)
 
             if provider_id == "gemini":
                 ws_models = get_web_search_models()

@@ -21,7 +21,7 @@ try {
         $version = $release.tag_name
     } catch {
         # Fallback to hardcoded current release if API limit is hit
-        $version = "v0.5.1"
+        $version = "v0.5.2"
     }
 
     Write-Host "Found version: $version" -ForegroundColor Green

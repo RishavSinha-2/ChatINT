@@ -36,6 +36,15 @@ jobs:
       - name: Install Dependencies
         run: uv sync --all-groups
 
+      - name: Verify Tag and Version Parity
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          uv run python -c "import re, tomllib; from pathlib import Path; tag = '${{ github.ref_name }}'.lstrip('v'); py = tomllib.load(open('pyproject.toml','rb'))['project']['version']; init = re.search(r'__version__\s*=\s*\"([^\"]+)\"', Path('src/chatint/__init__.py').read_text()).group(1); iss = re.search(r'#define\s+MyAppVersion\s+\"([^\"]+)\"', Path('packaging/ChatInt.iss').read_text()).group(1); assert tag == py == init == iss, f'Version mismatch: tag={tag}, pyproject={py}, init={init}, iss={iss}'; print(f'Version parity verified: {tag}')"
+
+      - name: Run Automated Test Suite
+        run: uv run python -m unittest discover -s tests -v
+
       - name: Build Standalone Executable, Portable ZIP, and Inno Setup Installer
         run: uv run python packaging/build_release.py
 

@@ -52,14 +52,14 @@ This builds:
 - Prints SHA-256 hashes for all artifacts.
 
 ### Step 2: Publish GitHub Release
-1. Create a release tag on GitHub (e.g. `v0.5.1`).
-2. Upload `ChatInt-Setup-x64.exe` and `ChatInt-Portable-v0.5.1.zip` as release assets.
+1. Create a release tag on GitHub (e.g. `v0.5.2`).
+2. Upload `ChatInt-Setup-x64.exe` and `ChatInt-Portable-v0.5.2.zip` as release assets.
 3. Publish the release.
 
 ### Step 3: Submit to WinGet using `wingetcreate`
 Use Microsoft's official `wingetcreate` tool:
 ```powershell
-wingetcreate new https://github.com/RishavSinha-2/ChatINT/releases/download/v0.5.1/ChatInt-Setup-x64.exe
+wingetcreate new https://github.com/RishavSinha-2/ChatINT/releases/download/v0.5.2/ChatInt-Setup-x64.exe
 ```
 `wingetcreate` will:
 1. Download the installer and compute the SHA-256 hash automatically.
@@ -77,7 +77,7 @@ For manual PR submission, create the manifests under:
 ### Manifest 1: `RishavSinha.ChatInt.version.yaml`
 ```yaml
 PackageIdentifier: RishavSinha.ChatInt
-PackageVersion: 0.5.1
+PackageVersion: 0.5.2
 DefaultLocale: en-US
 ManifestType: version
 ManifestVersion: 1.6.0
@@ -86,7 +86,7 @@ ManifestVersion: 1.6.0
 ### Manifest 2: `RishavSinha.ChatInt.installer.yaml`
 ```yaml
 PackageIdentifier: RishavSinha.ChatInt
-PackageVersion: 0.5.1
+PackageVersion: 0.5.2
 InstallerLocale: en-US
 InstallerType: inno
 Scope: user
@@ -98,10 +98,10 @@ InstallerSwitches:
   Silent: /VERYSILENT /SUPPRESSMSGBOXES /NORESTART
   SilentWithProgress: /SILENT /SUPPRESSMSGBOXES /NORESTART
 UpgradeBehavior: install
-ReleaseDate: 2026-11-15
+ReleaseDate: 2026-11-25
 Installers:
   - Architecture: x64
-    InstallerUrl: https://github.com/RishavSinha-2/ChatINT/releases/download/v0.5.1/ChatInt-Setup-x64.exe
+    InstallerUrl: https://github.com/RishavSinha-2/ChatINT/releases/download/v0.5.2/ChatInt-Setup-x64.exe
     InstallerSha256: <SHA256_FROM_BUILD_RELEASE_PY>
 ManifestType: installer
 ManifestVersion: 1.6.0
@@ -110,7 +110,7 @@ ManifestVersion: 1.6.0
 ### Manifest 3: `RishavSinha.ChatInt.locale.en-US.yaml`
 ```yaml
 PackageIdentifier: RishavSinha.ChatInt
-PackageVersion: 0.5.1
+PackageVersion: 0.5.2
 PackageLocale: en-US
 Publisher: Rishav Sinha
 PublisherUrl: https://github.com/RishavSinha-2/ChatINT
@@ -141,7 +141,7 @@ ManifestVersion: 1.6.0
 
 - **Upgrades (`winget upgrade RishavSinha.ChatInt`)**:
   - The installer runs silently with `/VERYSILENT /SUPPRESSMSGBOXES /NORESTART`.
-  - Inno Setup script detects `WizardSilent() == True` and leaves `%APPDATA%\ChatInt` intact.
+  - Inno Setup script detects `UninstallSilent() == True` and leaves `%APPDATA%\ChatInt` intact.
   - The newer `.exe` replaces the old binary in `%LOCALAPPDATA%\Programs\ChatInt`.
   - App opens with all chats, models, and settings preserved.
 - **Uninstalls (`winget uninstall RishavSinha.ChatInt` or Windows Settings)**:

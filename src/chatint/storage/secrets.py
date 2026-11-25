@@ -138,7 +138,7 @@ def _atomic_write_env(env_path: Path, content: str) -> None:
 
 
 def _ensure_env_text_locked(env_path: Path) -> str:
-    """Ensure .env exists with all built-in provider entries and return its raw text in at most 1 read."""
+    """Ensure .env is seeded on first creation and return its raw text without re-adding pruned default keys."""
     raw_text = env_path.read_text(encoding="utf-8") if env_path.exists() else ""
     if not raw_text.strip():
         lines = []
@@ -152,28 +152,6 @@ def _ensure_env_text_locked(env_path: Path) -> str:
         new_content = "\n".join(lines) + ("\n" if lines else "")
         _atomic_write_env(env_path, new_content)
         return new_content
-
-    existing_keys = set()
-    for line in raw_text.splitlines():
-        s = line.strip()
-        if s and not s.startswith("#") and "=" in s:
-            existing_keys.add(s.split("=", 1)[0].strip().upper())
-
-    appended = []
-    for p in DEFAULT_PROVIDERS:
-        clean = sanitize_provider_name(str(p.get("name") or ""))
-        if clean:
-            env_k = f"{clean.upper()}_API_KEY"
-            if env_k not in existing_keys:
-                default_val = "ollama" if clean.lower() == "ollama" else str(p.get("api_key") or "")
-                stored_val = encrypt_secret_for_storage(default_val) if default_val else ""
-                appended.append(f"{env_k}={_format_env_value(stored_val)}")
-
-    if appended:
-        prefix = raw_text if raw_text.endswith("\n") else (raw_text + "\n")
-        updated_text = prefix + "\n".join(appended) + "\n"
-        _atomic_write_env(env_path, updated_text)
-        return updated_text
 
     return raw_text
 

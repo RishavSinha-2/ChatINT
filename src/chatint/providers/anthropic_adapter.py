@@ -211,6 +211,8 @@ def _stream_anthropic(
             last_api_err = None
             try:
                 for effort in effort_chain:
+                    if abort_event.is_set():
+                        break
                     effort_candidates = _build_anthropic_effort_candidates(model_id, effort)
                     attempt_list: List[Dict[str, Any]] = []
                     for cand in effort_candidates:
@@ -224,6 +226,8 @@ def _stream_anthropic(
 
                     effort_succeeded = False
                     for attempt_kwargs in attempt_list:
+                        if abort_event.is_set():
+                            break
                         try:
                             response_stream = client.messages.create(**attempt_kwargs)
                             actual_thinking_level = effort if effort is not None else "none"
@@ -238,7 +242,7 @@ def _stream_anthropic(
                                 last_api_err = api_err
                                 continue
                             raise
-                    if effort_succeeded:
+                    if effort_succeeded or abort_event.is_set():
                         break
 
                 if response_stream is None and last_api_err is not None:
@@ -519,18 +523,24 @@ def _stream_anthropic(
             for tb in assistant_blocks:
                 if tb.get("type") != "tool_use":
                     continue
-                if abort_event.is_set() or total_executed_tool_calls >= MAX_TOOL_CALLS_PER_PROMPT:
+                if abort_event.is_set():
                     break
-                res = _run_web_search_tool_call(
-                    bridge,
-                    tab_id,
-                    conversation_id,
-                    tb["name"],
-                    tb.get("input") or {},
-                    abort_event,
-                    stream_id=stream_id,
-                )
-                total_executed_tool_calls += 1
+                if total_executed_tool_calls >= MAX_TOOL_CALLS_PER_PROMPT:
+                    res = {
+                        "ok": False,
+                        "error": f"Tool call budget limit ({MAX_TOOL_CALLS_PER_PROMPT}) reached for this prompt.",
+                    }
+                else:
+                    res = _run_web_search_tool_call(
+                        bridge,
+                        tab_id,
+                        conversation_id,
+                        tb["name"],
+                        tb.get("input") or {},
+                        abort_event,
+                        stream_id=stream_id,
+                    )
+                    total_executed_tool_calls += 1
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": tb["id"],

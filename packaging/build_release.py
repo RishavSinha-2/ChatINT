@@ -23,7 +23,7 @@ def get_version() -> str:
     pyproject = PROJECT_ROOT / "pyproject.toml"
     with pyproject.open("rb") as f:
         data = tomllib.load(f)
-    return str(data.get("project", {}).get("version", "0.5.1"))
+    return str(data.get("project", {}).get("version", "0.5.2"))
 
 
 def compute_sha256(path: Path) -> str:
@@ -52,23 +52,62 @@ def find_iscc() -> Path | None:
 
 
 def prepare_clean_default_db() -> Path | None:
-    """Creates a clean template copy of data/chatint.db with providers, models, pricings, and settings,
-    ensuring personal chat history (conversations, messages, ledger) is empty."""
-    source_db = PROJECT_ROOT / "data" / "chatint.db"
-    if not source_db.is_file():
-        return None
+    """Create a clean baseline chatint.db preserving curated providers/models/pricing and settings while scrubbing personal/runtime state."""
+    import contextlib
+    import sqlite3
+
     clean_dir = PROJECT_ROOT / "build" / "default_data"
     clean_dir.mkdir(parents=True, exist_ok=True)
     clean_db = clean_dir / "chatint.db"
-    shutil.copy2(source_db, clean_db)
-    import sqlite3
-    with sqlite3.connect(clean_db) as conn:
-        conn.execute("DELETE FROM messages")
-        conn.execute("DELETE FROM conversations")
-        conn.execute("DELETE FROM token_ledger")
-        conn.execute("DELETE FROM tab_sessions")
-        conn.commit()
-        conn.execute("VACUUM")
+    temp_env = clean_dir / ".env.tmp"
+    for candidate in (clean_db, temp_env):
+        if candidate.exists():
+            candidate.unlink()
+
+    source_db = PROJECT_ROOT / "data" / "chatint.db"
+    if source_db.is_file():
+        with contextlib.closing(sqlite3.connect(source_db)) as src_conn, contextlib.closing(sqlite3.connect(clean_db)) as dst_conn:
+            src_conn.backup(dst_conn)
+        with contextlib.closing(sqlite3.connect(clean_db)) as conn:
+            for tbl in ("messages", "conversations", "token_ledger", "tab_sessions", "google_search_usage"):
+                conn.execute(f"DELETE FROM {tbl}")
+            conn.execute("UPDATE providers SET api_key = ''")
+            conn.commit()
+            conn.execute("VACUUM")
+    else:
+        src_dir = PROJECT_ROOT / "src"
+        if str(src_dir) not in sys.path:
+            sys.path.insert(0, str(src_dir))
+
+        import chatint.config as cfg
+        import chatint.db as db_mod
+        import chatint.storage.connection as conn_mod
+        import chatint.storage.secrets as sec_mod
+
+        orig_attrs = (
+            cfg.DB_PATH,
+            cfg.ENV_PATH,
+            db_mod.DB_PATH,
+            db_mod.ENV_PATH,
+            conn_mod._DEFAULT_DB_PATH,
+            sec_mod._DEFAULT_ENV_PATH,
+        )
+        try:
+            cfg.DB_PATH = db_mod.DB_PATH = conn_mod._DEFAULT_DB_PATH = clean_db
+            cfg.ENV_PATH = db_mod.ENV_PATH = sec_mod._DEFAULT_ENV_PATH = temp_env
+            db_mod.init_db()
+        finally:
+            (
+                cfg.DB_PATH,
+                cfg.ENV_PATH,
+                db_mod.DB_PATH,
+                db_mod.ENV_PATH,
+                conn_mod._DEFAULT_DB_PATH,
+                sec_mod._DEFAULT_ENV_PATH,
+            ) = orig_attrs
+            if temp_env.exists():
+                temp_env.unlink()
+
     print(f" -> Prepared clean baseline template database: {clean_db} ({clean_db.stat().st_size / 1024:.1f} KB)")
     return clean_db
 

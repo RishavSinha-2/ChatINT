@@ -15,9 +15,12 @@ def _resolve_dist_exe() -> Path:
     override = os.environ.get("CHATINT_EXE_PATH", "").strip()
     if override:
         return Path(override)
-    default_candidate = Path("dist/v0.5.1/ChatInt.exe")
+    default_candidate = Path("dist/v0.5.2/ChatInt.exe")
     if default_candidate.exists():
         return default_candidate
+    fallback_v051 = Path("dist/v0.5.1/ChatInt.exe")
+    if fallback_v051.exists():
+        return fallback_v051
     fallback_v050 = Path("dist/v0.5.0/ChatInt.exe")
     if fallback_v050.exists():
         return fallback_v050

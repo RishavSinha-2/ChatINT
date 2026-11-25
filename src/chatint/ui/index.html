@@ -92,7 +92,7 @@
   </div>
 
   <!-- Settings Modal (Ctrl+,) -->
-  <div class="modal-overlay" id="settings-modal">
+  <div class="modal-overlay" id="settings-modal" role="dialog" aria-modal="true" aria-label="Settings">
     <div class="modal-card">
       <div class="modal-header">
         <div style="display: flex; align-items: center; gap: 8px;">
@@ -125,7 +125,7 @@
   </div>
 
   <!-- Conversation Context & Settings Modal -->
-  <div class="modal-overlay" id="conv-settings-modal">
+  <div class="modal-overlay" id="conv-settings-modal" role="dialog" aria-modal="true" aria-label="Conversation Settings">
     <div class="modal-card" style="width: 500px;">
       <div class="modal-header">
         <span class="modal-title">Conversation Settings</span>
@@ -161,7 +161,7 @@
   </div>
 
   <!-- Export Modal -->
-  <div class="modal-overlay" id="export-modal">
+  <div class="modal-overlay" id="export-modal" role="dialog" aria-modal="true" aria-label="Export Conversation">
     <div class="modal-card" style="width: 480px;">
       <div class="modal-header">
         <span class="modal-title">Export Conversation</span>
@@ -193,7 +193,7 @@
   </div>
 
   <!-- Model Pricing & Thinking Configuration Modal -->
-  <div class="modal-overlay" id="model-config-modal">
+  <div class="modal-overlay" id="model-config-modal" role="dialog" aria-modal="true" aria-labelledby="model-config-title">
     <div class="modal-card single-space-dialog" style="width: 400px;">
       <div class="single-dialog-title" id="model-config-title">Model Pricing &amp; Thinking</div>
       <div class="settings-group">
@@ -220,7 +220,7 @@
   </div>
 
   <!-- Headerless Single-Space App Dialog (Alerts, Confirmations, Prompts) -->
-  <div class="modal-overlay" id="app-dialog-modal" style="z-index: 250;">
+  <div class="modal-overlay" id="app-dialog-modal" role="dialog" aria-modal="true" aria-labelledby="app-dialog-message" style="z-index: 250;">
     <div class="modal-card single-space-dialog" id="app-dialog-card">
       <div class="single-dialog-message" id="app-dialog-message"></div>
       <input type="text" class="settings-input" id="app-dialog-input" style="display: none;">

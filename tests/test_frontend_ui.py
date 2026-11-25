@@ -177,6 +177,13 @@ async function runE2eChecks() {
     window.dispatchEvent(new KeyboardEvent("keydown", { key: "T", ctrlKey: true, bubbles: true, cancelable: true }));
     assert(window.ChatInt.state.tabs.length === countBefore + 1, "Ctrl+T with uppercase T (CapsLock) must open new tab");
 
+    // 6. AUD-L5: Modals expose role=dialog + aria-modal and close on backdrop click
+    const exportModal = document.getElementById("export-modal");
+    assert(exportModal.getAttribute("role") === "dialog" && exportModal.getAttribute("aria-modal") === "true", "Export modal missing dialog aria attributes");
+    exportModal.classList.add("open");
+    exportModal.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    assert(!exportModal.classList.contains("open"), "Backdrop click must close Export modal");
+
     results.push({ name: "test_e2e_csp_bootstrap_dedup_click_to_load_drag_and_shortcuts", ok: true });
   } catch (err) {
     results.push({
@@ -231,15 +238,18 @@ FRONTEND_RUNNER_SCRIPT = r"""
   <script type="module">
     try {
       const { _isSafeUrl, renderMarkdownWithEnhancements } = await import("./js/markdown.js");
-      const { createTabObject, el, state, uiHooks } = await import("./js/state.js");
+      const { createTabObject, el, getDropdownProviders, state, uiHooks } = await import("./js/state.js");
       const { callApi, flushTabsState, isTabsStateDirty, persistTabsState } = await import("./js/api.js");
       const { copyText } = await import("./js/dialogs.js");
       const {
         applyLiveStreamRender,
+        createLiveStreamingRow,
         createMessageElement,
         populatePaneContent,
         renderActivePanes,
         renderTabs,
+        renderTokenStats,
+        sendMessageFromPane,
       } = await import("./js/panes.js");
       const { renderConversationsList } = await import("./js/sidebar.js");
       const {
@@ -572,6 +582,234 @@ FRONTEND_RUNNER_SCRIPT = r"""
         assertEqual(bufOpenai.fetched_model_ids[0], "custom-preview-model", "dirty provider fetched_model_ids must not be clobbered");
         el.settingsModal.classList.remove("open");
       }],
+
+      ["test_custom_provider_display_name_and_tokens_per_sec_rendering", async () => {
+        const origProviders = state.providers.slice();
+        const customProv = {
+          id: "provider_1795606486438",
+          name: "Bonsai",
+          base_url: "https://api.bonsai.example/v1",
+          is_enabled: true,
+          has_api_key: true,
+          sync_status: "ready",
+          sync_error: "",
+          is_accessible: true,
+          fetched_model_ids: ["bonsai-2.5-27b"],
+          models: [{ id: "bonsai-2.5-27b", name: "bonsai-2.5-27b", input_price: 0, cached_input_price: 0, output_price: 0 }],
+        };
+        state.providers = [...origProviders, customProv];
+        try {
+          const tab = createTabObject();
+          state.tabs = [tab];
+          state.activeTabId = tab.id;
+          state.splitTabIds = [tab.id];
+          renderActivePanes();
+          const pane = el.panesContainer.querySelector(`.chat-pane[data-tab-id="${tab.id}"]`);
+
+          const liveRow = createLiveStreamingRow({
+            ...tab,
+            streamingProviderId: "provider_1795606486438",
+            streamingModelId: "bonsai-2.5-27b",
+            streamingThinkingLevel: "none",
+          });
+          assertEqual(liveRow.querySelector(".provider-tag").textContent, "BONSAI", "live row must show Settings provider name");
+
+          const msgEl = createMessageElement(tab, {
+            id: "m_bonsai",
+            role: "assistant",
+            content: "Answer",
+            provider_id: "provider_1795606486438",
+            provider_name: "Bonsai",
+            model_id: "bonsai-2.5-27b",
+            thinking_level: "none",
+            prompt_tokens: 171,
+            completion_tokens: 467,
+            cached_tokens: 0,
+            duration_ms: 9630,
+          }, pane);
+          assertEqual(msgEl.querySelector(".provider-tag").textContent, "BONSAI", "message badge must show Settings provider name");
+          assertEqual(msgEl.querySelector(".msg-token-meta").textContent, "171 in / 467 out · 48.5 tok/s", "message metadata must include tok/s");
+
+          const cachedFastEl = createMessageElement(tab, {
+            id: "m_deepseek",
+            role: "assistant",
+            content: "Fast reply",
+            provider_id: "deepseek",
+            provider_name: "DeepSeek",
+            model_id: "deepseek-flash",
+            thinking_level: "low",
+            prompt_tokens: 2700,
+            completion_tokens: 1100,
+            cached_tokens: 1200,
+            duration_ms: 10000,
+          }, pane);
+          assertEqual(cachedFastEl.querySelector(".provider-tag").textContent, "DEEPSEEK");
+          assertEqual(cachedFastEl.querySelector(".msg-token-meta").textContent, "2.7k in / 1.1k out (1.2k cached) · 110 tok/s");
+
+          const legacyEl = createMessageElement(tab, {
+            id: "m_legacy",
+            role: "assistant",
+            content: "Legacy",
+            provider_id: "provider_99999999",
+            provider_name: "",
+            model_id: "custom-1",
+            thinking_level: "none",
+            prompt_tokens: 171,
+            completion_tokens: 467,
+            cached_tokens: 0,
+            duration_ms: 0,
+          }, pane);
+          assertEqual(legacyEl.querySelector(".provider-tag").textContent, "CUSTOM", "deleted custom provider without name must not show raw ID");
+          assertEqual(legacyEl.querySelector(".msg-token-meta").textContent, "171 in / 467 out", "zero duration_ms omits tok/s");
+
+          renderTokenStats(pane, tab.id, {
+            per_model: [{
+              model_id: "bonsai-2.5-27b",
+              provider_id: "provider_1795606486438",
+              provider_name: "Bonsai",
+              prompt_tokens: 171,
+              completion_tokens: 467,
+              cached_tokens: 0,
+              cache_miss_tokens: 171,
+              cache_hit_rate: 0,
+              total_tokens: 638,
+              cost: 0,
+            }],
+            grand_total: {
+              prompt_tokens: 171,
+              completion_tokens: 467,
+              cached_tokens: 0,
+              cache_miss_tokens: 171,
+              cache_hit_rate: 0,
+              total_tokens: 638,
+              total_cost: 0,
+              google_search_requests: 0,
+            },
+          });
+          const statsText = pane.querySelector(".stats-table").textContent;
+          assert(statsText.includes("Bonsai"), "stats table must show Settings provider name");
+          assert(!statsText.includes("provider_1795606486438"), "stats table must not leak raw provider_id");
+        } finally {
+          state.providers = origProviders;
+        }
+      }],
+
+      ["test_aud_h2_fast_stream_done_preserved_when_regen_rpc_resolves_late", async () => {
+        const origGetConv = window.pywebview.api.get_conversation;
+        const origRegen = window.pywebview.api.regenerate_message;
+        const tab = createTabObject({ conversationId: "c_race", title: "Race" });
+        window.pywebview.api.get_conversation = async (cid) => ({
+          ok: true,
+          data: {
+            id: cid,
+            title: "Race",
+            system_prompt: "",
+            max_context_messages: 30,
+            messages: [
+              { id: "u1", role: "user", content: "Q" },
+              { id: "a1", role: "assistant", content: "Old reply", provider_id: "openai", model_id: "gpt-5", thinking_level: "none" },
+            ],
+            token_stats: { per_model: [], grand_total: { total_tokens: 10, prompt_tokens: 5, completion_tokens: 5, cached_tokens: 0, cache_hit_rate: 0, total_cost: 0, google_search_requests: 0 } },
+          },
+          error: null,
+        });
+        state.conversations = [{ id: "c_race", title: "Race", system_prompt: "", max_context_messages: 30, updated_at: 1 }];
+        state.tabs = [tab];
+        state.activeTabId = tab.id;
+        state.splitTabIds = [tab.id];
+        renderActivePanes();
+        await new Promise((r) => setTimeout(r, 20));
+
+        const pane = el.panesContainer.querySelector(`.chat-pane[data-tab-id="${tab.id}"]`);
+        const msgBox = document.getElementById(`messages-${tab.id}`);
+        const a1 = msgBox.querySelector('[data-msg-id="a1"]');
+
+        window.pywebview.api.regenerate_message = async (_tabId, convId, _msgId, _p, _m, _t, _w, sid) => {
+          onStreamEvent({ type: "start", tab_id: tab.id, conversation_id: convId, stream_id: sid, provider_id: "openai", model_id: "gpt-5", thinking_level: "none" });
+          onStreamEvent({
+            type: "done",
+            tab_id: tab.id,
+            conversation_id: convId,
+            stream_id: sid,
+            message: { id: "a_new", role: "assistant", content: "Fast reply", provider_id: "openai", model_id: "gpt-5", thinking_level: "none" },
+            token_stats: { per_model: [], grand_total: { total_tokens: 99, prompt_tokens: 50, completion_tokens: 49, cached_tokens: 0, cache_hit_rate: 0, total_cost: 0, google_search_requests: 0 } },
+          });
+          return {
+            ok: true,
+            data: {
+              success: true,
+              stream_id: sid,
+              token_stats: { per_model: [], grand_total: { total_tokens: 10, prompt_tokens: 5, completion_tokens: 5, cached_tokens: 0, cache_hit_rate: 0, total_cost: 0, google_search_requests: 0 } },
+            },
+            error: null,
+          };
+        };
+        try {
+          await a1.querySelector(".regen-msg-btn").onclick();
+          assertEqual(msgBox.querySelector('[data-msg-id="a1"]'), null, "stale regenerated message removed");
+          assert(Boolean(msgBox.querySelector('[data-msg-id="a_new"]')), "fast completed message must NOT be wiped by late RPC resolution");
+          assertEqual(tab.tokenStats.grand_total.total_tokens, 99, "stale pre-stream token_stats must not overwrite post-stream stats");
+        } finally {
+          window.pywebview.api.get_conversation = origGetConv;
+          window.pywebview.api.regenerate_message = origRegen;
+        }
+      }],
+
+      ["test_aud_m1_m3_m5_loopback_dropdown_send_rollback_and_stats_scroll", async () => {
+        const origProviders = state.providers.slice();
+        state.providers = [
+          { id: "loop_ok", name: "LocalLLM", base_url: "http://127.0.0.1:11434/v1", is_enabled: true, is_accessible: true, has_api_key: false, clear_api_key: false, models: [{ id: "llama3" }] },
+          { id: "loop_cleared", name: "LocalCleared", base_url: "http://localhost:11434/v1", is_enabled: true, is_accessible: true, has_api_key: false, clear_api_key: true, models: [{ id: "llama3" }] },
+          { id: "remote_nokey", name: "RemoteNoKey", base_url: "https://api.example.com/v1", is_enabled: true, is_accessible: true, has_api_key: false, clear_api_key: false, models: [{ id: "m1" }] },
+        ];
+        try {
+          const ddIds = getDropdownProviders().map((p) => p.id);
+          assert(ddIds.includes("loop_ok"), "keyless loopback provider must appear in dropdown");
+          assert(!ddIds.includes("loop_cleared"), "explicitly cleared loopback key stays excluded");
+          assert(!ddIds.includes("remote_nokey"), "keyless remote provider stays excluded");
+        } finally {
+          state.providers = origProviders;
+        }
+
+        const origGetConv = window.pywebview.api.get_conversation;
+        window.pywebview.api.get_conversation = async (cid) => ({
+          ok: true,
+          data: { id: cid, title: "Rollback", system_prompt: "", max_context_messages: 30, messages: [], token_stats: null },
+          error: null,
+        });
+        const tab = createTabObject({ conversationId: "c_rb", providerId: "openai", modelId: "gpt-5" });
+        state.tabs = [tab];
+        state.activeTabId = tab.id;
+        state.splitTabIds = [tab.id];
+        renderActivePanes();
+        await new Promise((r) => setTimeout(r, 20));
+
+        const pane = el.panesContainer.querySelector(`.chat-pane[data-tab-id="${tab.id}"]`);
+        const input = document.getElementById(`input-${tab.id}`);
+        const msgBox = document.getElementById(`messages-${tab.id}`);
+        input.value = "Draft to preserve";
+        const origSend = window.pywebview.api.send_message;
+        window.pywebview.api.send_message = async () => ({ ok: true, data: { error: "Simulated validation error" }, error: null });
+        try {
+          await sendMessageFromPane(pane, tab);
+          assertEqual(msgBox.querySelectorAll(".user-message-row").length, 0, "optimistic user row rolled back on send failure");
+          assertEqual(input.value, "Draft to preserve", "unsent prompt restored to textarea on failure");
+          assertEqual(el.appDialogModal.classList.contains("open"), true, "error dialog opened");
+          el.appDialogOkBtn.click();
+
+          onStreamEvent({
+            type: "token_stats_updated",
+            tab_id: tab.id,
+            conversation_id: "c_rb",
+            token_stats: { per_model: [{ provider_id: "openai", model_id: "gpt-5", prompt_tokens: 33, completion_tokens: 12, cached_tokens: 0, cache_miss_tokens: 33, cache_hit_rate: 0, total_tokens: 45, cost: 0 }], grand_total: { total_tokens: 45, prompt_tokens: 33, completion_tokens: 12, cached_tokens: 0, cache_miss_tokens: 33, cache_hit_rate: 0, total_cost: 0, google_search_requests: 0 } },
+          });
+          assertEqual(tab.tokenStats.grand_total.total_tokens, 45, "token_stats_updated refreshes stats after error");
+          assertEqual(getComputedStyle(pane.querySelector(".token-stats-details")).overflowX, "auto", "stats breakdown must scroll horizontally");
+        } finally {
+          window.pywebview.api.get_conversation = origGetConv;
+          window.pywebview.api.send_message = origSend;
+        }
+      }],
     ];
 
     const results = [];
@@ -756,7 +994,7 @@ class TestFrontendBehavioralUI(unittest.TestCase):
             self.fail(f"Frontend test runner failed during module boot:\n{received_payload['boot_error']}")
 
         results = received_payload.get("results", [])
-        self.assertGreaterEqual(len(results), 12, f"Expected >= 12 frontend tests, got {results}")
+        self.assertGreaterEqual(len(results), 14, f"Expected >= 14 frontend tests, got {results}")
         failures = [r for r in results if not r.get("ok")]
         if failures:
             formatted = "\n\n".join(f"[{f['name']}]\n{f.get('error')}" for f in failures)

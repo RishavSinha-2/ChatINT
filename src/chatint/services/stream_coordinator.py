@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import threading
+import time
 from typing import Any, Callable, Dict, List, Optional
 import uuid
 
@@ -108,7 +109,7 @@ def run_auto_naming(
             if assistant_count < 1:
                 return
             needs_name = (not conv.get("is_auto_named")) and is_default_conversation_title(current_title)
-            if not needs_name or assistant_count > 1:
+            if not needs_name:
                 return
 
             final_title, in_tok, out_tok, cache_tok = generate_chat_title(
@@ -169,9 +170,11 @@ def stream_chat_completion_impl(
     abort_event = StreamManager.register_stream(tab_id, stream_id=active_stream_id, conversation_id=conversation_id)
     user_question = next((m.get("content", "") for m in reversed(messages) if m.get("role") == "user"), "")
     provider = ClientManager.get_provider(provider_id)
+    provider_name = (provider.get("name") if provider else "") or ""
     sdk_type = ClientManager.get_sdk_type(provider, provider_id)
     stream_fn = sdk_streamers.get(sdk_type) or sdk_streamers["openai"]
 
+    t_start = time.perf_counter()
     try:
         try:
             (
@@ -204,6 +207,7 @@ def stream_chat_completion_impl(
             return
     finally:
         StreamManager.unregister_stream(tab_id, stream_id=active_stream_id)
+    duration_ms = max(0, int(round((time.perf_counter() - t_start) * 1000)))
 
     final_content_str = "".join(full_content).strip()
     final_thinking_str = "".join(full_thinking).strip()
@@ -219,6 +223,17 @@ def stream_chat_completion_impl(
                 completion_tokens=completion_tokens,
                 cached_tokens=cached_tokens,
             )
+            if stream_had_error:
+                _safe_dispatch(
+                    bridge,
+                    {
+                        "type": "token_stats_updated",
+                        "tab_id": tab_id,
+                        "conversation_id": conversation_id,
+                        "stream_id": active_stream_id,
+                        "token_stats": get_token_stats(conversation_id),
+                    },
+                )
         if stream_had_error:
             return
         # Cleanly notify UI when user aborted before any chunk arrived
@@ -255,27 +270,27 @@ def stream_chat_completion_impl(
         completion_tokens=completion_tokens,
         cached_tokens=cached_tokens,
         msg_id=assistant_msg_id,
+        duration_ms=duration_ms,
+        provider_name=provider_name,
     )
     if msg_record is None:
         return
 
-    # Only spawn auto-naming on Turn 1 of an unnamed conversation (fixes H5 redundant threads & New Chat (1))
+    # Spawn auto-naming on any turn of a conversation that still uses its default title
     if not stream_had_error:
         conv_snapshot = get_conversation(conversation_id)
         if conv_snapshot and (not conv_snapshot.get("is_auto_named")) and is_default_conversation_title(
             conv_snapshot.get("title")
         ):
-            assistant_count = sum(1 for m in conv_snapshot.get("messages", []) if m.get("role") == "assistant")
-            if assistant_count <= 1:
-                auto_naming_fn(
-                    bridge,
-                    tab_id,
-                    conversation_id,
-                    user_question,
-                    provider_id,
-                    model_id,
-                    stream_id=active_stream_id,
-                )
+            auto_naming_fn(
+                bridge,
+                tab_id,
+                conversation_id,
+                user_question,
+                provider_id,
+                model_id,
+                stream_id=active_stream_id,
+            )
 
     token_stats = get_token_stats(conversation_id)
 
@@ -290,5 +305,16 @@ def stream_chat_completion_impl(
                 "message": msg_record,
                 "token_stats": token_stats,
                 "was_aborted": abort_event.is_set(),
+            },
+        )
+    else:
+        _safe_dispatch(
+            bridge,
+            {
+                "type": "token_stats_updated",
+                "tab_id": tab_id,
+                "conversation_id": conversation_id,
+                "stream_id": active_stream_id,
+                "token_stats": token_stats,
             },
         )

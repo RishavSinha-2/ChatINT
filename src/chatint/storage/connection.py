@@ -22,7 +22,7 @@ from chatint.storage.secrets import (
 )
 
 _logger = get_logger("chatint.storage.connection")
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def _get_db_path() -> Path:
@@ -93,11 +93,13 @@ def _migration_v1(cursor: sqlite3.Cursor) -> None:
         content TEXT NOT NULL,
         thinking_content TEXT NOT NULL DEFAULT '',
         provider_id TEXT NOT NULL DEFAULT '',
+        provider_name TEXT NOT NULL DEFAULT '',
         model_id TEXT NOT NULL DEFAULT '',
         thinking_level TEXT NOT NULL DEFAULT 'none',
         prompt_tokens INTEGER NOT NULL DEFAULT 0,
         completion_tokens INTEGER NOT NULL DEFAULT 0,
         cached_tokens INTEGER NOT NULL DEFAULT 0,
+        duration_ms INTEGER NOT NULL DEFAULT 0,
         created_at REAL NOT NULL,
         FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
     )
@@ -182,9 +184,19 @@ def _migration_v2(cursor: sqlite3.Cursor) -> None:
             cursor.execute("UPDATE conversations SET is_auto_named = 1 WHERE id = ?", (r["id"],))
 
 
+def _migration_v3(cursor: sqlite3.Cursor) -> None:
+    """Add messages.duration_ms and messages.provider_name columns for tok/s and custom provider labels."""
+    msg_cols = {r["name"] for r in cursor.execute("PRAGMA table_info(messages)").fetchall()}
+    if "duration_ms" not in msg_cols:
+        cursor.execute("ALTER TABLE messages ADD COLUMN duration_ms INTEGER NOT NULL DEFAULT 0")
+    if "provider_name" not in msg_cols:
+        cursor.execute("ALTER TABLE messages ADD COLUMN provider_name TEXT NOT NULL DEFAULT ''")
+
+
 MIGRATIONS: List[Tuple[int, str, Callable[[sqlite3.Cursor], None]]] = [
     (1, "Base schema, composite indexes, and token ledger backfill", _migration_v1),
     (2, "Add conversations.is_auto_named column and backfill existing titled conversations", _migration_v2),
+    (3, "Add messages.duration_ms and messages.provider_name columns", _migration_v3),
 ]
 
 

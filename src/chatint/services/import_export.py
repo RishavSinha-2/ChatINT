@@ -100,11 +100,13 @@ def format_conversation_markdown(conv: Dict[str, Any]) -> str:
         msg_meta: Dict[str, Any] = {}
         if msg.get("provider_id"):
             msg_meta["provider_id"] = msg["provider_id"]
+        if msg.get("provider_name"):
+            msg_meta["provider_name"] = msg["provider_name"]
         if msg.get("model_id"):
             msg_meta["model_id"] = msg["model_id"]
         if msg.get("thinking_level") and msg.get("thinking_level") != "none":
             msg_meta["thinking_level"] = msg["thinking_level"]
-        for tok_k in ("prompt_tokens", "completion_tokens", "cached_tokens"):
+        for tok_k in ("prompt_tokens", "completion_tokens", "cached_tokens", "duration_ms"):
             if _safe_nonneg_int(msg.get(tok_k)) > 0:
                 msg_meta[tok_k] = _safe_nonneg_int(msg.get(tok_k))
         if isinstance(msg.get("created_at"), (int, float)):
@@ -130,11 +132,13 @@ def _normalize_json_msg(m: Dict[str, Any]) -> Dict[str, Any]:
         "content": str(m.get("content", "") or ""),
         "thinking_content": str(m.get("thinking_content", "") or ""),
         "provider_id": str(m.get("provider_id", "") or ""),
+        "provider_name": str(m.get("provider_name", "") or ""),
         "model_id": str(m.get("model_id", "") or ""),
         "thinking_level": _normalize_thinking_level(m.get("thinking_level", "none")),
         "prompt_tokens": _safe_nonneg_int(m.get("prompt_tokens")),
         "completion_tokens": _safe_nonneg_int(m.get("completion_tokens")),
         "cached_tokens": _safe_nonneg_int(m.get("cached_tokens")),
+        "duration_ms": _safe_nonneg_int(m.get("duration_ms")),
     }
     if isinstance(m.get("created_at"), (int, float)):
         out["created_at"] = float(m["created_at"])
@@ -149,6 +153,12 @@ def _has_closing_fence(lines: List[str], start_idx: int, fence_char: str, fence_
         if m and m.group(1)[0] == fence_char and len(m.group(1)) >= fence_len:
             return True
     return False
+
+
+def _has_closing_marker(lines: List[str], start_idx: int, end_marker: str) -> bool:
+    """Return True if a closing delimiter marker appears on or after start_idx."""
+    needle = end_marker.lower()
+    return any(needle in lines[j].lower() for j in range(start_idx, len(lines)))
 
 
 def parse_chat_file_content(content: str, filename: str = "") -> Dict[str, Any]:
@@ -233,11 +243,13 @@ def parse_chat_file_content(content: str, filename: str = "") -> Dict[str, Any]:
             "content": body,
             "thinking_content": thinking_content,
             "provider_id": str(current_msg_meta.get("provider_id", "") or ""),
+            "provider_name": str(current_msg_meta.get("provider_name", "") or ""),
             "model_id": str(current_msg_meta.get("model_id") or current_model_id or ""),
             "thinking_level": resolved_thinking,
             "prompt_tokens": _safe_nonneg_int(current_msg_meta.get("prompt_tokens")),
             "completion_tokens": _safe_nonneg_int(current_msg_meta.get("completion_tokens")),
             "cached_tokens": _safe_nonneg_int(current_msg_meta.get("cached_tokens")),
+            "duration_ms": _safe_nonneg_int(current_msg_meta.get("duration_ms")),
         }
         if isinstance(current_msg_meta.get("created_at"), (int, float)):
             msg_entry["created_at"] = float(current_msg_meta["created_at"])
@@ -262,7 +274,8 @@ def parse_chat_file_content(content: str, filename: str = "") -> Dict[str, Any]:
 
         if not in_fence_char:
             if not in_delimited_thought and "<!-- chatint-thought-start -->" in stripped.lower():
-                in_delimited_thought = True
+                if _has_closing_marker(raw_lines, idx, "<!-- chatint-thought-end -->"):
+                    in_delimited_thought = True
             if in_delimited_thought and "<!-- chatint-thought-end -->" in stripped.lower():
                 if current_role is not None:
                     current_body_lines.append(line)
@@ -273,7 +286,8 @@ def parse_chat_file_content(content: str, filename: str = "") -> Dict[str, Any]:
                 if not in_legacy_details and re.search(
                     r"<details>\s*<summary>\s*Thought Process\s*</summary>", line, re.IGNORECASE
                 ):
-                    in_legacy_details = True
+                    if _has_closing_marker(raw_lines, idx, "</details>"):
+                        in_legacy_details = True
                 if in_legacy_details and "</details>" in line.lower():
                     if current_role is not None:
                         current_body_lines.append(line)
@@ -358,11 +372,13 @@ def parse_chat_file_content(content: str, filename: str = "") -> Dict[str, Any]:
             "content": content_str,
             "thinking_content": "",
             "provider_id": "",
+            "provider_name": "",
             "model_id": "",
             "thinking_level": "none",
             "prompt_tokens": 0,
             "completion_tokens": 0,
             "cached_tokens": 0,
+            "duration_ms": 0,
         })
 
     result: Dict[str, Any] = {

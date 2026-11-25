@@ -285,6 +285,7 @@ def _attach_origin_guard(window: webview.Window, bridge: DesktopBridge, index_ht
                             nav_args.Cancel = True
                             _logger.warning("Cancelled WebView2 navigation to untrusted URI: %s", uri)
                     except Exception as nav_exc:
+                        nav_args.Cancel = True
                         _logger.debug("NavigationStarting check error: %s", nav_exc)
 
                 nav_handler_refs.append(_on_nav_starting)

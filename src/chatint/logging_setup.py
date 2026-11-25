@@ -121,19 +121,20 @@ def configure_logging(log_dir: Optional[Path] = None) -> logging.Logger:
         )
         scrub_filter = _SecretScrubFilter()
 
-        try:
-            file_handler = RotatingFileHandler(
-                log_file,
-                maxBytes=2 * 1024 * 1024,
-                backupCount=3,
-                encoding="utf-8",
-            )
-            file_handler.setLevel(logging.INFO)
-            file_handler.setFormatter(formatter)
-            file_handler.addFilter(scrub_filter)
-            logger.addHandler(file_handler)
-        except OSError:
-            pass
+        if log_dir is not None or "unittest" not in sys.modules:
+            try:
+                file_handler = RotatingFileHandler(
+                    log_file,
+                    maxBytes=2 * 1024 * 1024,
+                    backupCount=3,
+                    encoding="utf-8",
+                )
+                file_handler.setLevel(logging.INFO)
+                file_handler.setFormatter(formatter)
+                file_handler.addFilter(scrub_filter)
+                logger.addHandler(file_handler)
+            except OSError:
+                pass
 
         if not getattr(sys, "frozen", False):
             stream_handler = logging.StreamHandler()

@@ -257,12 +257,22 @@ def _stream_openai(
                     if not _is_openai_retryable_param_error(api_err):
                         raise
                     last_api_err = api_err
-                    if include_stream_options and "stream_options" in str(api_err).lower():
-                        include_stream_options = False
-                        kw.pop("stream_options", None)
+                    err_low = str(api_err).lower()
+                    should_retry_no_so = include_stream_options and (
+                        "stream_options" in err_low
+                        or "include_usage" in err_low
+                        or "extra" in err_low
+                        or "unknown" in err_low
+                        or "unrecognized" in err_low
+                        or (eff_val is None and not (use_tools and active_tools))
+                    )
+                    if should_retry_no_so:
+                        kw_no_so = dict(kw)
+                        kw_no_so.pop("stream_options", None)
                         try:
-                            raw_stream = client.chat.completions.create(**kw)
+                            raw_stream = client.chat.completions.create(**kw_no_so)
                             wrapped_stream = _peek_and_wrap(raw_stream)
+                            include_stream_options = False
                             actual_thinking_level = eff_val if eff_val is not None else "none"
                             record_resolved_thinking_level(provider_id, model_id, thinking_level, actual_thinking_level)
                             last_api_err = None
@@ -278,9 +288,11 @@ def _stream_openai(
 
             try:
                 for effort in effort_chain:
+                    if abort_event.is_set():
+                        break
                     if round_tools:
                         response_stream = _try_openai_create(effort, True, round_tools)
-                        if response_stream is not None:
+                        if response_stream is not None or abort_event.is_set():
                             break
                         # Test same effort WITHOUT tools before downgrading effort so tool-unsupported 400s
                         # never poison resolved_thinking to 'none'!
@@ -481,19 +493,25 @@ def _stream_openai(
             normalized_messages.append(assistant_msg)
 
             for idx, tc in enumerate(ordered_calls):
-                if abort_event.is_set() or total_executed_tool_calls >= MAX_TOOL_CALLS_PER_PROMPT:
+                if abort_event.is_set():
                     break
                 call_id = tc["id"] or f"call_{tool_round}_{idx}"
-                res = _run_web_search_tool_call(
-                    bridge,
-                    tab_id,
-                    conversation_id,
-                    tc["name"],
-                    tc.get("arguments") or "{}",
-                    abort_event,
-                    stream_id=stream_id,
-                )
-                total_executed_tool_calls += 1
+                if total_executed_tool_calls >= MAX_TOOL_CALLS_PER_PROMPT:
+                    res = {
+                        "ok": False,
+                        "error": f"Tool call budget limit ({MAX_TOOL_CALLS_PER_PROMPT}) reached for this prompt.",
+                    }
+                else:
+                    res = _run_web_search_tool_call(
+                        bridge,
+                        tab_id,
+                        conversation_id,
+                        tc["name"],
+                        tc.get("arguments") or "{}",
+                        abort_event,
+                        stream_id=stream_id,
+                    )
+                    total_executed_tool_calls += 1
                 normalized_messages.append({
                     "role": "tool",
                     "tool_call_id": call_id,

@@ -22,7 +22,7 @@ BUILTIN_PROVIDER_ORDER = {p["id"]: idx for idx, p in enumerate(DEFAULT_PROVIDERS
 
 
 def get_providers() -> List[Dict[str, Any]]:
-    from chatint.client_manager import BackgroundModelSyncer
+    from chatint.client_manager import BackgroundModelSyncer, ClientManager, is_loopback_endpoint
 
     with open_db() as conn:
         cursor = conn.cursor()
@@ -36,6 +36,7 @@ def get_providers() -> List[Dict[str, Any]]:
     for r in rows:
         pid = r["id"]
         pname = sanitize_provider_name(r["name"]) or "Provider"
+        base_url = r["base_url"] or ""
         try:
             raw_models = json.loads(r["models_json"] or "[]")
         except Exception as exc:
@@ -44,7 +45,8 @@ def get_providers() -> List[Dict[str, Any]]:
         models = [normalize_model_entry(m) for m in raw_models if isinstance(m, dict) and m.get("id")]
         env_key_name = provider_env_key(pname)
         raw_env_key = "" if env_key_name == "_API_KEY" else env_map.get(env_key_name, "")
-        has_api_key = bool(raw_env_key)
+        sdk_type = ClientManager.get_sdk_type({"id": pid, "name": pname}, pid)
+        has_api_key = bool(raw_env_key) or (sdk_type == "openai" and is_loopback_endpoint(base_url))
         is_enabled = bool(r["is_enabled"])
         is_verified = BackgroundModelSyncer.is_provider_verified(pid) if has_api_key else False
         verified_ids = BackgroundModelSyncer.get_verified_model_ids(pid) if is_verified else set()
@@ -54,9 +56,9 @@ def get_providers() -> List[Dict[str, Any]]:
         providers.append({
             "id": pid,
             "name": pname,
-            "base_url": r["base_url"],
+            "base_url": base_url,
             "has_api_key": has_api_key,
-            "api_key_mask": mask_api_key(raw_env_key) if has_api_key else "",
+            "api_key_mask": mask_api_key(raw_env_key) if raw_env_key else "",
             "is_enabled": is_enabled,
             "models": models,
             "fetched_model_ids": sorted(list(verified_ids)),
@@ -67,17 +69,28 @@ def get_providers() -> List[Dict[str, Any]]:
     return providers
 
 
-def update_provider_models(provider_id: str, models: List[Dict[str, Any]]) -> bool:
-    """Safely update only models_json for a single provider without touching or pruning other providers."""
+def update_provider_models(
+    provider_id: str,
+    models: List[Dict[str, Any]],
+    expected_models_json: Optional[str] = None,
+) -> bool:
+    """Safely update only models_json for a single provider without clobbering concurrent Settings edits."""
     if not provider_id:
         return False
     normalized_models = [normalize_model_entry(m) for m in (models or []) if isinstance(m, dict) and m.get("id")]
+    new_json = json.dumps(normalized_models)
     with open_db() as conn:
         cursor = conn.cursor()
-        cursor.execute(
-            "UPDATE providers SET models_json = ? WHERE id = ?",
-            (json.dumps(normalized_models), provider_id),
-        )
+        if expected_models_json is not None:
+            cursor.execute(
+                "UPDATE providers SET models_json = ? WHERE id = ? AND models_json = ?",
+                (new_json, provider_id, expected_models_json),
+            )
+        else:
+            cursor.execute(
+                "UPDATE providers SET models_json = ? WHERE id = ?",
+                (new_json, provider_id),
+            )
         conn.commit()
         return cursor.rowcount > 0
 
@@ -111,6 +124,10 @@ def save_providers(providers: List[Dict[str, Any]], prune_missing: bool = True) 
                 or "Provider"
             )
 
+            is_native_sdk = pid.lower() in ("anthropic", "gemini") or clean_name.lower() in ("anthropic", "gemini")
+            base_url_val = "" if is_native_sdk else str(p.get("base_url") or "").strip()
+            is_loopback = (not is_native_sdk) and is_loopback_endpoint(base_url_val)
+
             raw_new_key = p.get("api_key")
             has_new_key = raw_new_key is not None and str(raw_new_key).strip() != ""
             should_clear = bool(p.get("clear_api_key")) and not has_new_key
@@ -130,13 +147,12 @@ def save_providers(providers: List[Dict[str, Any]], prune_missing: bool = True) 
                     "clear": True,
                 })
             else:
-                is_new_loopback = old_row is None and is_loopback_endpoint(str(p.get("base_url") or ""))
                 env_updates.append({
                     "provider_name": clean_name,
                     "api_key": None,
                     "old_provider_name": old_name,
                     "clear": False,
-                    "default_if_missing": "ollama" if (clean_name.lower() == "ollama" or is_new_loopback) else "",
+                    "default_if_missing": "ollama" if (clean_name.lower() == "ollama" or is_loopback) else "",
                 })
 
             normalized_models = [normalize_model_entry(m) for m in (p.get("models") or []) if isinstance(m, dict) and m.get("id")]
@@ -147,14 +163,11 @@ def save_providers(providers: List[Dict[str, Any]], prune_missing: bool = True) 
             else:
                 models_json_str = "[]"
 
-            is_native_sdk = pid.lower() in ("anthropic", "gemini") or clean_name.lower() in ("anthropic", "gemini")
-            base_url_val = "" if is_native_sdk else str(p.get("base_url") or "").strip()
-
             key_changed = has_new_key or should_clear
             url_changed = bool(old_row and not is_native_sdk and (base_url_val != old_row["base_url"]))
             if key_changed or url_changed:
                 BackgroundModelSyncer.clear_provider_verified(pid)
-                if should_clear:
+                if should_clear and not is_loopback:
                     BackgroundModelSyncer.set_sync_status(pid, "no_key", "NO API KEY")
                 else:
                     BackgroundModelSyncer.set_sync_status(pid, "checking", "CHECKING...")

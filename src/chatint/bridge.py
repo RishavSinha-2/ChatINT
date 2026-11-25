@@ -940,6 +940,10 @@ class DesktopBridge:
         stream_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Validate provider & abort active streams BEFORE deleting downstream messages (fixes NEW-H3)."""
+        clean_message_id = (message_id or "").strip()
+        if not clean_message_id:
+            return {"error": "Message ID is required."}
+
         clean_provider = (provider_id or "").strip()
         clean_model = (model_id or "").strip()
         if not clean_provider or not clean_model:
@@ -954,7 +958,7 @@ class DesktopBridge:
 
         StreamManager.abort_conversation(conversation_id)
         clean_thinking = _normalize_thinking_level(thinking_level)
-        delete_messages_from(conversation_id, message_id, include_self=True)
+        delete_messages_from(conversation_id, clean_message_id, include_self=True)
         active_sid = self._start_stream(
             tab_id,
             conversation_id,

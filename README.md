@@ -19,7 +19,7 @@ A minimalist, multi-tab, multi-provider desktop chat interface built with **Pyth
   - Rename, duplicate/branch, or delete chats at any time via the sidebar or conversation settings.
 - **Streamlined Settings (General, Providers & Web Search)**:
   - Three master tabs: **General**, **Providers**, and **Web Search**.
-  - Under **Providers**: native SDK support for **Anthropic** (`anthropic` SDK) and **Gemini** (`google-genai` SDK) with automatic endpoint management, plus configurable endpoints for OpenAI, OpenRouter, DeepSeek, Ollama, or **`+ Add Provider`** for any OpenAI-compatible API.
+  - Under **Providers**: native SDK support for **Anthropic** (`anthropic` SDK) and **Gemini** (`google-genai` SDK) with automatic endpoint management, plus configurable endpoints for OpenAI, OpenRouter, DeepSeek, Ollama, or **`+ Add Provider`** for any OpenAI-compatible API (with custom provider display names across badges/stats and keyless support for local/loopback endpoints).
   - Buffered Settings modal edits with explicit **Save**, write-only masked `.env` API key management, **`Fetch from Endpoint`** verification, and **`Auto add`** for up to 5 models per provider.
   - Under **Web Search**: configure Gemini-backed Google Search and Image Search fallback models with request tracking (`monthly / 5,000` & all-time totals).
 - **Dynamic Startup Verification & Model Dropdown Mirroring**:
@@ -33,8 +33,9 @@ A minimalist, multi-tab, multi-provider desktop chat interface built with **Pyth
 - **Offline Markdown, Code Highlighting & LaTeX**:
   - Rich Markdown streaming with nested lists, tables, blockquotes, and bundled local KaTeX math fonts (`file://` offline-safe).
   - Syntax-highlighted code blocks with language pills and one-click **Copy Code** buttons.
-- **Token & Cache Analytics**:
-  - Collapsible statistics bar at the bottom of each tab pane showing input/output tokens, cache hits/misses, estimated cost per model, and Google Search usage.
+- **Per-Prompt Speed, Token & Cache Analytics**:
+  - Displays per-prompt generation speed (`tok/s`) and response timing directly alongside provider/model/token metadata on each assistant message.
+  - Collapsible, horizontally scrollable statistics bar at the bottom of each tab pane showing input/output tokens, cache hits/misses, estimated cost per model, and Google Search usage.
 
 ---
 
@@ -56,7 +57,7 @@ This downloads the latest release, installs silently to `%LOCALAPPDATA%\Programs
 Grab the standalone files directly from [GitHub Releases](https://github.com/RishavSinha-2/ChatINT/releases/latest):
 
 * **[ChatInt-Setup-x64.exe](https://github.com/RishavSinha-2/ChatINT/releases/latest)** — Standard Windows installer.
-* **[ChatInt-Portable-v0.5.1.zip](https://github.com/RishavSinha-2/ChatINT/releases/latest)** — Zero-install portable edition. Extract anywhere and run `ChatInt.exe`.
+* **[ChatInt-Portable-v0.5.2.zip](https://github.com/RishavSinha-2/ChatINT/releases/latest)** — Zero-install portable edition. Extract anywhere and run `ChatInt.exe`.
 
 ---
 
@@ -110,7 +111,7 @@ To compile the standalone `.exe`, package the portable `.zip`, and build the Inn
 uv run python packaging/build_release.py
 ```
 
-This automatically prepares the sanitized baseline template database, packages the portable archive, and prints SHA-256 checksums for all release artifacts.
+This automatically builds a clean baseline template database from `data/chatint.db` (preserving curated models, pricing, and default settings while scrubbing any runtime chats, tab sessions, search quota counts, and database API keys), packages the portable archive, and prints SHA-256 checksums for all release artifacts.
 
 ---
 
@@ -123,8 +124,8 @@ ChatInt features deterministic multi-mode path resolution and automatic database
   - Provider API keys are encrypted at rest using Windows DPAPI in **`%APPDATA%\ChatInt\.env`**.
 * **Portable Mode (Custom folder or alongside `data/`)**:
   - Completely self-contained next to `ChatInt.exe` in **`<exe_dir>\data\chatint.db`** and **`<exe_dir>\.env`**.
-* **Database Self-Healing**:
-  - Automatically checks SQLite integrity on launch. If corruption is detected, safely quarantines the corrupted database to `chatint.db.corrupted.<timestamp>`, restores from an intact `.bak` backup if available, or cleanly re-initializes from the bundled template without crashing.
+* **Database Self-Healing & Seamless Upgrades**:
+  - Automatically checks SQLite integrity and runs sequential schema migrations with pre-migration `.bak` snapshots, keeping older `data/` databases compatible across updates. If corruption is detected, safely quarantines the corrupted database to `chatint.db.corrupted.<timestamp>`, restores from an intact `.bak` backup if available, or cleanly re-initializes from the bundled template without crashing.
 * **Diagnostic Logs**:
   - Rotating logs with automatic secret scrubbing are stored in `data/logs/chatint.log` (accessible directly via **Settings → General → Open Logs Folder**).
 
@@ -141,5 +142,5 @@ uv run python -m unittest discover -s tests -v
 To run the live GUI smoke test against a built standalone executable (ensure no live `ChatInt` session is open first):
 
 ```bash
-CHATINT_RUN_EXE_SMOKE=1 CHATINT_EXE_PATH=dist/v0.5.1/ChatInt.exe uv run python -m unittest tests/test_dist_exe.py -v
+CHATINT_RUN_EXE_SMOKE=1 CHATINT_EXE_PATH=dist/v0.5.2/ChatInt.exe uv run python -m unittest tests/test_dist_exe.py -v
 ```

@@ -133,6 +133,25 @@ export function onStreamEvent(event) {
     return;
   }
 
+  if (event.type === "token_stats_updated") {
+    if (event.token_stats) {
+      if (event.token_stats.google_search_totals) {
+        state.googleSearchTotals = event.token_stats.google_search_totals;
+      }
+      for (const matchingTab of state.tabs) {
+        if (event.conversation_id && matchingTab.conversationId !== event.conversation_id) continue;
+        matchingTab.tokenStats = event.token_stats;
+        const matchingPane = el.panesContainer
+          ? el.panesContainer.querySelector(`.chat-pane[data-tab-id="${matchingTab.id}"]`)
+          : null;
+        if (matchingPane) {
+          renderTokenStats(matchingPane, matchingTab.id, event.token_stats);
+        }
+      }
+    }
+    return;
+  }
+
   const tab = state.tabs.find((t) => t.id === event.tab_id);
   if (!tab) return;
 
@@ -181,6 +200,9 @@ export function onStreamEvent(event) {
       if (staleLive) staleLive.remove();
 
       const liveRow = createLiveStreamingRow(tab);
+      if (event.stream_id || tab.activeStreamId) {
+        liveRow.dataset.streamId = event.stream_id || tab.activeStreamId;
+      }
       messagesContainer.appendChild(liveRow);
       renderIcons(liveRow);
       messagesContainer.scrollTop = messagesContainer.scrollHeight;
@@ -258,6 +280,9 @@ export function onStreamEvent(event) {
       const liveRow = document.getElementById(`live-msg-${tab.id}`);
       if (event.message) {
         const finalEl = createMessageElement(tab, event.message, pane);
+        if (event.stream_id) {
+          finalEl.dataset.streamId = event.stream_id;
+        }
         if (liveRow) {
           liveRow.replaceWith(finalEl);
         } else if (!messagesContainer.querySelector(`[data-msg-id="${event.message.id}"]`)) {
@@ -309,7 +334,10 @@ export function onStreamEvent(event) {
         targetRow.querySelectorAll("[id]").forEach((elWithId) => elWithId.removeAttribute("id"));
       }
 
-      appendStreamErrorBanner(tab, pane, messagesContainer, tab.lastStreamError, targetRow);
+      const errorRow = appendStreamErrorBanner(tab, pane, messagesContainer, tab.lastStreamError, targetRow);
+      if (event.stream_id && errorRow) {
+        errorRow.dataset.streamId = event.stream_id;
+      }
       messagesContainer.scrollTop = messagesContainer.scrollHeight;
     }
     resetTabStreamBuffers(tab);

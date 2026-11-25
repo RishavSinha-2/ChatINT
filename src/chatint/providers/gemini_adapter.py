@@ -302,13 +302,19 @@ def _stream_gemini(
 
             try:
                 for effort in effort_chain:
+                    if abort_event.is_set():
+                        break
                     modes = ["level", "budget"] if is_gen3_or_newer else ["budget", "level"]
                     if effort is None:
                         modes = ["plain"]
 
                     effort_connected = False
                     for mode in modes:
+                        if abort_event.is_set():
+                            break
                         for with_tools in use_tools_opts:
+                            if abort_event.is_set():
+                                break
                             try:
                                 raw_stream = client.models.generate_content_stream(
                                     model=model_id,
@@ -335,9 +341,9 @@ def _stream_gemini(
                                     clear_resolved_thinking_cache(provider_id, model_id, thinking_level)
                                 last_err = attempt_err
                                 continue
-                        if effort_connected:
+                        if effort_connected or abort_event.is_set():
                             break
-                    if effort_connected:
+                    if effort_connected or abort_event.is_set():
                         break
 
                 if active_stream is None and last_err is not None:
@@ -534,19 +540,25 @@ def _stream_gemini(
             contents.append(genai_types.Content(role="model", parts=coalesced_parts or round_parts))
             fn_response_parts = []
             for fc in round_fn_calls:
-                if abort_event.is_set() or total_executed_tool_calls >= MAX_TOOL_CALLS_PER_PROMPT:
+                if abort_event.is_set():
                     break
                 fc_name = getattr(fc, "name", "") or ""
-                fc_args = getattr(fc, "args", None) or {}
-                if not isinstance(fc_args, dict):
-                    try:
-                        fc_args = dict(fc_args)
-                    except Exception:
-                        fc_args = {}
-                res = _run_web_search_tool_call(
-                    bridge, tab_id, conversation_id, fc_name, fc_args, abort_event, stream_id=stream_id
-                )
-                total_executed_tool_calls += 1
+                if total_executed_tool_calls >= MAX_TOOL_CALLS_PER_PROMPT:
+                    res = {
+                        "ok": False,
+                        "error": f"Tool call budget limit ({MAX_TOOL_CALLS_PER_PROMPT}) reached for this prompt.",
+                    }
+                else:
+                    fc_args = getattr(fc, "args", None) or {}
+                    if not isinstance(fc_args, dict):
+                        try:
+                            fc_args = dict(fc_args)
+                        except Exception:
+                            fc_args = {}
+                    res = _run_web_search_tool_call(
+                        bridge, tab_id, conversation_id, fc_name, fc_args, abort_event, stream_id=stream_id
+                    )
+                    total_executed_tool_calls += 1
                 fn_response_parts.append(genai_types.Part.from_function_response(name=fc_name, response=res))
 
             if not fn_response_parts or abort_event.is_set():

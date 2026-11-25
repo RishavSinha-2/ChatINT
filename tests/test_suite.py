@@ -1608,6 +1608,499 @@ Gradient descent minimizes the loss function step by step.
         res_none = update_conversation(c4["id"], title=None)
         self.assertTrue(res_none and res_none.startswith("New Chat"))
 
+    def test_duration_ms_and_custom_provider_name_persistence_and_roundtrip(self):
+        import contextlib
+        import time
+        from chatint.providers.base import _emit_api_error
+        from chatint.storage.connection import SCHEMA_VERSION
+
+        # 1. Custom provider name persisted on streamed message, token_stats, branch, and API errors
+        provs = get_providers()
+        provs.append({
+            "id": "provider_1795606486438",
+            "name": "Bonsai",
+            "base_url": "https://api.bonsai.example/v1",
+            "is_enabled": True,
+            "models": [{"id": "bonsai-2.5-27b", "name": "bonsai-2.5-27b"}],
+        })
+        save_providers(provs)
+
+        conv = create_conversation("Bonsai Speed Test")
+        add_message(conv["id"], "user", "Explain photons")
+
+        def slow_custom_stream(**_kwargs):
+            time.sleep(0.05)
+            return (["Photons are quanta of light."], [], 171, 467, 0, False, "none")
+
+        with patch.dict("chatint.streamer._SDK_STREAMERS", {"openai": slow_custom_stream}):
+            stream_chat_completion(
+                bridge=DesktopBridge(),
+                tab_id="tab1",
+                conversation_id=conv["id"],
+                messages=[{"role": "user", "content": "Explain photons"}],
+                provider_id="provider_1795606486438",
+                model_id="bonsai-2.5-27b",
+                thinking_level="none",
+                stream_id="s-bonsai",
+            )
+
+        loaded = get_conversation(conv["id"])
+        asst = loaded["messages"][1]
+        self.assertEqual(asst["provider_id"], "provider_1795606486438")
+        self.assertEqual(asst["provider_name"], "Bonsai")
+        self.assertGreaterEqual(asst["duration_ms"], 30)
+
+        stats = get_token_stats(conv["id"])
+        self.assertEqual(stats["per_model"][0]["provider_name"], "Bonsai")
+
+        err_events = []
+        mock_bridge = MagicMock()
+        mock_bridge.push_event.side_effect = err_events.append
+        _emit_api_error(mock_bridge, "t1", conv["id"], "provider_1795606486438", "bonsai-2.5-27b", RuntimeError("boom"), [], [])
+        self.assertIn("Bonsai / bonsai-2.5-27b", err_events[0]["error"])
+
+        # Branching preserves provider_name and resets duration_ms to 0 alongside 0 tokens
+        branch = duplicate_conversation(conv["id"])
+        self.assertEqual(branch["messages"][1]["provider_name"], "Bonsai")
+        self.assertEqual(branch["messages"][1]["duration_ms"], 0)
+
+        # 2. Markdown & JSON export/import roundtrip preserve provider_name and duration_ms
+        bridge = DesktopBridge()
+        md_exp = bridge.export_conversation(conv["id"], "markdown")
+        parsed_md = parse_chat_file_content(md_exp["content"], "bonsai.md")
+        self.assertEqual(parsed_md["messages"][1]["provider_name"], "Bonsai")
+        self.assertEqual(parsed_md["messages"][1]["duration_ms"], asst["duration_ms"])
+
+        json_exp = bridge.export_conversation(conv["id"], "json")
+        parsed_json = parse_chat_file_content(json_exp["content"], "bonsai.json")
+        imp = import_conversation_data(title="Imported Bonsai", messages=parsed_json["messages"])
+        self.assertEqual(imp["messages"][1]["provider_name"], "Bonsai")
+        self.assertEqual(imp["messages"][1]["duration_ms"], asst["duration_ms"])
+
+        # 3. Migration from v2 DB upgrades cleanly to SCHEMA_VERSION (3) with new columns
+        v2_db = Path(self.test_dir.name) / "legacy_v2.db"
+        with contextlib.closing(sqlite3.connect(v2_db)) as c_v2:
+            c_v2.execute("CREATE TABLE providers (id TEXT PRIMARY KEY, name TEXT NOT NULL, base_url TEXT NOT NULL, api_key TEXT NOT NULL DEFAULT '', is_enabled INTEGER NOT NULL DEFAULT 1, models_json TEXT NOT NULL DEFAULT '[]')")
+            c_v2.execute("CREATE TABLE conversations (id TEXT PRIMARY KEY, title TEXT NOT NULL, system_prompt TEXT NOT NULL DEFAULT '', max_context_messages INTEGER NOT NULL DEFAULT 30, is_imported INTEGER NOT NULL DEFAULT 0, is_auto_named INTEGER NOT NULL DEFAULT 0, created_at REAL NOT NULL, updated_at REAL NOT NULL)")
+            c_v2.execute("CREATE TABLE messages (id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL, thinking_content TEXT NOT NULL DEFAULT '', provider_id TEXT NOT NULL DEFAULT '', model_id TEXT NOT NULL DEFAULT '', thinking_level TEXT NOT NULL DEFAULT 'none', prompt_tokens INTEGER NOT NULL DEFAULT 0, completion_tokens INTEGER NOT NULL DEFAULT 0, cached_tokens INTEGER NOT NULL DEFAULT 0, created_at REAL NOT NULL)")
+            c_v2.execute("CREATE TABLE tab_sessions (id INTEGER PRIMARY KEY CHECK (id = 1), state_json TEXT NOT NULL, updated_at REAL NOT NULL)")
+            c_v2.execute("CREATE TABLE app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            c_v2.execute("CREATE TABLE token_ledger (id INTEGER PRIMARY KEY AUTOINCREMENT, conversation_id TEXT NOT NULL, provider_id TEXT NOT NULL DEFAULT '', model_id TEXT NOT NULL DEFAULT '', prompt_tokens INTEGER NOT NULL DEFAULT 0, completion_tokens INTEGER NOT NULL DEFAULT 0, cached_tokens INTEGER NOT NULL DEFAULT 0, google_search_requests INTEGER NOT NULL DEFAULT 0, created_at REAL NOT NULL)")
+            c_v2.execute("CREATE TABLE google_search_usage (month_key TEXT PRIMARY KEY, request_count INTEGER NOT NULL DEFAULT 0, updated_at REAL NOT NULL)")
+            c_v2.execute("PRAGMA user_version = 2")
+            c_v2.commit()
+
+        prev_db = db_mod.DB_PATH
+        try:
+            db_mod.DB_PATH = v2_db
+            cfg_mod.DB_PATH = v2_db
+            init_db()
+            self.assertTrue(v2_db.with_name("legacy_v2.db.bak").exists())
+            with open_db() as c_up:
+                self.assertEqual(c_up.execute("PRAGMA user_version").fetchone()[0], SCHEMA_VERSION)
+                cols = {r["name"] for r in c_up.execute("PRAGMA table_info(messages)").fetchall()}
+                self.assertIn("duration_ms", cols)
+                self.assertIn("provider_name", cols)
+        finally:
+            db_mod.DB_PATH = prev_db
+            cfg_mod.DB_PATH = prev_db
+
+    def test_aud_h1_tool_budget_exceeded_closes_tool_turns_across_adapters(self):
+        from chatint.providers.openai_adapter import _stream_openai
+        from chatint.providers.anthropic_adapter import _stream_anthropic
+        from chatint.providers.gemini_adapter import _stream_gemini
+
+        # 1. OpenAI: 12 tool_calls in one round -> 10 executed, 2 receive synthetic budget error tool responses
+        oai_round_msgs = []
+        oai_call_num = 0
+
+        def fake_oai_create(**kwargs):
+            nonlocal oai_call_num
+            oai_call_num += 1
+            oai_round_msgs.append(kwargs.get("messages", []))
+            if oai_call_num == 1:
+                deltas = []
+                for idx in range(12):
+                    tc = MagicMock()
+                    tc.index = idx
+                    tc.id = f"call_{idx}"
+                    tc.function = MagicMock(name="web_search", arguments='{"query": "q"}')
+                    deltas.append(
+                        MagicMock(
+                            usage=None,
+                            choices=[MagicMock(delta=MagicMock(content=None, reasoning_content=None, reasoning=None, tool_calls=[tc]))],
+                        )
+                    )
+                return iter(deltas)
+            final_delta = MagicMock(
+                usage=MagicMock(prompt_tokens=20, completion_tokens=5, prompt_tokens_details=None),
+                choices=[MagicMock(delta=MagicMock(content="Done after budget", reasoning_content=None, reasoning=None, tool_calls=None))],
+            )
+            return iter([final_delta])
+
+        oai_client = MagicMock()
+        oai_client.chat.completions.create.side_effect = fake_oai_create
+        with (
+            patch.object(ClientManager, "get_client", return_value=(oai_client, None)),
+            patch("chatint.providers.openai_adapter._resolve_search_enabled", return_value=True),
+            patch(
+                "chatint.providers.openai_adapter._run_web_search_tool_call",
+                return_value={"ok": True},
+            ) as mock_oai_tool,
+        ):
+            oai_text, *_oai_rest = _stream_openai(
+                bridge=DesktopBridge(),
+                tab_id="t1",
+                conversation_id="c1",
+                messages=[{"role": "user", "content": "hi"}],
+                provider_id="openai",
+                model_id="gpt-4o",
+                thinking_level="none",
+                assistant_msg_id="m_oai",
+                abort_event=threading.Event(),
+                user_question="hi",
+                web_search_enabled=True,
+            )
+        self.assertEqual("".join(oai_text), "Done after budget")
+        self.assertEqual(mock_oai_tool.call_count, 10)
+        oai_tool_msgs = [m for m in oai_round_msgs[1] if m.get("role") == "tool"]
+        self.assertEqual([m["tool_call_id"] for m in oai_tool_msgs], [f"call_{i}" for i in range(12)])
+        self.assertIn("Tool call budget limit", oai_tool_msgs[10]["content"])
+
+        # 2. Anthropic: 11 tool_use blocks -> all 11 receive tool_result blocks (11th marked is_error=True)
+        ant_round_msgs = []
+        ant_call_num = 0
+
+        class FakeAntEv:
+            def __init__(self, ev_type, **kw):
+                self.type = ev_type
+                for k, v in kw.items():
+                    setattr(self, k, v)
+
+        def fake_ant_create(**kwargs):
+            nonlocal ant_call_num
+            ant_call_num += 1
+            ant_round_msgs.append(kwargs.get("messages", []))
+            if ant_call_num == 1:
+                evs = []
+                for idx in range(11):
+                    blk = MagicMock(type="tool_use", id=f"ant_{idx}", input={"query": "q"})
+                    blk.name = "web_search"
+                    evs.append(FakeAntEv("content_block_start", index=idx, content_block=blk))
+                    evs.append(FakeAntEv("content_block_stop", index=idx))
+                return iter(evs)
+            return iter([
+                FakeAntEv("content_block_start", index=0, content_block=MagicMock(type="text", text="")),
+                FakeAntEv("content_block_delta", index=0, delta=MagicMock(type="text_delta", text="Ant done")),
+                FakeAntEv("content_block_stop", index=0),
+            ])
+
+        ant_client = MagicMock()
+        ant_client.messages.create.side_effect = fake_ant_create
+        with (
+            patch.object(ClientManager, "get_anthropic_client", return_value=(ant_client, None)),
+            patch("chatint.providers.anthropic_adapter._resolve_search_enabled", return_value=True),
+            patch(
+                "chatint.providers.anthropic_adapter._run_web_search_tool_call",
+                return_value={"ok": True},
+            ) as mock_ant_tool,
+        ):
+            ant_text, *_ant_rest = _stream_anthropic(
+                bridge=DesktopBridge(),
+                tab_id="t1",
+                conversation_id="c1",
+                messages=[{"role": "user", "content": "hi"}],
+                provider_id="anthropic",
+                model_id="claude-3-7-sonnet",
+                thinking_level="none",
+                assistant_msg_id="m_ant",
+                abort_event=threading.Event(),
+                user_question="hi",
+                web_search_enabled=True,
+            )
+        self.assertEqual("".join(ant_text), "Ant done")
+        self.assertEqual(mock_ant_tool.call_count, 10)
+        tool_result_blocks = ant_round_msgs[1][-1]["content"]
+        self.assertEqual(len(tool_result_blocks), 11)
+        self.assertIn("Tool call budget limit", tool_result_blocks[10]["content"])
+
+        # 3. Gemini: 11 function_call parts -> all 11 receive function_response parts
+        from google.genai import types as genai_types
+
+        gem_round_contents = []
+        gem_call_num = 0
+
+        def fake_gem_stream(**kwargs):
+            nonlocal gem_call_num
+            gem_call_num += 1
+            gem_round_contents.append(kwargs.get("contents", []))
+            if gem_call_num == 1:
+                fn_parts = [
+                    genai_types.Part.from_function_call(name="web_search", args={"query": f"q{idx}"})
+                    for idx in range(11)
+                ]
+                cand = MagicMock(content=MagicMock(parts=fn_parts))
+                return iter([MagicMock(usage_metadata=None, candidates=[cand])])
+            final_part = MagicMock(thought=False, text="Gem done", function_call=None)
+            final_cand = MagicMock(content=MagicMock(parts=[final_part]))
+            return iter([MagicMock(usage_metadata=None, candidates=[final_cand])])
+
+        gem_client = MagicMock()
+        gem_client.models.generate_content_stream.side_effect = fake_gem_stream
+        with (
+            patch.object(ClientManager, "get_gemini_client", return_value=(gem_client, None)),
+            patch("chatint.providers.gemini_adapter._resolve_search_enabled", return_value=True),
+            patch(
+                "chatint.providers.gemini_adapter._run_web_search_tool_call",
+                return_value={"ok": True},
+            ) as mock_gem_tool,
+        ):
+            gem_text, *_gem_rest = _stream_gemini(
+                bridge=DesktopBridge(),
+                tab_id="t1",
+                conversation_id="c1",
+                messages=[{"role": "user", "content": "hi"}],
+                provider_id="gemini",
+                model_id="gemini-2.5-flash",
+                thinking_level="none",
+                assistant_msg_id="m_gem",
+                abort_event=threading.Event(),
+                user_question="hi",
+                web_search_enabled=True,
+            )
+        self.assertEqual("".join(gem_text), "Gem done")
+        self.assertEqual(mock_gem_tool.call_count, 10)
+        tool_resp_content = gem_round_contents[1][-1]
+        self.assertEqual(len(tool_resp_content.parts), 11)
+        self.assertIn("Tool call budget limit", str(tool_resp_content.parts[10].function_response.response))
+
+    def test_aud_m1_loopback_provider_keyless_status_and_sync(self):
+        provs = get_providers()
+        provs.append({
+            "id": "custom_loopback",
+            "name": "LocalLoop",
+            "base_url": "http://127.0.0.1:11434/v1",
+            "is_enabled": True,
+            "models": [],
+        })
+        provs.append({
+            "id": "ollama",
+            "name": "Ollama",
+            "base_url": "http://localhost:11434/v1",
+            "is_enabled": True,
+            "clear_api_key": True,
+            "models": [],
+        })
+        save_providers(provs)
+
+        reloaded = {p["id"]: p for p in get_providers()}
+        self.assertTrue(reloaded["custom_loopback"]["has_api_key"])
+        self.assertTrue(reloaded["ollama"]["has_api_key"])
+        self.assertNotEqual(reloaded["ollama"]["sync_status"], "no_key")
+
+        emitted = []
+        with (
+            patch.object(
+                ClientManager,
+                "fetch_remote_models",
+                return_value=([{"id": "llama3:latest", "name": "llama3:latest"}], None, False),
+            ),
+            patch.object(BackgroundModelSyncer, "_emit_provider_update", side_effect=emitted.append),
+        ):
+            BackgroundModelSyncer._sync_single_provider("custom_loopback")
+        self.assertEqual(len(emitted), 1)
+        self.assertEqual(emitted[0]["sync_status"], "ready")
+        self.assertEqual(emitted[0]["fetched_model_ids"], ["llama3:latest"])
+
+    def test_aud_m2_openai_stream_options_400_retries_preserving_effort(self):
+        import httpx2
+        import openai
+        from chatint.providers.openai_adapter import _stream_openai
+
+        provs = get_providers()
+        for p in provs:
+            if p["id"] == "openai":
+                p["models"] = [{"id": "o3-compat", "name": "o3-compat"}]
+        save_providers(provs)
+
+        calls = []
+
+        def fake_create(**kwargs):
+            calls.append(("stream_options" in kwargs, kwargs.get("reasoning_effort")))
+            if "stream_options" in kwargs:
+                req = httpx2.Request("POST", "https://api.openai.com/v1/chat/completions")
+                resp = httpx2.Response(400, request=req)
+                raise openai.BadRequestError("Extra inputs are not permitted", response=resp, body=None)
+            chunk = MagicMock()
+            chunk.usage = MagicMock(prompt_tokens=11, completion_tokens=7, prompt_tokens_details=None)
+            chunk.choices = [MagicMock(delta=MagicMock(content="Compat reply", reasoning_content=None, reasoning=None, tool_calls=None))]
+            return iter([chunk])
+
+        client = MagicMock()
+        client.chat.completions.create.side_effect = fake_create
+        with (
+            patch.object(ClientManager, "get_client", return_value=(client, None)),
+            patch("chatint.providers.openai_adapter._resolve_search_enabled", return_value=False),
+        ):
+            text, _think, _in, _out, _cached, had_err, actual_lvl = _stream_openai(
+                bridge=DesktopBridge(),
+                tab_id="t1",
+                conversation_id="c1",
+                messages=[{"role": "user", "content": "hi"}],
+                provider_id="openai",
+                model_id="o3-compat",
+                thinking_level="high",
+                assistant_msg_id="m_compat",
+                abort_event=threading.Event(),
+                user_question="hi",
+                web_search_enabled=False,
+            )
+        self.assertFalse(had_err)
+        self.assertEqual("".join(text), "Compat reply")
+        self.assertEqual(actual_lvl, "high")
+        self.assertEqual(calls, [(True, "high"), (False, "high")])
+
+    def test_aud_m3_error_emits_token_stats_updated_and_turn2_auto_names(self):
+        from chatint.services.stream_coordinator import stream_chat_completion_impl
+
+        conv = create_conversation("New Chat")
+        add_message(conv["id"], "user", "First")
+        add_message(conv["id"], "assistant", "Earlier reply")
+        add_message(conv["id"], "user", "Second")
+
+        events = []
+
+        class CaptureBridge:
+            def push_event(self, ev):
+                events.append(ev)
+
+        bridge = CaptureBridge()
+        # 1. Stream fails after receiving token usage -> emits token_stats_updated
+        err_streamer = MagicMock(return_value=(["Partial"], [], 33, 12, 0, True, "none"))
+        auto_name_mock = MagicMock()
+        stream_chat_completion_impl(
+            bridge=bridge,
+            tab_id="t1",
+            conversation_id=conv["id"],
+            messages=[{"role": "user", "content": "Second"}],
+            provider_id="openai",
+            model_id="gpt-4o",
+            thinking_level="none",
+            stream_id="s-err",
+            sdk_streamers={"openai": err_streamer},
+            auto_naming_fn=auto_name_mock,
+        )
+        stats_evs = [e for e in events if e.get("type") == "token_stats_updated"]
+        self.assertEqual(len(stats_evs), 1)
+        self.assertGreaterEqual(stats_evs[0]["token_stats"]["grand_total"]["total_tokens"], 45)
+        auto_name_mock.assert_not_called()
+
+        # 2. Successful Turn 2 on still-unnamed conversation triggers auto-naming
+        ok_streamer = MagicMock(return_value=(["Full reply"], [], 10, 5, 0, False, "none"))
+        stream_chat_completion_impl(
+            bridge=bridge,
+            tab_id="t1",
+            conversation_id=conv["id"],
+            messages=[{"role": "user", "content": "Second"}],
+            provider_id="openai",
+            model_id="gpt-4o",
+            thinking_level="none",
+            stream_id="s-ok",
+            sdk_streamers={"openai": ok_streamer},
+            auto_naming_fn=auto_name_mock,
+        )
+        auto_name_mock.assert_called_once()
+
+    def test_aud_m4_prepare_clean_default_db_excludes_personal_state(self):
+        import contextlib
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("chatint_build_release", Path("packaging/build_release.py"))
+        br = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(br)
+
+        fake_root = Path(self.test_dir.name) / "pkg_root"
+        with patch.object(br, "PROJECT_ROOT", fake_root):
+            # 1. Fallback path when no source data/chatint.db exists
+            clean_db = br.prepare_clean_default_db()
+            self.assertTrue(clean_db and clean_db.is_file())
+            self.assertFalse((clean_db.parent / ".env.tmp").exists())
+
+            # 2. Curated baseline DB path: preserves models/settings, strips runtime/personal tables & api_key
+            src_data = fake_root / "data"
+            src_data.mkdir(parents=True, exist_ok=True)
+            curated_src = src_data / "chatint.db"
+            orig_db, orig_cfg_db = db_mod.DB_PATH, cfg_mod.DB_PATH
+            orig_env, orig_cfg_env = db_mod.ENV_PATH, cfg_mod.ENV_PATH
+            try:
+                tmp_env = fake_root / ".env.src"
+                db_mod.DB_PATH = cfg_mod.DB_PATH = curated_src
+                db_mod.ENV_PATH = cfg_mod.ENV_PATH = tmp_env
+                init_db()
+                c_tmp = create_conversation("Private chat")
+                add_message(c_tmp["id"], "user", "Secret prompt")
+                record_token_usage(c_tmp["id"], "anthropic", "claude-fable-5-2", 10, 5, 0)
+                with contextlib.closing(sqlite3.connect(curated_src)) as conn:
+                    conn.execute(
+                        "UPDATE providers SET api_key = 'raw-leak', models_json = ? WHERE id = 'anthropic'",
+                        (json.dumps([{"id": "claude-fable-5-2", "name": "claude-fable-5-2", "input_price": 8.0}]),),
+                    )
+                    conn.execute("INSERT OR REPLACE INTO tab_sessions (id, state_json, updated_at) VALUES (1, '{}', 1.0)")
+                    conn.execute("INSERT OR REPLACE INTO google_search_usage (month_key, request_count, updated_at) VALUES ('2026-11', 9, 1.0)")
+                    conn.execute("INSERT OR REPLACE INTO app_settings (key, value) VALUES ('default_model', 'claude-fable-5-2')")
+                    conn.commit()
+            finally:
+                db_mod.DB_PATH, cfg_mod.DB_PATH = orig_db, orig_cfg_db
+                db_mod.ENV_PATH, cfg_mod.ENV_PATH = orig_env, orig_cfg_env
+
+            curated_clean = br.prepare_clean_default_db()
+
+        with contextlib.closing(sqlite3.connect(curated_clean)) as c_clean:
+            for tbl in ("conversations", "messages", "token_ledger", "tab_sessions", "google_search_usage"):
+                self.assertEqual(c_clean.execute(f"SELECT COUNT(*) FROM {tbl}").fetchone()[0], 0, tbl)
+            api_keys = [r[0] for r in c_clean.execute("SELECT api_key FROM providers").fetchall()]
+            self.assertTrue(all(k == "" for k in api_keys))
+            ant_models = json.loads(
+                c_clean.execute("SELECT models_json FROM providers WHERE id = 'anthropic'").fetchone()[0]
+            )
+            self.assertEqual(ant_models[0]["id"], "claude-fable-5-2")
+            def_model = c_clean.execute("SELECT value FROM app_settings WHERE key = 'default_model'").fetchone()[0]
+            self.assertEqual(def_model, "claude-fable-5-2")
+
+    def test_aud_l1_l2_l3_import_regen_cas_and_env_preservation(self):
+        from chatint.storage.conversations_repo import delete_messages_from
+        from chatint.storage.providers_repo import update_provider_models
+
+        # AUD-L1: Unclosed thought delimiter does not swallow subsequent turns
+        md_unclosed = (
+            "### User\nFirst question\n\n"
+            "### Assistant\n<!-- chatint-thought-start -->\nTrailing thought\n\n"
+            "### User\nSecond question\n\n"
+            "### Assistant\nSecond answer\n"
+        )
+        parsed = parse_chat_file_content(md_unclosed, "unclosed.md")
+        self.assertEqual(len(parsed["messages"]), 4)
+        self.assertEqual(parsed["messages"][2]["content"], "Second question")
+
+        # AUD-L2: Empty message_id rejected by regenerate_message and delete_messages_from
+        conv = create_conversation("Regen Guard")
+        m_u = add_message(conv["id"], "user", "Keep me")
+        res_empty = DesktopBridge().regenerate_message("t1", conv["id"], "", "openai", "gpt-5")
+        self.assertIn("error", res_empty)
+        delete_messages_from(conv["id"], "", include_self=True)
+        self.assertEqual([m["id"] for m in get_conversation(conv["id"])["messages"]], [m_u["id"]])
+
+        # AUD-L3: CAS guard rejects stale expected_models_json; ensure_env_file does not re-seed pruned keys
+        self.assertFalse(update_provider_models("openai", [{"id": "x", "name": "x"}], expected_models_json='["stale"]'))
+        env_p = db_mod.ENV_PATH
+        orig_env = env_p.read_text(encoding="utf-8") if env_p.exists() else ""
+        try:
+            env_p.write_text('WORKOPENAI_API_KEY=""\n', encoding="utf-8")
+            db_mod.ensure_env_file()
+            self.assertNotRegex(env_p.read_text(encoding="utf-8"), r"(?m)^OPENAI_API_KEY=")
+        finally:
+            env_p.write_text(orig_env, encoding="utf-8")
+
 
 
 if __name__ == "__main__":

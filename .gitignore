@@ -21,3 +21,4 @@ data/*.bak
 data/*.corrupted*
 data/*-wal
 data/*-shm
+issues.md

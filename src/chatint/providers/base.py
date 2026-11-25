@@ -153,11 +153,20 @@ def _emit_api_error(
     if full_content or full_thinking:
         _emit_error(bridge, tab_id, conversation_id, f"Streaming interrupted: {err}", stream_id=stream_id)
     else:
+        provider_label = provider_id
+        try:
+            from chatint.client_manager import ClientManager
+
+            prov = ClientManager.get_provider(provider_id)
+            if prov and prov.get("name"):
+                provider_label = prov["name"]
+        except Exception:
+            pass
         _emit_error(
             bridge,
             tab_id,
             conversation_id,
-            f"API Error ({provider_id} / {model_id}): {err}",
+            f"API Error ({provider_label} / {model_id}): {err}",
             stream_id=stream_id,
         )
 

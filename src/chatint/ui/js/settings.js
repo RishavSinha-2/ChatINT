@@ -23,6 +23,7 @@ import {
   isLoopbackBaseUrl,
   normalizeWebSearchModelsClient,
   renderIcons,
+  resolveProviderDisplayName,
   state,
   stripModelPrefix,
 } from "./state.js";
@@ -763,6 +764,21 @@ export function renderSettingsContent(options = {}) {
         if (envLbl) {
           envLbl.textContent = `API Key (.env: ${(cleaned || "PROVIDER").toUpperCase()}_API_KEY)`;
         }
+        const bUrlEl = document.getElementById("prov-base-url-input");
+        if (bUrlEl) {
+          const isNativeSdkProv =
+            ["anthropic", "gemini"].includes((activeProv.id || "").toLowerCase()) ||
+            ["anthropic", "gemini"].includes(cleaned.toLowerCase());
+          bUrlEl.disabled = isNativeSdkProv;
+          bUrlEl.placeholder = isNativeSdkProv
+            ? "Managed automatically by official SDK (no endpoint needed)"
+            : "https://api.openai.com/v1";
+          if (isNativeSdkProv) {
+            bUrlEl.value = "";
+          } else if (!bUrlEl.value && activeProv.base_url) {
+            bUrlEl.value = activeProv.base_url;
+          }
+        }
       };
     }
 
@@ -1193,6 +1209,11 @@ export async function saveSettingsFromModal() {
   syncAllPaneWebSearchButtons();
   renderTabs();
   if (el.panesContainer) {
+    el.panesContainer.querySelectorAll(".provider-tag[data-provider-id]").forEach((tagEl) => {
+      const pid = tagEl.dataset.providerId || "";
+      const fallback = tagEl.dataset.providerName || "";
+      tagEl.textContent = resolveProviderDisplayName(pid, fallback).toUpperCase();
+    });
     el.panesContainer.querySelectorAll(".chat-pane").forEach((paneEl) => {
       const tabId = paneEl.dataset.tabId;
       const t = state.tabs.find((item) => item.id === tabId);

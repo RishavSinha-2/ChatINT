@@ -2,7 +2,7 @@
 ; Builds: dist\installer\ChatInt-Setup-x64.exe
 
 #define MyAppName "ChatInt"
-#define MyAppVersion "0.5.1"
+#define MyAppVersion "0.5.2"
 #define MyAppPublisher "Rishav Sinha"
 #define MyAppURL "https://github.com/RishavSinha-2/ChatINT"
 #define MyAppExeName "ChatInt.exe"
@@ -58,7 +58,7 @@ begin
   if CurUninstallStep = usPostUninstall then
   begin
     // During silent uninstalls (e.g. WinGet upgrade/reinstall), NEVER touch user data in %APPDATA%\ChatInt
-    if not WizardSilent() then
+    if not UninstallSilent() then
     begin
       DataDir := ExpandConstant('{userappdata}\ChatInt');
       if DirExists(DataDir) then

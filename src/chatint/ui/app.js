@@ -440,12 +440,61 @@ function setupEventListeners() {
   document.querySelectorAll(".close-conv-settings-btn").forEach((btn) => {
     btn.onclick = () => el.convSettingsModal.classList.remove("open");
   });
+  if (el.convSettingsModal) {
+    el.convSettingsModal.onclick = (e) => {
+      if (e.target === el.convSettingsModal) el.convSettingsModal.classList.remove("open");
+    };
+  }
 
   if (el.exportMarkdownBtn) el.exportMarkdownBtn.onclick = () => downloadExport("markdown");
   if (el.exportJsonBtn) el.exportJsonBtn.onclick = () => downloadExport("json");
   document.querySelectorAll(".close-export-modal-btn").forEach((btn) => {
     btn.onclick = () => el.exportModal.classList.remove("open");
   });
+  if (el.exportModal) {
+    el.exportModal.onclick = (e) => {
+      if (e.target === el.exportModal) el.exportModal.classList.remove("open");
+    };
+  }
+
+  if (el.modelConfigModal) {
+    el.modelConfigModal.onclick = (e) => {
+      if (e.target === el.modelConfigModal) closeModelConfigModal(false);
+    };
+  }
+  if (el.appDialogModal) {
+    el.appDialogModal.onclick = (e) => {
+      if (e.target !== el.appDialogModal) return;
+      if (el.appDialogCancelBtn && el.appDialogCancelBtn.style.display !== "none") {
+        el.appDialogCancelBtn.click();
+      } else if (el.appDialogOkBtn) {
+        el.appDialogOkBtn.click();
+      }
+    };
+  }
+
+  // Track and restore opener focus across all modal overlays (including nested modals)
+  if (typeof MutationObserver === "function") {
+    document.querySelectorAll(".modal-overlay").forEach((overlay) => {
+      let wasOpen = overlay.classList.contains("open");
+      let openerEl = null;
+      new MutationObserver(() => {
+        const isOpen = overlay.classList.contains("open");
+        if (isOpen && !wasOpen) {
+          const active = document.activeElement;
+          if (active instanceof HTMLElement && !overlay.contains(active)) {
+            openerEl = active;
+          }
+        } else if (!isOpen && wasOpen) {
+          if (openerEl && openerEl.isConnected) {
+            openerEl.focus();
+          }
+          openerEl = null;
+        }
+        wasOpen = isOpen;
+      }).observe(overlay, { attributes: true, attributeFilter: ["class"] });
+    });
+  }
 
   // Global Keyboard Shortcuts (`NEW-L2`)
   window.addEventListener("keydown", (e) => {

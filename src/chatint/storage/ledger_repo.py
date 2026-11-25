@@ -195,13 +195,16 @@ def get_token_stats(conversation_id: str) -> Dict[str, Any]:
             "total_tokens": active_in + active_out,
         }
 
-        cursor.execute("SELECT id, models_json FROM providers")
+        cursor.execute("SELECT id, name, models_json FROM providers")
         prov_rows = cursor.fetchall()
 
+    provider_name_map: Dict[str, str] = {}
     pricing_map: Dict[tuple[str, str], Dict[str, float]] = {}
     model_fallback_map: Dict[str, Dict[str, float]] = {}
     for pr in prov_rows:
         pid = pr["id"]
+        if pr["name"]:
+            provider_name_map[pid] = pr["name"]
         try:
             mlist = json.loads(pr["models_json"] or "[]")
             for m in mlist:
@@ -301,6 +304,7 @@ def get_token_stats(conversation_id: str) -> Dict[str, Any]:
         per_model.append({
             "model_id": mid,
             "provider_id": pid,
+            "provider_name": provider_name_map.get(pid, ""),
             "prompt_tokens": tin,
             "completion_tokens": tout,
             "cached_tokens": tcached,
