@@ -39,8 +39,20 @@ jobs:
       - name: Verify Tag and Version Parity
         if: startsWith(github.ref, 'refs/tags/v')
         shell: pwsh
+        env:
+          TAG_NAME: ${{ github.ref_name }}
         run: |
-          uv run python -c "import re, tomllib; from pathlib import Path; tag = '${{ github.ref_name }}'.lstrip('v'); py = tomllib.load(open('pyproject.toml','rb'))['project']['version']; init = re.search(r'__version__\s*=\s*\"([^\"]+)\"', Path('src/chatint/__init__.py').read_text()).group(1); iss = re.search(r'#define\s+MyAppVersion\s+\"([^\"]+)\"', Path('packaging/ChatInt.iss').read_text()).group(1); assert tag == py == init == iss, f'Version mismatch: tag={tag}, pyproject={py}, init={init}, iss={iss}'; print(f'Version parity verified: {tag}')"
+          @'
+          import os, re, tomllib
+          from pathlib import Path
+          tag = os.environ["TAG_NAME"].lstrip("v")
+          with open("pyproject.toml", "rb") as f:
+              py = tomllib.load(f)["project"]["version"]
+          init = re.search(r'__version__\s*=\s*"([^"]+)"', Path("src/chatint/__init__.py").read_text(encoding="utf-8")).group(1)
+          iss = re.search(r'#define\s+MyAppVersion\s+"([^"]+)"', Path("packaging/ChatInt.iss").read_text(encoding="utf-8")).group(1)
+          assert tag == py == init == iss, f"Version mismatch: tag={tag}, pyproject={py}, init={init}, iss={iss}"
+          print(f"Version parity verified: {tag}")
+          '@ | uv run python -
 
       - name: Run Automated Test Suite
         run: uv run python -m unittest discover -s tests -v
