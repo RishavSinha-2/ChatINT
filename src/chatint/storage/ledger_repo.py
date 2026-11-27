@@ -8,7 +8,13 @@ from typing import Any, Dict, Optional
 
 from chatint.catalog import strip_model_prefix
 from chatint.logging_setup import get_logger
-from chatint.storage.connection import open_db
+from chatint.storage.connection import (
+    get_conv_db_size_bytes,
+    get_conv_lock,
+    open_conv_db,
+    open_db,
+    validate_conv_id,
+)
 from chatint.storage.settings_repo import get_web_search_models
 
 _logger = get_logger("chatint.storage.ledger_repo")
@@ -78,42 +84,55 @@ def record_token_usage(
     ):
         return False
     try:
-        with open_db() as conn:
-            cursor = conn.cursor()
-            if not cursor.execute("SELECT 1 FROM conversations WHERE id = ?", (conversation_id,)).fetchone():
-                return False
-            resolved_prov_name = (provider_name or "").strip()
-            if not resolved_prov_name and provider_id:
-                prov_row = cursor.execute("SELECT name FROM providers WHERE id = ?", (provider_id,)).fetchone()
-                if prov_row and prov_row["name"]:
-                    resolved_prov_name = prov_row["name"]
+        validate_conv_id(conversation_id)
+    except ValueError:
+        return False
+    try:
+        with get_conv_lock(conversation_id):
+            with open_db() as conn:
+                cursor = conn.cursor()
+                if not cursor.execute("SELECT 1 FROM conversations WHERE id = ?", (conversation_id,)).fetchone():
+                    return False
+                resolved_prov_name = (provider_name or "").strip()
+                if not resolved_prov_name and provider_id:
+                    prov_row = cursor.execute("SELECT name FROM providers WHERE id = ?", (provider_id,)).fetchone()
+                    if prov_row and prov_row["name"]:
+                        resolved_prov_name = prov_row["name"]
+
             now = time.time()
-            cursor.execute(
-                """
-                INSERT INTO token_ledger (
-                    conversation_id, provider_id, provider_name, model_id,
-                    prompt_tokens, completion_tokens, cached_tokens,
-                    google_search_requests, ddg_search_requests, cost_usd, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    conversation_id,
-                    provider_id or "",
-                    resolved_prov_name,
-                    model_id or "",
-                    prompt_tokens,
-                    completion_tokens,
-                    cached_tokens,
-                    g_cnt,
-                    ddg_cnt,
-                    clean_cost,
-                    now,
-                ),
-            )
-            conn.commit()
+            with open_conv_db(conversation_id) as cconn:
+                ccur = cconn.cursor()
+                ccur.execute(
+                    """
+                    INSERT INTO token_ledger (
+                        conversation_id, provider_id, provider_name, model_id,
+                        prompt_tokens, completion_tokens, cached_tokens,
+                        google_search_requests, ddg_search_requests, cost_usd, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        conversation_id,
+                        provider_id or "",
+                        resolved_prov_name,
+                        model_id or "",
+                        prompt_tokens,
+                        completion_tokens,
+                        cached_tokens,
+                        g_cnt,
+                        ddg_cnt,
+                        clean_cost,
+                        now,
+                    ),
+                )
+                cconn.commit()
+
+            size_bytes = get_conv_db_size_bytes(conversation_id)
+            with open_db() as conn:
+                conn.execute("UPDATE conversations SET db_size_bytes = ? WHERE id = ?", (size_bytes, conversation_id))
+                conn.commit()
             return True
-    except sqlite3.IntegrityError:
-        _logger.debug("Skipped token_ledger insert; conversation %s was deleted", conversation_id)
+    except sqlite3.Error:
+        _logger.debug("Skipped token_ledger insert; conversation %s could not be updated", conversation_id)
         return False
 
 
@@ -123,114 +142,123 @@ def get_token_stats(conversation_id: str) -> Dict[str, Any]:
     Uses token_ledger so token and cost counts are never lost when branching, editing, or regenerating.
     """
     global_search_totals = get_google_search_request_totals()
+    empty_stats = {
+        "per_model": [],
+        "grand_total": {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "cached_tokens": 0,
+            "cache_miss_tokens": 0,
+            "cache_hit_rate": 0.0,
+            "total_tokens": 0,
+            "total_cost": 0.0,
+            "google_search_requests": 0,
+            "ddg_search_requests": 0,
+            "web_search_requests": 0,
+        },
+        "active_turn_tokens": {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "cached_tokens": 0,
+            "total_tokens": 0,
+        },
+        "google_search_totals": global_search_totals,
+    }
     if not conversation_id:
-        return {
-            "per_model": [],
-            "grand_total": {
-                "prompt_tokens": 0,
-                "completion_tokens": 0,
-                "cached_tokens": 0,
-                "cache_miss_tokens": 0,
-                "cache_hit_rate": 0.0,
-                "total_tokens": 0,
-                "total_cost": 0.0,
-                "google_search_requests": 0,
-                "ddg_search_requests": 0,
-                "web_search_requests": 0,
-            },
-            "active_turn_tokens": {
-                "prompt_tokens": 0,
-                "completion_tokens": 0,
-                "cached_tokens": 0,
-                "total_tokens": 0,
-            },
-            "google_search_totals": global_search_totals,
-        }
+        return empty_stats
+    try:
+        validate_conv_id(conversation_id)
+    except ValueError:
+        return empty_stats
 
-    with open_db() as conn:
-        cursor = conn.cursor()
-        conv_row = cursor.execute(
-            "SELECT is_imported FROM conversations WHERE id = ?",
-            (conversation_id,),
-        ).fetchone()
-        is_imported = bool(conv_row["is_imported"]) if conv_row else False
+    with get_conv_lock(conversation_id):
+        with open_db() as conn:
+            cursor = conn.cursor()
+            conv_row = cursor.execute(
+                "SELECT * FROM conversations WHERE id = ?",
+                (conversation_id,),
+            ).fetchone()
+            if not conv_row:
+                return empty_stats
+            is_imported = bool(conv_row["is_imported"])
+            prov_rows = cursor.execute("SELECT id, name, models_json FROM providers").fetchall()
+            conv_meta = {k: conv_row[k] for k in conv_row.keys()}
 
-        conv_search_row = cursor.execute(
-            """
-            SELECT COALESCE(SUM(google_search_requests), 0) as conv_google_searches,
-                   COALESCE(SUM(ddg_search_requests), 0) as conv_ddg_searches
-            FROM token_ledger
-            WHERE conversation_id = ?
-            """,
-            (conversation_id,),
-        ).fetchone()
-        conv_google_requests = int((conv_search_row["conv_google_searches"] if conv_search_row else 0) or 0)
-        conv_ddg_requests = int((conv_search_row["conv_ddg_searches"] if conv_search_row else 0) or 0)
-        conv_web_requests = conv_google_requests + conv_ddg_requests
+        with open_conv_db(conversation_id, meta=conv_meta) as cconn:
+            ccur = cconn.cursor()
+            conv_search_row = ccur.execute(
+                """
+                SELECT COALESCE(SUM(google_search_requests), 0) as conv_google_searches,
+                       COALESCE(SUM(ddg_search_requests), 0) as conv_ddg_searches
+                FROM token_ledger
+                WHERE conversation_id = ?
+                """,
+                (conversation_id,),
+            ).fetchone()
+            conv_google_requests = int((conv_search_row["conv_google_searches"] if conv_search_row else 0) or 0)
+            conv_ddg_requests = int((conv_search_row["conv_ddg_searches"] if conv_search_row else 0) or 0)
+            conv_web_requests = conv_google_requests + conv_ddg_requests
 
-        cursor.execute(
-            """
-            SELECT model_id, provider_id,
-                   MAX(provider_name) as ledger_provider_name,
-                   SUM(prompt_tokens) as total_in,
-                   SUM(completion_tokens) as total_out,
-                   SUM(cached_tokens) as total_cached,
-                   SUM(CASE WHEN cost_usd IS NULL THEN prompt_tokens ELSE 0 END) as live_in,
-                   SUM(CASE WHEN cost_usd IS NULL THEN completion_tokens ELSE 0 END) as live_out,
-                   SUM(CASE WHEN cost_usd IS NULL THEN cached_tokens ELSE 0 END) as live_cached,
-                   COALESCE(SUM(cost_usd), 0.0) as fixed_cost
-            FROM token_ledger
-            WHERE conversation_id = ? AND (model_id != '' OR prompt_tokens > 0)
-            GROUP BY model_id, provider_id
-            """,
-            (conversation_id,),
-        )
-        rows = cursor.fetchall()
-
-        # Fallback to messages table only for historical pre-ledger non-imported conversations
-        if not rows and not is_imported:
-            cursor.execute(
+            ccur.execute(
                 """
                 SELECT model_id, provider_id,
                        MAX(provider_name) as ledger_provider_name,
                        SUM(prompt_tokens) as total_in,
                        SUM(completion_tokens) as total_out,
                        SUM(cached_tokens) as total_cached,
-                       SUM(prompt_tokens) as live_in,
-                       SUM(completion_tokens) as live_out,
-                       SUM(cached_tokens) as live_cached,
-                       0.0 as fixed_cost
-                FROM messages
-                WHERE conversation_id = ? AND role = 'assistant' AND (model_id != '' OR prompt_tokens > 0)
+                       SUM(CASE WHEN cost_usd IS NULL THEN prompt_tokens ELSE 0 END) as live_in,
+                       SUM(CASE WHEN cost_usd IS NULL THEN completion_tokens ELSE 0 END) as live_out,
+                       SUM(CASE WHEN cost_usd IS NULL THEN cached_tokens ELSE 0 END) as live_cached,
+                       COALESCE(SUM(cost_usd), 0.0) as fixed_cost
+                FROM token_ledger
+                WHERE conversation_id = ? AND (model_id != '' OR prompt_tokens > 0)
                 GROUP BY model_id, provider_id
                 """,
                 (conversation_id,),
             )
-            rows = cursor.fetchall()
+            rows = ccur.fetchall()
 
-        cursor.execute(
-            """
-            SELECT COALESCE(SUM(prompt_tokens), 0) as act_in,
-                   COALESCE(SUM(completion_tokens), 0) as act_out,
-                   COALESCE(SUM(cached_tokens), 0) as act_cached
-            FROM messages
-            WHERE conversation_id = ? AND role = 'assistant'
-            """,
-            (conversation_id,),
-        )
-        act_row = cursor.fetchone()
-        active_in = int((act_row["act_in"] if act_row else 0) or 0)
-        active_out = int((act_row["act_out"] if act_row else 0) or 0)
-        active_cached = int((act_row["act_cached"] if act_row else 0) or 0)
-        active_turn_tokens = {
-            "prompt_tokens": active_in,
-            "completion_tokens": active_out,
-            "cached_tokens": active_cached,
-            "total_tokens": active_in + active_out,
-        }
+            # Fallback to messages table only for historical pre-ledger non-imported conversations
+            if not rows and not is_imported:
+                ccur.execute(
+                    """
+                    SELECT model_id, provider_id,
+                           MAX(provider_name) as ledger_provider_name,
+                           SUM(prompt_tokens) as total_in,
+                           SUM(completion_tokens) as total_out,
+                           SUM(cached_tokens) as total_cached,
+                           SUM(prompt_tokens) as live_in,
+                           SUM(completion_tokens) as live_out,
+                           SUM(cached_tokens) as live_cached,
+                           0.0 as fixed_cost
+                    FROM messages
+                    WHERE conversation_id = ? AND role = 'assistant' AND (model_id != '' OR prompt_tokens > 0)
+                    GROUP BY model_id, provider_id
+                    """,
+                    (conversation_id,),
+                )
+                rows = ccur.fetchall()
 
-        cursor.execute("SELECT id, name, models_json FROM providers")
-        prov_rows = cursor.fetchall()
+            ccur.execute(
+                """
+                SELECT COALESCE(SUM(prompt_tokens), 0) as act_in,
+                       COALESCE(SUM(completion_tokens), 0) as act_out,
+                       COALESCE(SUM(cached_tokens), 0) as act_cached
+                FROM messages
+                WHERE conversation_id = ? AND role = 'assistant'
+                """,
+                (conversation_id,),
+            )
+            act_row = ccur.fetchone()
+            active_in = int((act_row["act_in"] if act_row else 0) or 0)
+            active_out = int((act_row["act_out"] if act_row else 0) or 0)
+            active_cached = int((act_row["act_cached"] if act_row else 0) or 0)
+            active_turn_tokens = {
+                "prompt_tokens": active_in,
+                "completion_tokens": active_out,
+                "cached_tokens": active_cached,
+                "total_tokens": active_in + active_out,
+            }
 
     provider_name_map: Dict[str, str] = {}
     pricing_map: Dict[tuple[str, str], Dict[str, float]] = {}

@@ -127,45 +127,7 @@ export function renderConversationsList() {
         }
       } else if (e.target.closest(".delete-conv-btn")) {
         e.stopPropagation();
-        const confirmed = await showConfirmDialog(`Delete chat "${conv.title}"?`);
-        if (confirmed) {
-          // Track deleted ID so late `chat_named` events never resurrect this chat (`H5`)
-          state.recentlyDeletedConvIds.add(conv.id);
-          callApi("delete_conversation", conv.id, false).catch(() => {});
-          state.conversations = state.conversations.filter((c) => c.id !== conv.id);
-
-          let affectedOpenPane = false;
-          state.tabs.forEach((t) => {
-            if (t.conversationId === conv.id) {
-              if (state.splitTabIds.includes(t.id)) {
-                affectedOpenPane = true;
-              }
-              if (t.isStreaming) {
-                callApi("stop_streaming", t.id, t.activeStreamId || null).catch(() => {});
-                t.isStreaming = false;
-              }
-              t.activeStreamId = null;
-              t.lastStreamError = null;
-              t.conversationId = null;
-              t.title = "New Chat";
-              t.systemPrompt = "";
-              t.maxContextMessages = 30;
-              t.workspaceDir = "";
-              t.agentMode = state.settings?.default_agent_mode === "auto" ? "auto" : "manual";
-              t.hasUnansweredPrompt = false;
-              t.pendingUserDraft = null;
-              resetTabStreamBuffers(t);
-            }
-          });
-          persistTabsState();
-          renderConversationsList();
-          renderTabs();
-          if (affectedOpenPane) {
-            renderActivePanes();
-          } else {
-            refreshPaneHeaderLabels();
-          }
-        }
+        await deleteConversationById(conv.id, conv.title);
       } else {
         sanitizeSplitTabIds();
         const activeSlotIdx = state.splitTabIds.indexOf(state.activeTabId);
@@ -208,6 +170,53 @@ export function renderConversationsList() {
   });
 
   renderIcons(el.conversationsList);
+}
+
+export async function deleteConversationById(convId, convTitle = "this chat") {
+  if (!convId) return false;
+  const confirmed = await showConfirmDialog(`Delete chat "${convTitle}"?`);
+  if (!confirmed) return false;
+
+  // Track deleted ID so late `chat_named` events never resurrect this chat (`H5`)
+  state.recentlyDeletedConvIds.add(convId);
+  await callApi("delete_conversation", convId, false).catch(() => {});
+  state.conversations = state.conversations.filter((c) => c.id !== convId);
+
+  let affectedOpenPane = false;
+  state.tabs.forEach((t) => {
+    if (t.conversationId === convId) {
+      if (state.splitTabIds.includes(t.id)) {
+        affectedOpenPane = true;
+      }
+      if (t.isStreaming) {
+        callApi("stop_streaming", t.id, t.activeStreamId || null).catch(() => {});
+        t.isStreaming = false;
+      }
+      t.activeStreamId = null;
+      t.lastStreamError = null;
+      t.conversationId = null;
+      t.title = "New Chat";
+      t.systemPrompt = "";
+      t.maxContextMessages = 30;
+      t.workspaceDir = "";
+      t.agentMode = state.settings?.default_agent_mode === "auto" ? "auto" : "manual";
+      t.hasUnansweredPrompt = false;
+      t.pendingUserDraft = null;
+      t.dbSizeBytes = 0;
+      t.quotaNotice = null;
+      t.quotaBannerDismissed = false;
+      resetTabStreamBuffers(t);
+    }
+  });
+  persistTabsState();
+  renderConversationsList();
+  renderTabs();
+  if (affectedOpenPane) {
+    renderActivePanes();
+  } else {
+    refreshPaneHeaderLabels();
+  }
+  return true;
 }
 
 export async function openConvSettingsModal(tabOrId) {

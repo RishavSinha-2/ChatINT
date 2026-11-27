@@ -11,8 +11,20 @@ import uuid
 
 from chatint.catalog import strip_model_prefix
 from chatint.logging_setup import get_logger
-from chatint.storage.connection import open_db
+from chatint.storage.connection import (
+    get_conv_db_path,
+    get_conv_db_size_bytes,
+    get_conv_lock,
+    get_total_conv_dbs_size_bytes,
+    init_conv_db,
+    open_conv_db,
+    open_db,
+    sync_conv_meta_cursor,
+    unlink_conv_db_files,
+    validate_conv_id,
+)
 from chatint.storage.ledger_repo import get_token_stats
+from chatint.storage.settings_repo import get_app_settings, mb_setting_to_bytes, normalize_storage_limit_mb
 
 _logger = get_logger("chatint.storage.conversations_repo")
 _DEFAULT_TITLE_RE = re.compile(r"^new chat(?:\s*\(\d+\))?$", re.IGNORECASE)
@@ -57,6 +69,67 @@ def _parse_tool_trace(raw_json: Any) -> List[Dict[str, Any]]:
         return [item for item in parsed if isinstance(item, dict)] if isinstance(parsed, list) else []
     except Exception:
         return []
+
+
+def _conv_meta_from_row(conv_row: Any) -> Dict[str, Any]:
+    keys = set(conv_row.keys())
+    return {
+        "id": conv_row["id"],
+        "title": conv_row["title"],
+        "system_prompt": conv_row["system_prompt"] if "system_prompt" in keys else "",
+        "max_context_messages": conv_row["max_context_messages"] if "max_context_messages" in keys else 30,
+        "workspace_dir": (conv_row["workspace_dir"] or "") if "workspace_dir" in keys else "",
+        "agent_mode": _normalize_agent_mode(conv_row["agent_mode"] if "agent_mode" in keys else "manual"),
+        "is_imported": bool(conv_row["is_imported"]) if "is_imported" in keys else False,
+        "is_auto_named": bool(conv_row["is_auto_named"]) if "is_auto_named" in keys else False,
+        "created_at": conv_row["created_at"],
+        "updated_at": conv_row["updated_at"],
+    }
+
+
+def _count_messages_in_cursor(cursor: sqlite3.Cursor, conv_id: str) -> tuple[int, int]:
+    row = cursor.execute(
+        """
+        SELECT COUNT(*) as total_cnt,
+               COALESCE(SUM(CASE WHEN role = 'assistant' AND (LENGTH(TRIM(content)) > 0 OR LENGTH(TRIM(thinking_content)) > 0) THEN 1 ELSE 0 END), 0) as asst_cnt
+        FROM messages
+        WHERE conversation_id = ?
+        """,
+        (conv_id,),
+    ).fetchone()
+    if not row:
+        return 0, 0
+    return int(row["total_cnt"] or 0), int(row["asst_cnt"] or 0)
+
+
+def _sync_conv_index(
+    conv_id: str,
+    msg_count: int,
+    asst_reply_count: int,
+    updated_at: Optional[float] = None,
+) -> int:
+    size_bytes = get_conv_db_size_bytes(conv_id)
+    with open_db() as conn:
+        if updated_at is not None:
+            conn.execute(
+                """
+                UPDATE conversations
+                SET message_count = ?, assistant_reply_count = ?, db_size_bytes = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (msg_count, asst_reply_count, size_bytes, updated_at, conv_id),
+            )
+        else:
+            conn.execute(
+                """
+                UPDATE conversations
+                SET message_count = ?, assistant_reply_count = ?, db_size_bytes = ?
+                WHERE id = ?
+                """,
+                (msg_count, asst_reply_count, size_bytes, conv_id),
+            )
+        conn.commit()
+    return size_bytes
 
 
 def is_default_conversation_title(title: Optional[str]) -> bool:
@@ -147,31 +220,62 @@ def create_conversation(
     is_unnamed_placeholder = raw_title.lower() in ("", "new chat")
     clean_ws = str(workspace_dir or "").strip()
     clean_mode = _normalize_agent_mode(agent_mode)
+    conv_id = str(uuid.uuid4())
+    now = time.time()
 
-    with open_db() as conn:
-        conn.execute("BEGIN IMMEDIATE")
-        if is_unnamed_placeholder:
-            # Keep default placeholder as "New Chat" with is_auto_named=0 so auto-naming runs cleanly on Turn 1
-            resolved_title = "New Chat"
-            is_auto_named = 0
-        else:
-            resolved_title = get_unique_conversation_title(raw_title, conn=conn)
-            is_auto_named = 1
+    with get_conv_lock(conv_id):
+        with open_db() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if is_unnamed_placeholder:
+                # Keep default placeholder as "New Chat" with is_auto_named=0 so auto-naming runs cleanly on Turn 1
+                resolved_title = "New Chat"
+                is_auto_named = 0
+            else:
+                resolved_title = get_unique_conversation_title(raw_title, conn=conn)
+                is_auto_named = 1
 
-        cursor = conn.cursor()
-        conv_id = str(uuid.uuid4())
-        now = time.time()
-        cursor.execute(
-            """
-            INSERT INTO conversations (
-                id, title, system_prompt, max_context_messages, is_imported, is_auto_named,
-                workspace_dir, agent_mode, created_at, updated_at
-            )
-            VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?)
-            """,
-            (conv_id, resolved_title, system_prompt, max_context, is_auto_named, clean_ws, clean_mode, now, now),
-        )
-        conn.commit()
+            meta = {
+                "id": conv_id,
+                "title": resolved_title,
+                "system_prompt": system_prompt,
+                "max_context_messages": max_context,
+                "workspace_dir": clean_ws,
+                "agent_mode": clean_mode,
+                "is_imported": 0,
+                "is_auto_named": is_auto_named,
+                "created_at": now,
+                "updated_at": now,
+            }
+            try:
+                init_conv_db(conv_id, meta=meta)
+                size_bytes = get_conv_db_size_bytes(conv_id)
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    INSERT INTO conversations (
+                        id, title, system_prompt, max_context_messages, is_imported, is_auto_named,
+                        workspace_dir, agent_mode, message_count, assistant_reply_count, db_size_bytes,
+                        created_at, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, 0, ?, ?, ?, 0, 0, ?, ?, ?)
+                    """,
+                    (
+                        conv_id,
+                        resolved_title,
+                        system_prompt,
+                        max_context,
+                        is_auto_named,
+                        clean_ws,
+                        clean_mode,
+                        size_bytes,
+                        now,
+                        now,
+                    ),
+                )
+                conn.commit()
+            except Exception:
+                unlink_conv_db_files(conv_id)
+                raise
     return {
         "id": conv_id,
         "title": resolved_title,
@@ -181,6 +285,7 @@ def create_conversation(
         "is_auto_named": bool(is_auto_named),
         "workspace_dir": clean_ws,
         "agent_mode": clean_mode,
+        "db_size_bytes": size_bytes,
         "created_at": now,
         "updated_at": now,
         "messages": [],
@@ -191,15 +296,12 @@ def get_conversations() -> List[Dict[str, Any]]:
     with open_db() as conn:
         cursor = conn.cursor()
         cursor.execute("""
-            SELECT c.id, c.title, c.system_prompt, c.max_context_messages, c.is_imported, c.is_auto_named,
-                   c.workspace_dir, c.agent_mode, c.created_at, c.updated_at,
-                   COALESCE(SUM(CASE WHEN m.role = 'assistant' AND (LENGTH(TRIM(m.content)) > 0 OR LENGTH(TRIM(m.thinking_content)) > 0) THEN 1 ELSE 0 END), 0) as message_count,
-                   COUNT(m.id) as total_messages
-            FROM conversations c
-            LEFT JOIN messages m ON c.id = m.conversation_id
-            GROUP BY c.id
-            HAVING message_count > 0 OR (c.is_imported = 1 AND total_messages > 0)
-            ORDER BY c.updated_at DESC
+            SELECT id, title, system_prompt, max_context_messages, is_imported, is_auto_named,
+                   workspace_dir, agent_mode, assistant_reply_count as message_count,
+                   message_count as total_messages, db_size_bytes, created_at, updated_at
+            FROM conversations
+            WHERE assistant_reply_count > 0 OR (is_imported = 1 AND message_count > 0)
+            ORDER BY updated_at DESC
         """)
         rows = cursor.fetchall()
 
@@ -216,37 +318,50 @@ def get_conversations() -> List[Dict[str, Any]]:
             "created_at": r["created_at"],
             "updated_at": r["updated_at"],
             "message_count": r["message_count"],
+            "db_size_bytes": int(r["db_size_bytes"] or 0),
         }
         for r in rows
     ]
 
 
 def get_conversation(conv_id: str) -> Optional[Dict[str, Any]]:
-    with open_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM conversations WHERE id = ?", (conv_id,))
-        conv_row = cursor.fetchone()
-        if not conv_row:
-            return None
+    if not conv_id:
+        return None
+    try:
+        validate_conv_id(conv_id)
+    except ValueError:
+        return None
 
-        cursor.execute(
-            "SELECT * FROM messages WHERE conversation_id = ? ORDER BY created_at ASC, rowid ASC",
-            (conv_id,),
-        )
-        msg_rows = cursor.fetchall()
-        cursor.execute(
-            """
-            SELECT provider_id, provider_name, model_id,
-                   prompt_tokens, completion_tokens, cached_tokens,
-                   google_search_requests, ddg_search_requests, cost_usd, created_at
-            FROM token_ledger
-            WHERE conversation_id = ?
-            ORDER BY id ASC
-            """,
-            (conv_id,),
-        )
-        ledger_rows = cursor.fetchall()
+    with get_conv_lock(conv_id):
+        with open_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM conversations WHERE id = ?", (conv_id,))
+            conv_row = cursor.fetchone()
+            if not conv_row:
+                return None
+        conv_meta = _conv_meta_from_row(conv_row)
 
+        with open_conv_db(conv_id, meta=conv_meta) as cconn:
+            ccur = cconn.cursor()
+            ccur.execute(
+                "SELECT * FROM messages WHERE conversation_id = ? ORDER BY created_at ASC, rowid ASC",
+                (conv_id,),
+            )
+            msg_rows = ccur.fetchall()
+            ccur.execute(
+                """
+                SELECT provider_id, provider_name, model_id,
+                       prompt_tokens, completion_tokens, cached_tokens,
+                       google_search_requests, ddg_search_requests, cost_usd, created_at
+                FROM token_ledger
+                WHERE conversation_id = ?
+                ORDER BY id ASC
+                """,
+                (conv_id,),
+            )
+            ledger_rows = ccur.fetchall()
+
+    size_bytes = get_conv_db_size_bytes(conv_id)
     messages = [
         {
             "id": m["id"],
@@ -292,8 +407,9 @@ def get_conversation(conv_id: str) -> Optional[Dict[str, Any]]:
         "max_context_messages": conv_row["max_context_messages"],
         "is_imported": bool(conv_row["is_imported"]) if "is_imported" in conv_keys else False,
         "is_auto_named": bool(conv_row["is_auto_named"]) if "is_auto_named" in conv_keys else False,
-        "workspace_dir": (conv_row["workspace_dir"] or "") if "is_imported" in conv_keys and "workspace_dir" in conv_keys else ((conv_row["workspace_dir"] or "") if "workspace_dir" in conv_keys else ""),
+        "workspace_dir": (conv_row["workspace_dir"] or "") if "workspace_dir" in conv_keys else "",
         "agent_mode": _normalize_agent_mode(conv_row["agent_mode"] if "agent_mode" in conv_keys else "manual"),
+        "db_size_bytes": size_bytes,
         "created_at": conv_row["created_at"],
         "updated_at": conv_row["updated_at"],
         "messages": messages,
@@ -303,38 +419,55 @@ def get_conversation(conv_id: str) -> Optional[Dict[str, Any]]:
 
 
 def update_conversation(conv_id: str, only_if_default: bool = False, **kwargs) -> Optional[str]:
+    if not conv_id:
+        return None
+    try:
+        validate_conv_id(conv_id)
+    except ValueError:
+        return None
     invalid_keys = [k for k in kwargs if k not in _ALLOWED_CONV_COLUMNS]
     if invalid_keys:
         raise ValueError(f"Unsupported conversation update column(s): {', '.join(invalid_keys)}")
 
-    with open_db() as conn:
-        conn.execute("BEGIN IMMEDIATE")
-        cursor = conn.cursor()
-        if only_if_default:
-            row = cursor.execute(
-                "SELECT title, is_auto_named FROM conversations WHERE id = ?", (conv_id,)
-            ).fetchone()
-            if not row or bool(row["is_auto_named"]) or not is_default_conversation_title(row["title"]):
+    with get_conv_lock(conv_id):
+        updated_meta: Optional[Dict[str, Any]] = None
+        with open_db() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            cursor = conn.cursor()
+            row = cursor.execute("SELECT * FROM conversations WHERE id = ?", (conv_id,)).fetchone()
+            if not row:
+                conn.rollback()
+                return None
+            if only_if_default and (bool(row["is_auto_named"]) or not is_default_conversation_title(row["title"])):
                 conn.rollback()
                 return None
 
-        if "title" in kwargs:
-            raw_title = (kwargs["title"] or "").strip() if isinstance(kwargs["title"], str) else ""
-            clean_title = raw_title or "New Chat"
-            kwargs["title"] = get_unique_conversation_title(clean_title, exclude_conv_id=conv_id, conn=conn)
-            kwargs.setdefault("is_auto_named", 1)
-        if "workspace_dir" in kwargs:
-            kwargs["workspace_dir"] = str(kwargs["workspace_dir"] or "").strip()
-        if "agent_mode" in kwargs:
-            kwargs["agent_mode"] = _normalize_agent_mode(kwargs["agent_mode"])
+            if "title" in kwargs:
+                raw_title = (kwargs["title"] or "").strip() if isinstance(kwargs["title"], str) else ""
+                clean_title = raw_title or "New Chat"
+                kwargs["title"] = get_unique_conversation_title(clean_title, exclude_conv_id=conv_id, conn=conn)
+                kwargs.setdefault("is_auto_named", 1)
+            if "workspace_dir" in kwargs:
+                kwargs["workspace_dir"] = str(kwargs["workspace_dir"] or "").strip()
+            if "agent_mode" in kwargs:
+                kwargs["agent_mode"] = _normalize_agent_mode(kwargs["agent_mode"])
 
-        fields = [f"{k} = ?" for k in kwargs]
-        values = list(kwargs.values())
-        values.append(time.time())
-        values.append(conv_id)
-        set_clause = f"{', '.join(fields)}, updated_at = ?" if fields else "updated_at = ?"
-        cursor.execute(f"UPDATE conversations SET {set_clause} WHERE id = ?", tuple(values))
-        conn.commit()
+            now = time.time()
+            fields = [f"{k} = ?" for k in kwargs]
+            values = list(kwargs.values())
+            values.append(now)
+            values.append(conv_id)
+            set_clause = f"{', '.join(fields)}, updated_at = ?" if fields else "updated_at = ?"
+            cursor.execute(f"UPDATE conversations SET {set_clause} WHERE id = ?", tuple(values))
+            fresh_row = cursor.execute("SELECT * FROM conversations WHERE id = ?", (conv_id,)).fetchone()
+            if fresh_row:
+                updated_meta = _conv_meta_from_row(fresh_row)
+            conn.commit()
+
+        if updated_meta and get_conv_db_path(conv_id).is_file():
+            with open_conv_db(conv_id) as cconn:
+                sync_conv_meta_cursor(cconn.cursor(), updated_meta)
+                cconn.commit()
     return kwargs.get("title")
 
 
@@ -347,62 +480,91 @@ def duplicate_conversation(conv_id: str) -> Optional[Dict[str, Any]]:
     if not conv:
         return None
 
-    with open_db() as conn:
-        conn.execute("BEGIN IMMEDIATE")
-        cursor = conn.cursor()
-        new_conv_id = str(uuid.uuid4())
-        branch_title = get_branch_title(conv["title"], conn=conn)
-        now = time.time()
+    new_conv_id = str(uuid.uuid4())
+    now = time.time()
 
-        cursor.execute(
-            """
-            INSERT INTO conversations (
-                id, title, system_prompt, max_context_messages, is_imported, is_auto_named,
-                workspace_dir, agent_mode, created_at, updated_at
-            )
-            VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
-            """,
-            (
-                new_conv_id,
-                branch_title,
-                conv.get("system_prompt", ""),
-                conv.get("max_context_messages", 30),
-                1 if conv.get("is_imported") else 0,
-                conv.get("workspace_dir", ""),
-                _normalize_agent_mode(conv.get("agent_mode", "manual")),
-                now,
-                now,
-            ),
-        )
+    with get_conv_lock(new_conv_id):
+        with open_db() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            cursor = conn.cursor()
+            branch_title = get_branch_title(conv["title"], conn=conn)
+            clean_ws = str(conv.get("workspace_dir", "") or "").strip()
+            clean_mode = _normalize_agent_mode(conv.get("agent_mode", "manual"))
+            is_imp = 1 if conv.get("is_imported") else 0
+            meta = {
+                "id": new_conv_id,
+                "title": branch_title,
+                "system_prompt": conv.get("system_prompt", ""),
+                "max_context_messages": conv.get("max_context_messages", 30),
+                "workspace_dir": clean_ws,
+                "agent_mode": clean_mode,
+                "is_imported": is_imp,
+                "is_auto_named": 1,
+                "created_at": now,
+                "updated_at": now,
+            }
+            try:
+                init_conv_db(new_conv_id, meta=meta)
+                with open_conv_db(new_conv_id, meta=meta) as cconn:
+                    ccur = cconn.cursor()
+                    for idx, m in enumerate(conv.get("messages", [])):
+                        new_msg_id = str(uuid.uuid4())
+                        msg_time = now + (idx * 0.001)
+                        trace_json = json.dumps(_parse_tool_trace(m.get("tool_trace")))
+                        ccur.execute(
+                            """
+                            INSERT INTO messages (
+                                id, conversation_id, role, content, thinking_content,
+                                provider_id, provider_name, model_id, thinking_level,
+                                prompt_tokens, completion_tokens, cached_tokens, duration_ms, worked_ms, tool_trace_json, created_at
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 0, ?, ?)
+                            """,
+                            (
+                                new_msg_id,
+                                new_conv_id,
+                                m["role"],
+                                m.get("content", ""),
+                                m.get("thinking_content", ""),
+                                m.get("provider_id", ""),
+                                m.get("provider_name", ""),
+                                m.get("model_id", ""),
+                                m.get("thinking_level", "none"),
+                                trace_json,
+                                msg_time,
+                            ),
+                        )
+                    msg_cnt, asst_cnt = _count_messages_in_cursor(ccur, new_conv_id)
+                    cconn.commit()
 
-        for idx, m in enumerate(conv.get("messages", [])):
-            new_msg_id = str(uuid.uuid4())
-            msg_time = now + (idx * 0.001)
-            trace_json = json.dumps(_parse_tool_trace(m.get("tool_trace")))
-            cursor.execute(
-                """
-                INSERT INTO messages (
-                    id, conversation_id, role, content, thinking_content,
-                    provider_id, provider_name, model_id, thinking_level,
-                    prompt_tokens, completion_tokens, cached_tokens, duration_ms, worked_ms, tool_trace_json, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 0, ?, ?)
-                """,
-                (
-                    new_msg_id,
-                    new_conv_id,
-                    m["role"],
-                    m.get("content", ""),
-                    m.get("thinking_content", ""),
-                    m.get("provider_id", ""),
-                    m.get("provider_name", ""),
-                    m.get("model_id", ""),
-                    m.get("thinking_level", "none"),
-                    trace_json,
-                    msg_time,
-                ),
-            )
-
-        conn.commit()
+                size_bytes = get_conv_db_size_bytes(new_conv_id)
+                cursor.execute(
+                    """
+                    INSERT INTO conversations (
+                        id, title, system_prompt, max_context_messages, is_imported, is_auto_named,
+                        workspace_dir, agent_mode, message_count, assistant_reply_count, db_size_bytes,
+                        created_at, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        new_conv_id,
+                        branch_title,
+                        conv.get("system_prompt", ""),
+                        conv.get("max_context_messages", 30),
+                        is_imp,
+                        clean_ws,
+                        clean_mode,
+                        msg_cnt,
+                        asst_cnt,
+                        size_bytes,
+                        now,
+                        now,
+                    ),
+                )
+                conn.commit()
+            except Exception:
+                unlink_conv_db_files(new_conv_id)
+                raise
     return get_conversation(new_conv_id)
 
 
@@ -537,126 +699,152 @@ def import_conversation_data(
     Import a conversation from parsed JSON/Markdown data with a deduplicated title.
     Restores conversation settings, per-message metrics/traces, and exported token/cost/search ledger data.
     """
-    with open_db() as conn:
-        conn.execute("BEGIN IMMEDIATE")
-        cursor = conn.cursor()
-        unique_title = get_unique_conversation_title(title or "Imported Chat", conn=conn)
-        new_conv_id = str(uuid.uuid4())
-        now = time.time()
-        conv_created = float(created_at) if isinstance(created_at, (int, float)) and created_at > 0 else now
-        conv_updated = float(updated_at) if isinstance(updated_at, (int, float)) and updated_at > 0 else now
-        clean_ws = str(workspace_dir or "").strip()
-        clean_mode = _normalize_agent_mode(agent_mode)
-        auto_named_val = 1 if (is_auto_named is None or is_auto_named) else 0
+    new_conv_id = str(uuid.uuid4())
+    now = time.time()
+    conv_created = float(created_at) if isinstance(created_at, (int, float)) and created_at > 0 else now
+    conv_updated = float(updated_at) if isinstance(updated_at, (int, float)) and updated_at > 0 else now
+    clean_ws = str(workspace_dir or "").strip()
+    clean_mode = _normalize_agent_mode(agent_mode)
+    clamped_ctx = max(1, min(500, int(max_context or 30)))
+    auto_named_val = 1 if (is_auto_named is None or is_auto_named) else 0
 
-        cursor.execute(
-            """
-            INSERT INTO conversations (
-                id, title, system_prompt, max_context_messages, is_imported, is_auto_named,
-                workspace_dir, agent_mode, created_at, updated_at
-            )
-            VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?)
-            """,
-            (
-                new_conv_id,
-                unique_title,
-                system_prompt or "",
-                max(1, min(500, int(max_context or 30))),
-                auto_named_val,
-                clean_ws,
-                clean_mode,
-                conv_created,
-                conv_updated,
-            ),
-        )
+    with get_conv_lock(new_conv_id):
+        with open_db() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            cursor = conn.cursor()
+            unique_title = get_unique_conversation_title(title or "Imported Chat", conn=conn)
+            meta = {
+                "id": new_conv_id,
+                "title": unique_title,
+                "system_prompt": system_prompt or "",
+                "max_context_messages": clamped_ctx,
+                "workspace_dir": clean_ws,
+                "agent_mode": clean_mode,
+                "is_imported": 1,
+                "is_auto_named": auto_named_val,
+                "created_at": conv_created,
+                "updated_at": conv_updated,
+            }
+            try:
+                init_conv_db(new_conv_id, meta=meta)
+                with open_conv_db(new_conv_id, meta=meta) as cconn:
+                    ccur = cconn.cursor()
+                    if messages:
+                        for idx, m in enumerate(messages):
+                            new_msg_id = str(uuid.uuid4())
+                            raw_role = str(m.get("role", "user") or "user").strip().lower()
+                            role = raw_role if raw_role in ("user", "assistant", "system") else "user"
+                            raw_ts = m.get("created_at")
+                            msg_time = (
+                                float(raw_ts)
+                                if isinstance(raw_ts, (int, float)) and raw_ts > 0
+                                else (now + idx * 0.001)
+                            )
+                            p_tok = max(0, int(m.get("prompt_tokens") or 0))
+                            c_tok = max(0, int(m.get("completion_tokens") or 0))
+                            cache_tok = max(0, int(m.get("cached_tokens") or 0))
+                            dur_ms = max(0, int(m.get("duration_ms") or 0))
+                            wrk_ms = max(0, int(m.get("worked_ms") or 0))
+                            trace_json = json.dumps(_parse_tool_trace(m.get("tool_trace")))
+                            ccur.execute(
+                                """
+                                INSERT INTO messages (
+                                    id, conversation_id, role, content, thinking_content,
+                                    provider_id, provider_name, model_id, thinking_level,
+                                    prompt_tokens, completion_tokens, cached_tokens, duration_ms, worked_ms, tool_trace_json, created_at
+                                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                """,
+                                (
+                                    new_msg_id,
+                                    new_conv_id,
+                                    role,
+                                    m.get("content", ""),
+                                    m.get("thinking_content", ""),
+                                    m.get("provider_id", ""),
+                                    str(m.get("provider_name", "") or ""),
+                                    m.get("model_id", ""),
+                                    m.get("thinking_level", "none"),
+                                    p_tok,
+                                    c_tok,
+                                    cache_tok,
+                                    dur_ms,
+                                    wrk_ms,
+                                    trace_json,
+                                    msg_time,
+                                ),
+                            )
 
-        if messages:
-            for idx, m in enumerate(messages):
-                new_msg_id = str(uuid.uuid4())
-                raw_role = str(m.get("role", "user") or "user").strip().lower()
-                role = raw_role if raw_role in ("user", "assistant", "system") else "user"
-                raw_ts = m.get("created_at")
-                msg_time = float(raw_ts) if isinstance(raw_ts, (int, float)) and raw_ts > 0 else (now + idx * 0.001)
-                p_tok = max(0, int(m.get("prompt_tokens") or 0))
-                c_tok = max(0, int(m.get("completion_tokens") or 0))
-                cache_tok = max(0, int(m.get("cached_tokens") or 0))
-                dur_ms = max(0, int(m.get("duration_ms") or 0))
-                wrk_ms = max(0, int(m.get("worked_ms") or 0))
-                trace_json = json.dumps(_parse_tool_trace(m.get("tool_trace")))
+                    _restore_imported_ledger(ccur, new_conv_id, token_ledger, token_stats, conv_created)
+                    msg_cnt, asst_cnt = _count_messages_in_cursor(ccur, new_conv_id)
+                    cconn.commit()
+
+                size_bytes = get_conv_db_size_bytes(new_conv_id)
                 cursor.execute(
                     """
-                    INSERT INTO messages (
-                        id, conversation_id, role, content, thinking_content,
-                        provider_id, provider_name, model_id, thinking_level,
-                        prompt_tokens, completion_tokens, cached_tokens, duration_ms, worked_ms, tool_trace_json, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO conversations (
+                        id, title, system_prompt, max_context_messages, is_imported, is_auto_named,
+                        workspace_dir, agent_mode, message_count, assistant_reply_count, db_size_bytes,
+                        created_at, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
-                        new_msg_id,
                         new_conv_id,
-                        role,
-                        m.get("content", ""),
-                        m.get("thinking_content", ""),
-                        m.get("provider_id", ""),
-                        str(m.get("provider_name", "") or ""),
-                        m.get("model_id", ""),
-                        m.get("thinking_level", "none"),
-                        p_tok,
-                        c_tok,
-                        cache_tok,
-                        dur_ms,
-                        wrk_ms,
-                        trace_json,
-                        msg_time,
+                        unique_title,
+                        system_prompt or "",
+                        clamped_ctx,
+                        auto_named_val,
+                        clean_ws,
+                        clean_mode,
+                        msg_cnt,
+                        asst_cnt,
+                        size_bytes,
+                        conv_created,
+                        conv_updated,
                     ),
                 )
-
-        _restore_imported_ledger(cursor, new_conv_id, token_ledger, token_stats, conv_created)
-        conn.commit()
+                conn.commit()
+            except Exception:
+                unlink_conv_db_files(new_conv_id)
+                raise
     return get_conversation(new_conv_id)
 
 
 def delete_conversation(conv_id: str, only_if_empty: bool = False) -> bool:
     if not conv_id:
         return False
-    with open_db() as conn:
-        conn.execute("BEGIN IMMEDIATE")
-        cursor = conn.cursor()
-        if only_if_empty:
-            conv_row = cursor.execute(
-                "SELECT is_imported FROM conversations WHERE id = ?",
-                (conv_id,),
-            ).fetchone()
-            if not conv_row:
-                conn.rollback()
-                return False
-            if conv_row["is_imported"]:
-                has_msgs = cursor.execute(
-                    "SELECT 1 FROM messages WHERE conversation_id = ? LIMIT 1",
-                    (conv_id,),
-                ).fetchone()
-                if has_msgs:
-                    conn.rollback()
-                    return False
-            else:
-                has_reply = cursor.execute(
-                    """
-                    SELECT 1 FROM messages
-                    WHERE conversation_id = ? AND role = 'assistant'
-                      AND (LENGTH(TRIM(content)) > 0 OR LENGTH(TRIM(thinking_content)) > 0)
-                    LIMIT 1
-                    """,
-                    (conv_id,),
-                ).fetchone()
-                if has_reply:
-                    conn.rollback()
-                    return False
+    try:
+        validate_conv_id(conv_id)
+    except ValueError:
+        return False
 
-        cursor.execute("DELETE FROM messages WHERE conversation_id = ?", (conv_id,))
-        cursor.execute("DELETE FROM token_ledger WHERE conversation_id = ?", (conv_id,))
-        cursor.execute("DELETE FROM conversations WHERE id = ?", (conv_id,))
-        deleted = cursor.rowcount > 0
-        conn.commit()
+    with get_conv_lock(conv_id):
+        with open_db() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            cursor = conn.cursor()
+            if only_if_empty:
+                conv_row = cursor.execute(
+                    "SELECT is_imported, message_count, assistant_reply_count FROM conversations WHERE id = ?",
+                    (conv_id,),
+                ).fetchone()
+                if not conv_row:
+                    conn.rollback()
+                    return False
+                if conv_row["is_imported"]:
+                    if int(conv_row["message_count"] or 0) > 0:
+                        conn.rollback()
+                        return False
+                else:
+                    if int(conv_row["assistant_reply_count"] or 0) > 0:
+                        conn.rollback()
+                        return False
+
+            cursor.execute("DELETE FROM conversations WHERE id = ?", (conv_id,))
+            deleted = cursor.rowcount > 0
+            conn.commit()
+
+        if deleted:
+            unlink_conv_db_files(conv_id)
         return deleted
 
 
@@ -679,6 +867,10 @@ def add_message(
 ) -> Optional[Dict[str, Any]]:
     if not conversation_id:
         return None
+    try:
+        validate_conv_id(conversation_id)
+    except ValueError:
+        return None
     if not msg_id:
         msg_id = str(uuid.uuid4())
     now = time.time()
@@ -689,70 +881,73 @@ def add_message(
     trace_json = json.dumps(clean_trace)
 
     try:
-        with open_db() as conn:
-            cursor = conn.cursor()
-            if not cursor.execute("SELECT 1 FROM conversations WHERE id = ?", (conversation_id,)).fetchone():
-                _logger.debug("Skipped add_message; conversation %s no longer exists", conversation_id)
-                return None
+        with get_conv_lock(conversation_id):
+            with open_db() as conn:
+                conv_row = conn.execute("SELECT * FROM conversations WHERE id = ?", (conversation_id,)).fetchone()
+                if not conv_row:
+                    _logger.debug("Skipped add_message; conversation %s no longer exists", conversation_id)
+                    return None
+                conv_meta = _conv_meta_from_row(conv_row)
+                if not resolved_provider_name and provider_id:
+                    prov_row = conn.execute("SELECT name FROM providers WHERE id = ?", (provider_id,)).fetchone()
+                    if prov_row and prov_row["name"]:
+                        resolved_provider_name = prov_row["name"]
 
-            if not resolved_provider_name and provider_id:
-                prov_row = cursor.execute("SELECT name FROM providers WHERE id = ?", (provider_id,)).fetchone()
-                if prov_row and prov_row["name"]:
-                    resolved_provider_name = prov_row["name"]
-
-            cursor.execute(
-                """
-                INSERT INTO messages (
-                    id, conversation_id, role, content, thinking_content,
-                    provider_id, provider_name, model_id, thinking_level,
-                    prompt_tokens, completion_tokens, cached_tokens, duration_ms, worked_ms, tool_trace_json, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    msg_id,
-                    conversation_id,
-                    role,
-                    content,
-                    thinking_content,
-                    provider_id,
-                    resolved_provider_name,
-                    model_id,
-                    thinking_level,
-                    prompt_tokens,
-                    completion_tokens,
-                    cached_tokens,
-                    clean_duration_ms,
-                    clean_worked_ms,
-                    trace_json,
-                    now,
-                ),
-            )
-
-            cursor.execute("UPDATE conversations SET updated_at = ? WHERE id = ?", (now, conversation_id))
-
-            if prompt_tokens > 0 or completion_tokens > 0 or cached_tokens > 0:
-                cursor.execute(
+            with open_conv_db(conversation_id, meta=conv_meta) as cconn:
+                ccur = cconn.cursor()
+                ccur.execute(
                     """
-                    INSERT INTO token_ledger (
-                        conversation_id, provider_id, provider_name, model_id,
-                        prompt_tokens, completion_tokens, cached_tokens, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO messages (
+                        id, conversation_id, role, content, thinking_content,
+                        provider_id, provider_name, model_id, thinking_level,
+                        prompt_tokens, completion_tokens, cached_tokens, duration_ms, worked_ms, tool_trace_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
+                        msg_id,
                         conversation_id,
-                        provider_id or "",
+                        role,
+                        content,
+                        thinking_content,
+                        provider_id,
                         resolved_provider_name,
-                        model_id or "",
+                        model_id,
+                        thinking_level,
                         prompt_tokens,
                         completion_tokens,
                         cached_tokens,
+                        clean_duration_ms,
+                        clean_worked_ms,
+                        trace_json,
                         now,
                     ),
                 )
 
-            conn.commit()
-    except sqlite3.IntegrityError:
-        _logger.debug("Skipped add_message due to foreign key delete race on conversation %s", conversation_id)
+                if prompt_tokens > 0 or completion_tokens > 0 or cached_tokens > 0:
+                    ccur.execute(
+                        """
+                        INSERT INTO token_ledger (
+                            conversation_id, provider_id, provider_name, model_id,
+                            prompt_tokens, completion_tokens, cached_tokens, created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            conversation_id,
+                            provider_id or "",
+                            resolved_provider_name,
+                            model_id or "",
+                            prompt_tokens,
+                            completion_tokens,
+                            cached_tokens,
+                            now,
+                        ),
+                    )
+                msg_cnt, asst_cnt = _count_messages_in_cursor(ccur, conversation_id)
+                cconn.commit()
+
+            _sync_conv_index(conversation_id, msg_cnt, asst_cnt, updated_at=now)
+    except sqlite3.Error:
+        _logger.debug("Skipped add_message due to DB error or delete race on conversation %s", conversation_id)
         return None
 
     return {
@@ -775,47 +970,212 @@ def add_message(
     }
 
 
-def update_message(msg_id: str, **kwargs) -> None:
+def update_message(msg_id: str, *, conversation_id: Optional[str] = None, **kwargs) -> None:
     if not kwargs:
         return
     invalid_keys = [k for k in kwargs if k not in _ALLOWED_MSG_COLUMNS]
     if invalid_keys:
         raise ValueError(f"Unsupported message update column(s): {', '.join(invalid_keys)}")
+    if not msg_id:
+        return
 
     fields = [f"{k} = ?" for k in kwargs]
     values = list(kwargs.values())
     values.append(msg_id)
-    with open_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute(f"UPDATE messages SET {', '.join(fields)} WHERE id = ?", tuple(values))
-        conn.commit()
+
+    if conversation_id:
+        try:
+            candidate_ids = [validate_conv_id(conversation_id)]
+        except ValueError:
+            return
+    else:
+        with open_db() as conn:
+            candidate_ids = [r["id"] for r in conn.execute("SELECT id FROM conversations").fetchall()]
+
+    for cid in candidate_ids:
+        with get_conv_lock(cid):
+            conv_db = get_conv_db_path(cid)
+            if not conv_db.is_file():
+                continue
+            updated_counts: Optional[tuple[int, int]] = None
+            with open_conv_db(cid) as cconn:
+                ccur = cconn.cursor()
+                ccur.execute(f"UPDATE messages SET {', '.join(fields)} WHERE id = ?", tuple(values))
+                if ccur.rowcount > 0:
+                    updated_counts = _count_messages_in_cursor(ccur, cid)
+                    cconn.commit()
+            if updated_counts is not None:
+                _sync_conv_index(cid, updated_counts[0], updated_counts[1])
+                break
 
 
 def delete_messages_from(conversation_id: str, from_msg_id: str, include_self: bool = True) -> None:
-    with open_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT rowid, created_at FROM messages WHERE id = ? AND conversation_id = ?",
-            (from_msg_id, conversation_id),
-        )
-        target = cursor.fetchone()
-        if not target and from_msg_id and from_msg_id.startswith("user_temp_"):
-            cursor.execute(
-                "SELECT rowid, id, created_at FROM messages WHERE conversation_id = ? AND role = 'user' ORDER BY rowid DESC LIMIT 1",
-                (conversation_id,),
-            )
-            target = cursor.fetchone()
+    if not conversation_id or not from_msg_id:
+        return
+    try:
+        validate_conv_id(conversation_id)
+    except ValueError:
+        return
 
-        if target:
-            target_rowid = target["rowid"]
-            target_time = target["created_at"]
-            op = ">=" if include_self else ">"
-            cursor.execute(
-                f"DELETE FROM messages WHERE conversation_id = ? AND (created_at > ? OR (created_at = ? AND rowid {op} ?))",
-                (conversation_id, target_time, target_time, target_rowid),
+    with get_conv_lock(conversation_id):
+        with open_db() as conn:
+            conv_row = conn.execute("SELECT * FROM conversations WHERE id = ?", (conversation_id,)).fetchone()
+            if not conv_row:
+                return
+            conv_meta = _conv_meta_from_row(conv_row)
+
+        deleted_count = 0
+        msg_cnt = int(conv_row["message_count"] or 0)
+        asst_cnt = int(conv_row["assistant_reply_count"] or 0)
+        with open_conv_db(conversation_id, meta=conv_meta) as cconn:
+            ccur = cconn.cursor()
+            ccur.execute(
+                "SELECT rowid, created_at FROM messages WHERE id = ? AND conversation_id = ?",
+                (from_msg_id, conversation_id),
             )
-            cursor.execute(
-                "UPDATE conversations SET updated_at = ? WHERE id = ?",
-                (time.time(), conversation_id),
+            target = ccur.fetchone()
+            if not target and from_msg_id.startswith("user_temp_"):
+                ccur.execute(
+                    "SELECT rowid, id, created_at FROM messages WHERE conversation_id = ? AND role = 'user' ORDER BY rowid DESC LIMIT 1",
+                    (conversation_id,),
+                )
+                target = ccur.fetchone()
+
+            if target:
+                target_rowid = target["rowid"]
+                target_time = target["created_at"]
+                op = ">=" if include_self else ">"
+                ccur.execute(
+                    f"DELETE FROM messages WHERE conversation_id = ? AND (created_at > ? OR (created_at = ? AND rowid {op} ?))",
+                    (conversation_id, target_time, target_time, target_rowid),
+                )
+                deleted_count = ccur.rowcount
+                msg_cnt, asst_cnt = _count_messages_in_cursor(ccur, conversation_id)
+                cconn.commit()
+                if deleted_count > 0:
+                    try:
+                        cconn.execute("PRAGMA incremental_vacuum;")
+                        cconn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+                    except sqlite3.Error:
+                        pass
+
+        if deleted_count > 0:
+            _sync_conv_index(conversation_id, msg_cnt, asst_cnt, updated_at=time.time())
+
+
+def resolve_message_id(conv_id: str, msg_id: str) -> str:
+    """Resolve explicit message ID or latest user message for optimistic `user_temp_*` placeholders."""
+    if not conv_id:
+        return ""
+    try:
+        validate_conv_id(conv_id)
+    except ValueError:
+        return ""
+    if msg_id and not msg_id.startswith("user_temp_"):
+        return msg_id
+
+    with get_conv_lock(conv_id):
+        with open_db() as conn:
+            if not conn.execute("SELECT 1 FROM conversations WHERE id = ?", (conv_id,)).fetchone():
+                return ""
+        if not get_conv_db_path(conv_id).is_file():
+            return ""
+        with open_conv_db(conv_id) as cconn:
+            row = cconn.execute(
+                "SELECT id FROM messages WHERE conversation_id = ? AND role = 'user' ORDER BY rowid DESC LIMIT 1",
+                (conv_id,),
+            ).fetchone()
+            return str(row["id"]) if row else ""
+
+
+def message_exists(conv_id: str, msg_id: str) -> bool:
+    """Return True when `msg_id` belongs to `conv_id`."""
+    if not conv_id or not msg_id:
+        return False
+    try:
+        validate_conv_id(conv_id)
+    except ValueError:
+        return False
+
+    with get_conv_lock(conv_id):
+        with open_db() as conn:
+            if not conn.execute("SELECT 1 FROM conversations WHERE id = ?", (conv_id,)).fetchone():
+                return False
+        if not get_conv_db_path(conv_id).is_file():
+            return False
+        with open_conv_db(conv_id) as cconn:
+            row = cconn.execute(
+                "SELECT 1 FROM messages WHERE id = ? AND conversation_id = ?",
+                (msg_id, conv_id),
+            ).fetchone()
+            return bool(row)
+
+
+def _format_mb_label(limit_bytes: int) -> str:
+    mb_val = limit_bytes / 1_048_576
+    if mb_val >= 1024 and abs(mb_val - round(mb_val)) < 1e-6 and int(round(mb_val)) % 1024 == 0:
+        return f"{int(round(mb_val)) // 1024} GB"
+    if abs(mb_val - round(mb_val)) < 1e-6:
+        return f"{int(round(mb_val))} MB"
+    return f"{mb_val:.2f}".rstrip("0").rstrip(".") + " MB"
+
+
+def check_storage_quota(conv_id: Optional[str] = None, additional_bytes: int = 0) -> Optional[str]:
+    """Return an actionable quota error if configured per-chat or total byte limits are exceeded."""
+    settings = get_app_settings()
+    max_chat_bytes = mb_setting_to_bytes(settings.get("max_chat_size_mb", "50"))
+    max_total_bytes = mb_setting_to_bytes(settings.get("max_total_chats_size_mb", "2048"))
+    extra = max(0, int(additional_bytes or 0))
+
+    if conv_id and max_chat_bytes > 0:
+        cur_chat_bytes = get_conv_db_size_bytes(conv_id)
+        if cur_chat_bytes >= max_chat_bytes or (extra > 0 and cur_chat_bytes + extra > max_chat_bytes):
+            return (
+                f"This chat has reached its {_format_mb_label(max_chat_bytes)} storage limit "
+                f"({cur_chat_bytes / 1_048_576:.1f} MB used). Start a new chat or raise the limit in Settings -> General."
             )
-            conn.commit()
+
+    if max_total_bytes > 0:
+        total_bytes = get_total_conv_dbs_size_bytes()
+        if total_bytes >= max_total_bytes or (extra > 0 and total_bytes + extra > max_total_bytes):
+            return (
+                f"Total conversation storage has reached its {_format_mb_label(max_total_bytes)} limit "
+                f"({total_bytes / 1_048_576:.1f} MB used). Delete unused chats or raise the limit in Settings -> General."
+            )
+    return None
+
+
+def get_storage_summary() -> Dict[str, Any]:
+    """Return live storage usage and sorted conversation breakdown for Settings & quota UI."""
+    settings = get_app_settings()
+    max_chat_str = normalize_storage_limit_mb(settings.get("max_chat_size_mb", "50"))
+    max_total_str = normalize_storage_limit_mb(settings.get("max_total_chats_size_mb", "2048"))
+
+    with open_db() as conn:
+        rows = conn.execute("""
+            SELECT id, title, db_size_bytes, message_count, assistant_reply_count, is_imported, updated_at
+            FROM conversations
+            WHERE assistant_reply_count > 0 OR (is_imported = 1 AND message_count > 0)
+            ORDER BY db_size_bytes DESC, updated_at DESC
+        """).fetchall()
+
+    convs = [
+        {
+            "id": r["id"],
+            "title": r["title"],
+            "db_size_bytes": int(r["db_size_bytes"] or 0),
+            "message_count": int(r["assistant_reply_count"] if not r["is_imported"] else r["message_count"] or 0),
+            "updated_at": r["updated_at"],
+        }
+        for r in rows
+    ]
+    total_bytes = get_total_conv_dbs_size_bytes()
+    return {
+        "total_bytes": total_bytes,
+        "chat_count": len(convs),
+        "max_chat_size_mb": max_chat_str,
+        "max_total_chats_size_mb": max_total_str,
+        "max_chat_bytes": mb_setting_to_bytes(max_chat_str),
+        "max_total_chats_bytes": mb_setting_to_bytes(max_total_str),
+        "conversations": convs,
+    }

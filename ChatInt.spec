@@ -15,7 +15,7 @@ def _load_project_metadata() -> tuple[str, tuple[int, int, int, int], str, str]:
         with pyproject_path.open("rb") as fh:
             project = tomllib.load(fh).get("project", {})
 
-    raw_version = os.environ.get("CHATINT_VERSION", "").strip() or str(project.get("version", "0.5.2")).strip()
+    raw_version = os.environ.get("CHATINT_VERSION", "").strip() or str(project.get("version", "0.5.3")).strip()
     clean_version = raw_version.lstrip("vV")
     nums = [int(x) for x in re.findall(r"\d+", clean_version)[:4]]
     while len(nums) < 4:

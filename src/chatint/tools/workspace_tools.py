@@ -78,11 +78,34 @@ def _is_blocked_rel_parts(rel_parts: tuple[str, ...] | List[str]) -> bool:
         if (
             part in _BLOCKED_FILENAMES
             or part.endswith((".db-wal", ".db-shm", ".db.bak"))
+            or part.startswith(("chatint.db.", "chatint.db-"))
             or part == ".env"
             or part.startswith(".env.")
         ):
             return True
-    return len(norm_parts) >= 2 and norm_parts[0] == "data" and norm_parts[1] in ("logs", "chatint.db")
+    return len(norm_parts) >= 2 and norm_parts[0] == "data" and (
+        norm_parts[1] in ("logs", "conversations") or norm_parts[1].startswith("chatint.db")
+    )
+
+
+def _is_protected_app_path(resolved: Path) -> bool:
+    """Block resolved targets inside ChatInt's active DB/conversations/logs directory."""
+    try:
+        from chatint.storage.connection import _get_db_path, get_conversations_dir
+
+        db_path = _get_db_path().resolve()
+        data_dir = db_path.parent
+        convs_dir = get_conversations_dir(db_path).resolve()
+        logs_dir = (data_dir / "logs").resolve()
+        if resolved == convs_dir or resolved.is_relative_to(convs_dir):
+            return True
+        if resolved == logs_dir or resolved.is_relative_to(logs_dir):
+            return True
+        if resolved.parent == data_dir and resolved.name.lower().startswith(("chatint.db", ".env")):
+            return True
+    except Exception:
+        pass
+    return False
 
 
 def _validate_rel_parts(parts: tuple[str, ...] | List[str]) -> None:
@@ -107,7 +130,7 @@ def _is_allowed_walk_entry(root: Path, entry: Path, *, is_dir: bool) -> bool:
             return False
         rel = resolved.relative_to(root)
         _validate_rel_parts(rel.parts)
-        if rel.parts and _is_blocked_rel_parts(rel.parts):
+        if (rel.parts and _is_blocked_rel_parts(rel.parts)) or _is_protected_app_path(resolved):
             return False
     except (OSError, PermissionError):
         return False
@@ -146,7 +169,7 @@ def resolve_workspace_path(workspace_root: Path, rel_path: str = ".", *, check_b
     rel_parts = resolved.relative_to(root).parts
     _validate_rel_parts(rel_parts)
 
-    if check_blocked and rel_parts and _is_blocked_rel_parts(rel_parts):
+    if check_blocked and ((rel_parts and _is_blocked_rel_parts(rel_parts)) or _is_protected_app_path(resolved)):
         raise PermissionError(f"Access to protected path '{resolved.name}' is blocked.")
 
     return resolved

@@ -1,6 +1,6 @@
 [project]
 name = "chatint"
-version = "0.5.2"
+version = "0.5.3"
 description = "ChatInt App"
 readme = "README.md"
 authors = [

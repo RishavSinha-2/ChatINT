@@ -2,7 +2,9 @@
 ; Builds: dist\installer\ChatInt-Setup-x64.exe
 
 #define MyAppName "ChatInt"
-#define MyAppVersion "0.5.2"
+#ifndef MyAppVersion
+#define MyAppVersion "0.5.3"
+#endif
 #define MyAppPublisher "Rishav Sinha"
 #define MyAppURL "https://github.com/RishavSinha-2/ChatINT"
 #define MyAppExeName "ChatInt.exe"

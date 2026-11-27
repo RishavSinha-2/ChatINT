@@ -17,6 +17,7 @@ import {
   VALID_THINKING_LEVELS,
   el,
   escapeHtml,
+  formatBytesHuman,
   getDefaultThinkingLevel,
   getVerifiedProviderModels,
   getWebSearchAvailability,
@@ -28,6 +29,50 @@ import {
   stripModelPrefix,
   uiHooks,
 } from "./state.js";
+
+const MAX_CHAT_SIZE_PRESETS = [
+  { value: "25", label: "25 MB" },
+  { value: "50", label: "50 MB (Default)" },
+  { value: "100", label: "100 MB" },
+  { value: "250", label: "250 MB" },
+  { value: "500", label: "500 MB" },
+  { value: "1024", label: "1 GB" },
+  { value: "0", label: "No limit" },
+];
+
+const MAX_TOTAL_STORAGE_PRESETS = [
+  { value: "512", label: "512 MB" },
+  { value: "1024", label: "1 GB" },
+  { value: "2048", label: "2 GB (Default)" },
+  { value: "5120", label: "5 GB" },
+  { value: "10240", label: "10 GB" },
+  { value: "25600", label: "25 GB" },
+  { value: "0", label: "No limit" },
+];
+
+function normalizeQuotaSelectValue(rawVal, fallback = "0") {
+  const s = String(rawVal ?? "").trim();
+  if (!s) return fallback;
+  const low = s.toLowerCase();
+  if (low === "0" || low === "unlimited" || low === "no limit" || low === "none") return "0";
+  const num = Number(s);
+  if (!Number.isFinite(num) || num < 0) return fallback;
+  return s;
+}
+
+function buildQuotaOptionsHtml(presets, currentVal, fallback) {
+  const norm = normalizeQuotaSelectValue(currentVal, fallback);
+  let matched = false;
+  const opts = presets.map((p) => {
+    const isSel = Number(p.value) === Number(norm) && !matched;
+    if (isSel) matched = true;
+    return `<option value="${escapeHtml(p.value)}" ${isSel ? "selected" : ""}>${escapeHtml(p.label)}</option>`;
+  });
+  if (!matched) {
+    opts.unshift(`<option value="${escapeHtml(norm)}" selected>Custom (${escapeHtml(norm)} MB)</option>`);
+  }
+  return opts.join("");
+}
 
 let activeConfigModelRef = null;
 
@@ -436,6 +481,33 @@ export function renderSettingsContent(options = {}) {
         </select>
       </div>
 
+      <div class="settings-group" style="padding-top: 8px; border-top: 1px solid var(--border-subtle);">
+        <div style="display: flex; align-items: center; justify-content: space-between; gap: 10px;">
+          <label class="settings-label" style="margin: 0;">Storage &amp; Quotas</label>
+          <span id="storage-usage-summary-val" style="font-size: 11.5px; color: var(--text-muted);">Calculating usage...</span>
+        </div>
+        <div class="storage-quota-grid">
+          <div class="storage-quota-field">
+            <label class="settings-sublabel" for="setting-max-chat-size-mb">Max Size Per Chat</label>
+            <select class="settings-input" id="setting-max-chat-size-mb">
+              ${buildQuotaOptionsHtml(MAX_CHAT_SIZE_PRESETS, buf.settings.max_chat_size_mb, "50")}
+            </select>
+          </div>
+          <div class="storage-quota-field">
+            <label class="settings-sublabel" for="setting-max-total-chats-mb">Max Total Chats Storage</label>
+            <select class="settings-input" id="setting-max-total-chats-mb">
+              ${buildQuotaOptionsHtml(MAX_TOTAL_STORAGE_PRESETS, buf.settings.max_total_chats_size_mb, "2048")}
+            </select>
+          </div>
+        </div>
+        <details class="storage-large-chats-details" id="storage-large-chats-details">
+          <summary class="storage-large-chats-summary">Manage Large Chats</summary>
+          <div class="storage-large-chats-list" id="storage-large-chats-list">
+            <div style="font-size: 11.5px; color: var(--text-muted); padding: 6px 0;">Loading conversation sizes...</div>
+          </div>
+        </details>
+      </div>
+
       <div class="settings-group" style="padding-top: 6px; border-top: 1px solid var(--border-subtle);">
         <div style="display: flex; align-items: center; justify-content: space-between; gap: 12px;">
           <div style="display: flex; flex-direction: column; gap: 2px;">
@@ -512,6 +584,77 @@ export function renderSettingsContent(options = {}) {
         buf.settings.default_agent_mode = agentModeSel.value === "auto" ? "auto" : "manual";
       };
     }
+
+    const maxChatSel = document.getElementById("setting-max-chat-size-mb");
+    if (maxChatSel) {
+      maxChatSel.onchange = () => {
+        buf.settings.max_chat_size_mb = normalizeQuotaSelectValue(maxChatSel.value, "50");
+      };
+    }
+    const maxTotalSel = document.getElementById("setting-max-total-chats-mb");
+    if (maxTotalSel) {
+      maxTotalSel.onchange = () => {
+        buf.settings.max_total_chats_size_mb = normalizeQuotaSelectValue(maxTotalSel.value, "2048");
+      };
+    }
+
+    const renderStorageSummaryIntoModal = (summary) => {
+      const usageEl = document.getElementById("storage-usage-summary-val");
+      const listEl = document.getElementById("storage-large-chats-list");
+      if (!usageEl || !listEl || !summary) return;
+      const totalBytes = Number(summary.total_bytes || 0);
+      const count = Number(summary.chat_count || 0);
+      usageEl.textContent = `${formatBytesHuman(totalBytes)} across ${count} ${count === 1 ? "chat" : "chats"}`;
+      const convs = Array.isArray(summary.conversations) ? summary.conversations : [];
+      if (convs.length === 0) {
+        listEl.innerHTML = '<div style="font-size: 11.5px; color: var(--text-muted); padding: 6px 0;">No saved conversations on disk yet.</div>';
+        return;
+      }
+      listEl.innerHTML = convs
+        .map(
+          (c) => `
+          <div class="storage-chat-row" data-conv-id="${escapeHtml(c.id)}">
+            <div class="storage-chat-meta">
+              <span class="storage-chat-title" title="${escapeHtml(c.title || "Conversation")}">${escapeHtml(c.title || "Conversation")}</span>
+              <span class="storage-chat-size">${escapeHtml(formatBytesHuman(c.db_size_bytes))}</span>
+            </div>
+            <div class="storage-chat-actions">
+              <button type="button" class="btn-secondary storage-chat-export-btn" data-conv-id="${escapeHtml(c.id)}" style="padding: 3px 8px; font-size: 11px;">Export</button>
+              <button type="button" class="btn-secondary storage-chat-delete-btn" data-conv-id="${escapeHtml(c.id)}" data-conv-title="${escapeHtml(c.title || "Conversation")}" style="padding: 3px 8px; font-size: 11px; color: var(--danger-text);">Delete</button>
+            </div>
+          </div>`
+        )
+        .join("");
+
+      listEl.querySelectorAll(".storage-chat-export-btn").forEach((btn) => {
+        btn.onclick = () => {
+          const cid = btn.dataset.convId;
+          if (cid) uiHooks.openExportModal?.(cid);
+        };
+      });
+      listEl.querySelectorAll(".storage-chat-delete-btn").forEach((btn) => {
+        btn.onclick = async () => {
+          const cid = btn.dataset.convId;
+          const title = btn.dataset.convTitle || "Conversation";
+          if (!cid) return;
+          const deleted = await uiHooks.deleteConversationFromUI?.(cid, title);
+          if (deleted && state.settingsBuffer) {
+            const refreshed = await callApi("get_storage_summary").catch(() => null);
+            if (refreshed && !refreshed.error) {
+              renderStorageSummaryIntoModal(refreshed);
+            }
+          }
+        };
+      });
+    };
+
+    callApi("get_storage_summary")
+      .then((summary) => {
+        if (summary && !summary.error && state.settingsBuffer && state.settingsBuffer.masterSettingsTab === "general") {
+          renderStorageSummaryIntoModal(summary);
+        }
+      })
+      .catch(() => {});
   } else if (buf.masterSettingsTab === "websearch") {
     buf.webSearchModels = normalizeWebSearchModelsClient(buf.webSearchModels);
     const geminiProv = buf.providers.find((p) => p.id === "gemini");
@@ -1172,6 +1315,16 @@ export function saveGeneralTabInputs() {
     if (modeSelect) {
       buf.settings.default_agent_mode = modeSelect.value === "auto" ? "auto" : "manual";
     }
+
+    const maxChatSel = document.getElementById("setting-max-chat-size-mb");
+    if (maxChatSel) {
+      buf.settings.max_chat_size_mb = normalizeQuotaSelectValue(maxChatSel.value, "50");
+    }
+
+    const maxTotalSel = document.getElementById("setting-max-total-chats-mb");
+    if (maxTotalSel) {
+      buf.settings.max_total_chats_size_mb = normalizeQuotaSelectValue(maxTotalSel.value, "2048");
+    }
   }
 }
 
@@ -1303,6 +1456,7 @@ export async function saveSettingsFromModal() {
   syncAllPaneModelDropdowns();
   syncAllPaneWebSearchButtons();
   uiHooks.syncAllPaneAgentControls?.();
+  uiHooks.refreshPaneQuotaBanners?.();
   renderTabs();
   if (el.panesContainer) {
     el.panesContainer.querySelectorAll(".provider-tag[data-provider-id]").forEach((tagEl) => {

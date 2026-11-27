@@ -25,6 +25,7 @@ from chatint.client_manager import (
 )
 from chatint.db import (
     add_message,
+    check_storage_quota,
     create_conversation,
     delete_conversation,
     delete_messages_from,
@@ -32,10 +33,12 @@ from chatint.db import (
     duplicate_conversation as db_duplicate_conversation,
     get_api_key_from_env,
     get_app_settings,
+    get_conv_db_size_bytes,
     get_conversation,
     get_conversations,
     get_google_search_request_totals,
     get_providers,
+    get_storage_summary,
     get_tabs_state,
     get_token_stats,
     get_web_search_models,
@@ -44,7 +47,8 @@ from chatint.db import (
     is_saved_secret_non_placeholder,
     is_valid_provider_name,
     mask_api_key,
-    open_db,
+    message_exists,
+    resolve_message_id,
     save_app_settings,
     save_providers,
     save_tabs_state,
@@ -73,6 +77,7 @@ PUBLIC_RPC_METHODS: tuple[str, ...] = (
     "delete_provider",
     "get_provider_api_key",
     "get_conversation_token_stats",
+    "get_storage_summary",
     "set_theme",
     "save_settings",
     "fetch_provider_models",
@@ -571,6 +576,10 @@ class DesktopBridge:
         return get_token_stats(conv_id)
 
     @_guarded_rpc
+    def get_storage_summary(self) -> Dict[str, Any]:
+        return get_storage_summary()
+
+    @_guarded_rpc
     def set_theme(self, theme: str) -> Dict[str, Any]:
         clean_theme = "light" if str(theme or "").strip().lower() == "light" else "dark"
         save_app_settings({"theme": clean_theme})
@@ -728,10 +737,7 @@ class DesktopBridge:
 
     @_guarded_rpc
     def get_conversation(self, conv_id: str) -> Optional[Dict[str, Any]]:
-        conv = get_conversation(conv_id)
-        if conv:
-            conv["token_stats"] = get_token_stats(conv_id)
-        return conv
+        return get_conversation(conv_id)
 
     @_guarded_rpc
     def rename_conversation(self, conv_id: str, title: str) -> Dict[str, Any]:
@@ -740,6 +746,10 @@ class DesktopBridge:
 
     @_guarded_rpc
     def duplicate_conversation(self, conv_id: str) -> Dict[str, Any]:
+        src_bytes = get_conv_db_size_bytes(conv_id)
+        quota_err = check_storage_quota(additional_bytes=src_bytes)
+        if quota_err:
+            return {"error": quota_err, "quota_exceeded": True}
         conv = db_duplicate_conversation(conv_id)
         if not conv:
             return {"error": "Conversation not found"}
@@ -768,6 +778,9 @@ class DesktopBridge:
 
                 p = Path(str(selected))
                 content = read_chat_file_safely(p)
+                quota_err = check_storage_quota(additional_bytes=len(content.encode("utf-8", errors="ignore")))
+                if quota_err:
+                    return {"error": quota_err, "quota_exceeded": True}
                 parsed = parse_chat_file_content(content, filename=p.name)
                 new_conv = db_import_conversation_data(
                     title=parsed["title"],
@@ -790,6 +803,9 @@ class DesktopBridge:
     @_guarded_rpc
     def import_conversation_content(self, content: str, filename: str = "") -> Dict[str, Any]:
         try:
+            quota_err = check_storage_quota(additional_bytes=len((content or "").encode("utf-8", errors="ignore")))
+            if quota_err:
+                return {"error": quota_err, "quota_exceeded": True}
             parsed = parse_chat_file_content(content, filename=filename)
             new_conv = db_import_conversation_data(
                 title=parsed["title"],
@@ -1012,6 +1028,10 @@ class DesktopBridge:
         clamped_ctx = _clamp_max_context(max_context_messages, default=30)
 
         conv = get_conversation(conversation_id) if conversation_id else None
+        quota_err = check_storage_quota(conv_id=conv["id"] if conv else None)
+        if quota_err:
+            return {"error": quota_err, "quota_exceeded": True}
+
         if not conv:
             init_mode = _normalize_agent_mode(
                 agent_mode if (agent_mode is not None and str(agent_mode).strip()) else get_app_settings().get("default_agent_mode", "manual")
@@ -1146,23 +1166,8 @@ class DesktopBridge:
             return {"error": ws_err}
 
         clean_thinking = _normalize_thinking_level(thinking_level)
-        if message_id.startswith("user_temp_") or not message_id:
-            with open_db() as conn:
-                row = conn.execute(
-                    "SELECT id FROM messages WHERE conversation_id = ? AND role = 'user' ORDER BY rowid DESC LIMIT 1",
-                    (conversation_id,),
-                ).fetchone()
-            message_id = row["id"] if row else ""
-
-        if not message_id:
-            return {"error": "Message not found"}
-
-        with open_db() as conn:
-            existing = conn.execute(
-                "SELECT id FROM messages WHERE id = ? AND conversation_id = ?",
-                (message_id, conversation_id),
-            ).fetchone()
-        if not existing:
+        message_id = resolve_message_id(conversation_id, message_id)
+        if not message_id or not message_exists(conversation_id, message_id):
             return {"error": "Message not found"}
 
         prov_err = ClientManager.validate_provider_ready(clean_provider)
@@ -1173,6 +1178,7 @@ class DesktopBridge:
         delete_messages_from(conversation_id, message_id, include_self=False)
         update_message(
             message_id,
+            conversation_id=conversation_id,
             content=new_content,
             provider_id=clean_provider,
             model_id=clean_model,

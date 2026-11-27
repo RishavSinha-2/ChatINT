@@ -141,11 +141,15 @@ export function onStreamEvent(event) {
       for (const matchingTab of state.tabs) {
         if (event.conversation_id && matchingTab.conversationId !== event.conversation_id) continue;
         matchingTab.tokenStats = event.token_stats;
+        if (typeof event.db_size_bytes === "number") {
+          matchingTab.dbSizeBytes = event.db_size_bytes;
+        }
         const matchingPane = el.panesContainer
           ? el.panesContainer.querySelector(`.chat-pane[data-tab-id="${matchingTab.id}"]`)
           : null;
         if (matchingPane) {
           renderTokenStats(matchingPane, matchingTab.id, event.token_stats);
+          uiHooks.updatePaneQuotaBanner?.(matchingPane, matchingTab);
         }
       }
     }
@@ -315,6 +319,11 @@ export function onStreamEvent(event) {
         state.googleSearchTotals = event.token_stats.google_search_totals;
       }
     }
+    if (typeof event.db_size_bytes === "number") {
+      tab.dbSizeBytes = event.db_size_bytes;
+      const storedConv = state.conversations.find((c) => c.id === tab.conversationId);
+      if (storedConv) storedConv.db_size_bytes = event.db_size_bytes;
+    }
 
     if (pane && messagesContainer) {
       const sendBtn = pane.querySelector(`#send-btn-${tab.id}`);
@@ -341,6 +350,7 @@ export function onStreamEvent(event) {
       if (event.token_stats) {
         renderTokenStats(pane, tab.id, event.token_stats);
       }
+      uiHooks.updatePaneQuotaBanner?.(pane, tab);
     }
 
     if (event.token_stats && el.panesContainer) {

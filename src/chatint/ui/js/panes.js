@@ -12,6 +12,7 @@ import {
   createTabObject,
   el,
   escapeHtml,
+  formatBytesHuman,
   formatCost,
   formatTokenSpeed,
   formatTokens,
@@ -578,6 +579,7 @@ export function createPaneElement(tab, index, totalPanes) {
     <div class="messages-container" id="messages-${tab.id}"></div>
 
     <div class="input-section">
+      <div class="pane-quota-banner" id="quota-banner-${tab.id}" style="display: none;"></div>
       <div class="input-box-wrapper">
         <textarea class="chat-input" id="input-${tab.id}" rows="1" placeholder="Ask anything..."></textarea>
         <div class="input-controls">
@@ -1645,7 +1647,11 @@ export async function populatePaneContent(pane, tab) {
     tab.maxContextMessages = conv.max_context_messages || tab.maxContextMessages || 30;
     if (conv.workspace_dir !== undefined) tab.workspaceDir = conv.workspace_dir || "";
     if (conv.agent_mode) tab.agentMode = conv.agent_mode === "auto" ? "auto" : "manual";
+    tab.dbSizeBytes = Number(conv.db_size_bytes || 0);
+    const storedConv = state.conversations.find((c) => c.id === conv.id);
+    if (storedConv) storedConv.db_size_bytes = tab.dbSizeBytes;
     updatePaneAgentControls(pane, tab);
+    updatePaneQuotaBanner(pane, tab);
 
     if (conv.messages && conv.messages.length > 0) {
       tab.tokenStats = conv.token_stats;
@@ -2065,6 +2071,11 @@ export async function sendMessageFromPane(pane, tab) {
         setTabStreamingUI(pane, tab, false);
       }
       renderTabs();
+      if (res && res.quota_exceeded) {
+        tab.quotaNotice = res.error;
+        tab.quotaBannerDismissed = false;
+        updatePaneQuotaBanner(pane, tab);
+      }
       showNoticeDialog((res && res.error) || "Failed to send message.");
       return;
     }
@@ -2094,6 +2105,62 @@ export async function sendMessageFromPane(pane, tab) {
     renderTabs();
     showNoticeDialog(`Failed to send message: ${err.message || err}`);
   }
+}
+
+export function updatePaneQuotaBanner(pane, tab) {
+  if (!pane || !tab) return;
+  const banner = pane.querySelector(`#quota-banner-${tab.id}`);
+  if (!banner) return;
+  const maxChatMb = Number(state.settings?.max_chat_size_mb ?? 50);
+  const maxChatBytes = Number.isFinite(maxChatMb) && maxChatMb > 0 ? maxChatMb * 1048576 : 0;
+  const usedBytes = Number(tab.dbSizeBytes || 0);
+  const nearLimit = Boolean(maxChatBytes > 0 && usedBytes >= 0.85 * maxChatBytes);
+  const hardNotice = tab.quotaNotice ? String(tab.quotaNotice) : "";
+
+  if (!hardNotice && (!nearLimit || tab.quotaBannerDismissed)) {
+    banner.style.display = "none";
+    banner.innerHTML = "";
+    return;
+  }
+
+  const label = hardNotice
+    ? hardNotice
+    : `Chat database is at ${formatBytesHuman(usedBytes)} of ${formatBytesHuman(maxChatBytes)} limit.`;
+  banner.className = `pane-quota-banner${hardNotice || usedBytes >= maxChatBytes ? " is-limit" : ""}`;
+  banner.style.display = "flex";
+  banner.innerHTML = `
+    <span class="pane-quota-text">${escapeHtml(label)}</span>
+    <div class="pane-quota-actions">
+      <button type="button" class="btn-secondary quota-new-chat-btn">New Chat</button>
+      <button type="button" class="btn-secondary quota-settings-btn">Settings</button>
+      <button type="button" class="icon-btn quota-dismiss-btn" title="Dismiss"><i data-lucide="x" style="width: 12px; height: 12px;"></i></button>
+    </div>
+  `;
+  const newBtn = banner.querySelector(".quota-new-chat-btn");
+  if (newBtn) newBtn.onclick = () => createNewTab();
+  const settingsBtn = banner.querySelector(".quota-settings-btn");
+  if (settingsBtn) settingsBtn.onclick = () => uiHooks.openSettingsModal?.();
+  const dismissBtn = banner.querySelector(".quota-dismiss-btn");
+  if (dismissBtn) {
+    dismissBtn.onclick = () => {
+      tab.quotaNotice = null;
+      tab.quotaBannerDismissed = true;
+      updatePaneQuotaBanner(pane, tab);
+    };
+  }
+  renderIcons(banner);
+}
+
+export function refreshAllPaneQuotaBanners() {
+  if (!el.panesContainer) return;
+  el.panesContainer.querySelectorAll(".chat-pane").forEach((paneEl) => {
+    const tid = paneEl.dataset.tabId;
+    const t = state.tabs.find((item) => item.id === tid);
+    if (t) {
+      t.quotaNotice = null;
+      updatePaneQuotaBanner(paneEl, t);
+    }
+  });
 }
 
 export function renderTokenStats(pane, tabId, stats) {

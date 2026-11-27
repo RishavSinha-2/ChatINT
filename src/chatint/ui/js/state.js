@@ -93,6 +93,14 @@ export function formatTokens(count) {
   return count.toString();
 }
 
+export function formatBytesHuman(bytes) {
+  const b = Math.max(0, Number(bytes) || 0);
+  if (b < 1024) return `${Math.round(b)} B`;
+  if (b < 1048576) return `${(b / 1024).toFixed(1)} KB`;
+  if (b < 1073741824) return `${(b / 1048576).toFixed(1)} MB`;
+  return `${(b / 1073741824).toFixed(2)} GB`;
+}
+
 export function resolveProviderDisplayName(providerId, fallbackName = "") {
   const pid = String(providerId || "").trim();
   if (pid.toLowerCase() === "system") return "SYSTEM";
@@ -152,6 +160,8 @@ export const state = {
     use_gemini_web_search: "false",
     default_workspace_dir: "",
     default_agent_mode: "manual",
+    max_chat_size_mb: "50",
+    max_total_chats_size_mb: "2048",
   },
   conversations: [],
   recentlyDeletedConvIds: new Set(),
@@ -393,6 +403,9 @@ export function createTabObject(overrides = {}) {
     hasAutoCollapsedThinking: false,
     isActivelyThinking: false,
     tokenStats: null,
+    dbSizeBytes: Number(overrides.dbSizeBytes || 0),
+    quotaNotice: null,
+    quotaBannerDismissed: false,
   };
 }
 

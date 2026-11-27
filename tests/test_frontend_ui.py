@@ -1092,11 +1092,76 @@ window.pywebview = {
           use_gemini_web_search: "false",
           default_workspace_dir: "",
           default_agent_mode: "manual",
+          max_chat_size_mb: "50",
+          max_total_chats_size_mb: "2048",
         },
-        conversations: [],
+        conversations: [
+          {
+            id: "conv_s2_large",
+            title: "Large Architecture Chat",
+            system_prompt: "",
+            max_context_messages: 30,
+            is_imported: false,
+            is_auto_named: true,
+            workspace_dir: "",
+            agent_mode: "manual",
+            db_size_bytes: 46 * 1024 * 1024,
+            message_count: 14,
+            updated_at: 1700000100,
+          },
+          {
+            id: "conv_s2_small",
+            title: "Small Quick Chat",
+            system_prompt: "",
+            max_context_messages: 30,
+            is_imported: false,
+            is_auto_named: true,
+            workspace_dir: "",
+            agent_mode: "manual",
+            db_size_bytes: 120 * 1024,
+            message_count: 2,
+            updated_at: 1700000050,
+          },
+        ],
         tabs_state: null,
         google_search_totals: { month: "2026-11", monthly: 0, all_time: 0 },
         web_search_models: [],
+      },
+    })),
+    get_storage_summary: __stage2Factory(async () => {
+      const deleted = window.__stage2DeletedIds || [];
+      const list = [
+        { id: "conv_s2_large", title: "Large Architecture Chat", db_size_bytes: 46 * 1024 * 1024, message_count: 14, updated_at: 1700000100 },
+        { id: "conv_s2_small", title: "Small Quick Chat", db_size_bytes: 120 * 1024, message_count: 2, updated_at: 1700000050 },
+      ].filter((c) => !deleted.includes(c.id));
+      return {
+        ok: true,
+        error: null,
+        data: {
+          total_bytes: list.reduce((a, b) => a + b.db_size_bytes, 0),
+          chat_count: list.length,
+          max_chat_size_mb: "50",
+          max_total_chats_size_mb: "2048",
+          conversations: list,
+        },
+      };
+    }),
+    delete_conversation: __stage2Factory(async (convId) => {
+      window.__stage2DeletedIds = window.__stage2DeletedIds || [];
+      window.__stage2DeletedIds.push(convId);
+      return { ok: true, data: { success: true, deleted: true }, error: null };
+    }),
+    get_conversation: __stage2Factory(async (convId) => ({
+      ok: true,
+      error: null,
+      data: {
+        id: convId,
+        title: "Large Architecture Chat",
+        system_prompt: "",
+        max_context_messages: 30,
+        db_size_bytes: 46 * 1024 * 1024,
+        messages: [{ id: "m_lg_1", role: "assistant", content: "Large answer", created_at: 1700000100 }],
+        token_stats: null,
       },
     })),
     get_pending_events: __stage2Factory(async () => ({ ok: true, data: [], error: null })),
@@ -1264,6 +1329,52 @@ async function run() {
     assert(!acc.classList.contains("collapsed"), "Clicking timeline header should expand it");
   });
 
+  await test("storage_quotas_presets_large_chats_and_quota_banner", async () => {
+    // Open Large Architecture Chat and verify >=85% quota warning banner appears
+    const firstItem = document.querySelector(".conversation-item");
+    assert(firstItem, "Expected seeded conversation in sidebar");
+    firstItem.click();
+    await wait(60);
+    const tab = window.ChatInt.state.tabs.find((t) => t.id === window.ChatInt.state.activeTabId);
+    const banner = document.getElementById(`quota-banner-${tab.id}`);
+    assert(banner && banner.style.display === "flex", "Expected >=85% quota banner when db_size_bytes >= 46 MB");
+
+    // Open Settings -> General and verify Storage & Quotas presets + No limit + Large Chats manager
+    document.getElementById("global-settings-btn").click();
+    await wait(60);
+    const maxChatSel = document.getElementById("setting-max-chat-size-mb");
+    const maxTotalSel = document.getElementById("setting-max-total-chats-mb");
+    const summaryEl = document.getElementById("storage-usage-summary-val");
+    const listEl = document.getElementById("storage-large-chats-list");
+    assert(maxChatSel && maxTotalSel && summaryEl && listEl, "Missing Storage & Quotas UI controls");
+    assert(summaryEl.textContent.includes("2 chats"), `Unexpected storage summary text: ${summaryEl.textContent}`);
+    assert(Array.from(maxChatSel.options).some((o) => o.value === "0" && o.textContent.includes("No limit")), "Missing No limit option on per-chat select");
+    assert(Array.from(maxTotalSel.options).some((o) => o.value === "0" && o.textContent.includes("No limit")), "Missing No limit option on total select");
+    assert(listEl.querySelectorAll(".storage-chat-row").length === 2, "Expected 2 rows in Manage Large Chats");
+
+    const delBtn = listEl.querySelector('.storage-chat-delete-btn[data-conv-id="conv_s2_small"]');
+    assert(delBtn, "Expected Delete button for conv_s2_small");
+    delBtn.click();
+    await wait(30);
+    const confirmOk = document.getElementById("app-dialog-ok-btn");
+    assert(confirmOk, "Expected confirm OK button");
+    confirmOk.click();
+    await wait(60);
+    assert(!window.ChatInt.state.conversations.some((c) => c.id === "conv_s2_small"), "Deleted chat must leave state.conversations");
+    assert(listEl.querySelectorAll(".storage-chat-row").length === 1, "Manage Large Chats should re-render with 1 remaining row");
+
+    maxChatSel.value = "0";
+    maxChatSel.dispatchEvent(new Event("change"));
+    maxTotalSel.value = "5120";
+    maxTotalSel.dispatchEvent(new Event("change"));
+    document.getElementById("save-settings-btn").click();
+    await wait(50);
+    assert(window.ChatInt.state.settings.max_chat_size_mb === "0", "Saved max_chat_size_mb should become 0 (No limit)");
+    assert(window.ChatInt.state.settings.max_total_chats_size_mb === "5120", "Saved max_total_chats_size_mb should become 5120");
+    const liveBanner = document.getElementById(`quota-banner-${tab.id}`);
+    assert(liveBanner && liveBanner.style.display === "none", "Quota banner must hide once switched to No limit");
+  });
+
   await fetch("/__report", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -1397,7 +1508,7 @@ run().catch(async (err) => {
         if "boot_error" in received_payload:
             self.fail(f"Stage 2 UI test runner boot error:\n{received_payload['boot_error']}")
         results = received_payload.get("results", [])
-        self.assertEqual(len(results), 3, f"Expected 3 Stage 2 UI tests, got {results}")
+        self.assertEqual(len(results), 4, f"Expected 4 Stage 2 UI tests, got {results}")
         failures = [r for r in results if not r.get("ok")]
         if failures:
             self.fail("\n\n".join(f"[{f['name']}]\n{f.get('error')}" for f in failures))

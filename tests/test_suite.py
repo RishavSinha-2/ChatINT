@@ -95,14 +95,16 @@ class TestChatIntFeatures(unittest.TestCase):
         cls.test_dir.cleanup()
 
     def setUp(self):
-        # Reset transient tables and isolate .env between tests
+        import shutil
+        # Reset global tables, per-conv DB folder, and isolate .env between tests
+        shutil.rmtree(Path(self.test_dir.name) / "conversations", ignore_errors=True)
         with open_db() as conn:
             c = conn.cursor()
-            c.execute("DELETE FROM messages")
-            c.execute("DELETE FROM token_ledger")
             c.execute("DELETE FROM conversations")
             c.execute("DELETE FROM providers")
             c.execute("DELETE FROM app_settings")
+            c.execute("DELETE FROM tab_sessions")
+            c.execute("DELETE FROM google_search_usage")
             conn.commit()
         if self.env_path.exists():
             self.env_path.unlink()
@@ -1681,7 +1683,7 @@ Gradient descent minimizes the loss function step by step.
         self.assertEqual(imp["messages"][1]["provider_name"], "Bonsai")
         self.assertEqual(imp["messages"][1]["duration_ms"], asst["duration_ms"])
 
-        # 3. Migration from v2 DB upgrades cleanly to SCHEMA_VERSION (3) with new columns
+        # 3. Migration from v2 DB upgrades cleanly to SCHEMA_VERSION (6) & splits per-conv DB
         v2_db = Path(self.test_dir.name) / "legacy_v2.db"
         with contextlib.closing(sqlite3.connect(v2_db)) as c_v2:
             c_v2.execute("CREATE TABLE providers (id TEXT PRIMARY KEY, name TEXT NOT NULL, base_url TEXT NOT NULL, api_key TEXT NOT NULL DEFAULT '', is_enabled INTEGER NOT NULL DEFAULT 1, models_json TEXT NOT NULL DEFAULT '[]')")
@@ -1691,9 +1693,12 @@ Gradient descent minimizes the loss function step by step.
             c_v2.execute("CREATE TABLE app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
             c_v2.execute("CREATE TABLE token_ledger (id INTEGER PRIMARY KEY AUTOINCREMENT, conversation_id TEXT NOT NULL, provider_id TEXT NOT NULL DEFAULT '', model_id TEXT NOT NULL DEFAULT '', prompt_tokens INTEGER NOT NULL DEFAULT 0, completion_tokens INTEGER NOT NULL DEFAULT 0, cached_tokens INTEGER NOT NULL DEFAULT 0, google_search_requests INTEGER NOT NULL DEFAULT 0, created_at REAL NOT NULL)")
             c_v2.execute("CREATE TABLE google_search_usage (month_key TEXT PRIMARY KEY, request_count INTEGER NOT NULL DEFAULT 0, updated_at REAL NOT NULL)")
+            c_v2.execute("INSERT INTO conversations (id, title, is_imported, is_auto_named, created_at, updated_at) VALUES ('c_v2', 'V2 Topic', 0, 1, 1.0, 2.0)")
+            c_v2.execute("INSERT INTO messages (id, conversation_id, role, content, created_at) VALUES ('m_v2', 'c_v2', 'assistant', 'Hi from v2', 1.5)")
             c_v2.execute("PRAGMA user_version = 2")
             c_v2.commit()
 
+        from chatint.db import open_conv_db
         prev_db = db_mod.DB_PATH
         try:
             db_mod.DB_PATH = v2_db
@@ -1702,9 +1707,14 @@ Gradient descent minimizes the loss function step by step.
             self.assertTrue(v2_db.with_name("legacy_v2.db.bak").exists())
             with open_db() as c_up:
                 self.assertEqual(c_up.execute("PRAGMA user_version").fetchone()[0], SCHEMA_VERSION)
-                cols = {r["name"] for r in c_up.execute("PRAGMA table_info(messages)").fetchall()}
+                main_tbls = {r[0] for r in c_up.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+                self.assertNotIn("messages", main_tbls)
+                self.assertNotIn("token_ledger", main_tbls)
+            with open_conv_db("c_v2") as c_conv:
+                cols = {r["name"] for r in c_conv.execute("PRAGMA table_info(messages)").fetchall()}
                 self.assertIn("duration_ms", cols)
                 self.assertIn("provider_name", cols)
+                self.assertEqual(c_conv.execute("SELECT content FROM messages WHERE id='m_v2'").fetchone()[0], "Hi from v2")
         finally:
             db_mod.DB_PATH = prev_db
             cfg_mod.DB_PATH = prev_db
@@ -2060,7 +2070,10 @@ Gradient descent minimizes the loss function step by step.
             curated_clean = br.prepare_clean_default_db()
 
         with contextlib.closing(sqlite3.connect(curated_clean)) as c_clean:
-            for tbl in ("conversations", "messages", "token_ledger", "tab_sessions", "google_search_usage"):
+            clean_tbls = {r[0] for r in c_clean.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+            self.assertNotIn("messages", clean_tbls)
+            self.assertNotIn("token_ledger", clean_tbls)
+            for tbl in ("conversations", "tab_sessions", "google_search_usage"):
                 self.assertEqual(c_clean.execute(f"SELECT COUNT(*) FROM {tbl}").fetchone()[0], 0, tbl)
             api_keys = [r[0] for r in c_clean.execute("SELECT api_key FROM providers").fetchall()]
             self.assertTrue(all(k == "" for k in api_keys))
@@ -2232,10 +2245,17 @@ Gradient descent minimizes the loss function step by step.
 
                 with open_db() as migrated:
                     self.assertEqual(migrated.execute("PRAGMA user_version").fetchone()[0], SCHEMA_VERSION)
-                    self.assertEqual(SCHEMA_VERSION, 5)
-                    msg_cols = {r["name"] for r in migrated.execute("PRAGMA table_info(messages)").fetchall()}
+                    self.assertEqual(SCHEMA_VERSION, 6)
+                    migrated_tbls = {r[0] for r in migrated.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+                    self.assertNotIn("messages", migrated_tbls)
+                    self.assertNotIn("token_ledger", migrated_tbls)
+
+                from chatint.db import open_conv_db
+                with open_conv_db("c_v3") as conv_conn:
+                    msg_cols = {r["name"] for r in conv_conn.execute("PRAGMA table_info(messages)").fetchall()}
                     self.assertIn("worked_ms", msg_cols)
-                    ledger_cols = {r["name"] for r in migrated.execute("PRAGMA table_info(token_ledger)").fetchall()}
+                    self.assertIn("tool_trace_json", msg_cols)
+                    ledger_cols = {r["name"] for r in conv_conn.execute("PRAGMA table_info(token_ledger)").fetchall()}
                     self.assertIn("ddg_search_requests", ledger_cols)
                     self.assertIn("provider_name", ledger_cols)
                     self.assertIn("cost_usd", ledger_cols)
@@ -2247,6 +2267,8 @@ Gradient descent minimizes the loss function step by step.
                 app_cfg = get_app_settings()
                 self.assertIn("default_workspace_dir", app_cfg)
                 self.assertEqual(app_cfg["default_agent_mode"], "manual")
+                self.assertEqual(app_cfg["max_chat_size_mb"], "50")
+                self.assertEqual(app_cfg["max_total_chats_size_mb"], "2048")
 
                 # 2. prepare_clean_default_db scrubs personal default_workspace_dir & resets default_agent_mode
                 save_app_settings({"default_workspace_dir": "C:/Users/private/secret_repo", "default_agent_mode": "auto"})
@@ -2953,6 +2975,180 @@ Gradient descent minimizes the loss function step by step.
                     rebind_res = fetch_url("https://rebind.example/test")
                 self.assertFalse(rebind_res["ok"])
                 self.assertIn("127.0.0.1", rebind_res["error"])
+
+    def test_v053_per_conv_db_migration_quotas_races_and_sandbox(self):
+        import concurrent.futures
+        import contextlib
+        from chatint.db import (
+            SCHEMA_VERSION,
+            delete_messages_from,
+            get_conv_db_path,
+            get_conv_db_size_bytes,
+            get_conversations_dir,
+            get_storage_summary,
+            get_total_conv_dbs_size_bytes,
+            open_conv_db,
+            record_token_usage,
+            save_app_settings,
+        )
+        from chatint.tools import resolve_workspace_path, tool_list_dir
+
+        # 1. Legacy v5 -> v6 migration preserving worked_ms, tool_trace, ddg_search_requests, conflict archive, & partial v6 init
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            v5_db = tmp_dir / "chatint.db"
+            stale_conv = tmp_dir / "conversations" / "c_v5_1.db"
+            stale_conv.parent.mkdir(parents=True, exist_ok=True)
+            stale_conv.write_bytes(b"OLD_CONFLICT_DB_DATA")
+
+            with contextlib.closing(sqlite3.connect(v5_db)) as conn:
+                conn.executescript(
+                    """
+                    PRAGMA user_version = 5;
+                    CREATE TABLE providers (id TEXT PRIMARY KEY, name TEXT NOT NULL, base_url TEXT NOT NULL, api_key TEXT NOT NULL DEFAULT '', is_enabled INTEGER NOT NULL DEFAULT 1, models_json TEXT NOT NULL DEFAULT '[]');
+                    CREATE TABLE conversations (id TEXT PRIMARY KEY, title TEXT NOT NULL, system_prompt TEXT NOT NULL DEFAULT '', max_context_messages INTEGER NOT NULL DEFAULT 30, is_imported INTEGER NOT NULL DEFAULT 0, is_auto_named INTEGER NOT NULL DEFAULT 0, workspace_dir TEXT NOT NULL DEFAULT '', agent_mode TEXT NOT NULL DEFAULT 'manual', created_at REAL NOT NULL, updated_at REAL NOT NULL);
+                    CREATE TABLE messages (id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL, thinking_content TEXT NOT NULL DEFAULT '', provider_id TEXT NOT NULL DEFAULT '', provider_name TEXT NOT NULL DEFAULT '', model_id TEXT NOT NULL DEFAULT '', thinking_level TEXT NOT NULL DEFAULT 'none', prompt_tokens INTEGER NOT NULL DEFAULT 0, completion_tokens INTEGER NOT NULL DEFAULT 0, cached_tokens INTEGER NOT NULL DEFAULT 0, duration_ms INTEGER NOT NULL DEFAULT 0, worked_ms INTEGER NOT NULL DEFAULT 0, tool_trace_json TEXT NOT NULL DEFAULT '[]', created_at REAL NOT NULL);
+                    CREATE TABLE token_ledger (id INTEGER PRIMARY KEY AUTOINCREMENT, conversation_id TEXT NOT NULL, provider_id TEXT NOT NULL DEFAULT '', provider_name TEXT NOT NULL DEFAULT '', model_id TEXT NOT NULL DEFAULT '', prompt_tokens INTEGER NOT NULL DEFAULT 0, completion_tokens INTEGER NOT NULL DEFAULT 0, cached_tokens INTEGER NOT NULL DEFAULT 0, google_search_requests INTEGER NOT NULL DEFAULT 0, ddg_search_requests INTEGER NOT NULL DEFAULT 0, cost_usd REAL DEFAULT NULL, created_at REAL NOT NULL);
+                    CREATE TABLE google_search_usage (month_key TEXT PRIMARY KEY, request_count INTEGER NOT NULL DEFAULT 0, updated_at REAL NOT NULL);
+                    CREATE TABLE app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                    CREATE TABLE tab_sessions (id INTEGER PRIMARY KEY CHECK (id = 1), state_json TEXT NOT NULL, updated_at REAL NOT NULL);
+                    INSERT INTO conversations VALUES ('c_v5_1', 'Agent Run', 'sys', 40, 0, 1, 'C:/proj', 'auto', 100.0, 200.0);
+                    INSERT INTO conversations VALUES ('c_v5_missing', 'No Disk Copy', '', 30, 1, 1, '', 'manual', 100.0, 150.0);
+                    INSERT INTO messages VALUES ('m1', 'c_v5_1', 'user', 'Check repo', '', 'openai', 'OpenAI', 'gpt-4o', 'none', 10, 0, 0, 0, 0, '[]', 101.0);
+                    INSERT INTO messages VALUES ('m2', 'c_v5_1', 'assistant', 'Done.', 'thought', 'openai', 'OpenAI', 'gpt-4o', 'medium', 200, 50, 25, 450, 1230, '[{"tool":"read_file","status":"done"}]', 102.0);
+                    INSERT INTO token_ledger (conversation_id, provider_id, provider_name, model_id, prompt_tokens, completion_tokens, cached_tokens, google_search_requests, ddg_search_requests, cost_usd, created_at)
+                    VALUES ('c_v5_1', 'openai', 'OpenAI', 'gpt-4o', 200, 50, 25, 1, 3, 0.42, 102.0);
+                    """
+                )
+                conn.commit()
+
+            orig_db, orig_cfg = db_mod.DB_PATH, cfg_mod.DB_PATH
+            try:
+                db_mod.DB_PATH = cfg_mod.DB_PATH = v5_db
+                init_db()
+                self.assertEqual(SCHEMA_VERSION, 6)
+                self.assertTrue(v5_db.with_name("chatint.db.bak").is_file())
+                self.assertTrue(list((tmp_dir / "conversations").glob("c_v5_1.db.pre_v6_conflict.*")))
+
+                c1 = get_conversation("c_v5_1")
+                self.assertIsNotNone(c1)
+                self.assertEqual(c1["workspace_dir"], "C:/proj")
+                self.assertEqual(c1["agent_mode"], "auto")
+                self.assertEqual(c1["messages"][1]["worked_ms"], 1230)
+                self.assertEqual(c1["messages"][1]["tool_trace"][0]["tool"], "read_file")
+                self.assertEqual(c1["token_ledger"][0]["ddg_search_requests"], 3)
+                self.assertEqual(c1["token_stats"]["grand_total"]["total_cost"], 0.42)
+                self.assertEqual(c1["token_stats"]["grand_total"]["web_search_requests"], 4)
+
+                # Simulate partial v6 index restore where c_v5_missing.db was omitted on disk
+                get_conv_db_path("c_v5_missing").unlink()
+                c_miss = get_conversation("c_v5_missing")
+                self.assertIsNotNone(c_miss)
+                self.assertEqual(c_miss["messages"], [])
+                self.assertTrue(get_conv_db_path("c_v5_missing").is_file())
+            finally:
+                db_mod.DB_PATH = orig_db
+                cfg_mod.DB_PATH = orig_cfg
+
+        # 2. Race-safe concurrent writes across chats & anti-resurrection on delete
+        ca = create_conversation("Concurrent A")
+        cb = create_conversation("Concurrent B")
+
+        def _worker(cid: str, idx: int):
+            add_message(cid, "user", f"Q{idx}")
+            add_message(cid, "assistant", f"A{idx}", provider_id="openai", model_id="gpt-4o", prompt_tokens=10, completion_tokens=5)
+            record_token_usage(cid, "websearch", "", 0, 0, ddg_search_requests=1)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+            futs = [pool.submit(_worker, ca["id"] if i % 2 == 0 else cb["id"], i) for i in range(8)]
+            for f in futs:
+                f.result()
+
+        self.assertEqual(len(get_conversation(ca["id"])["messages"]), 8)
+        self.assertEqual(len(get_conversation(cb["id"])["messages"]), 8)
+
+        self.assertTrue(delete_conversation(ca["id"]))
+        self.assertFalse(get_conv_db_path(ca["id"]).exists())
+        self.assertIsNone(add_message(ca["id"], "assistant", "Zombie reply"))
+        self.assertFalse(record_token_usage(ca["id"], "openai", "gpt-4o", 50, 10))
+        self.assertFalse(get_conv_db_path(ca["id"]).exists())
+
+        # 3. Incremental auto_vacuum reclaims bytes on delete_messages_from
+        c_vac = create_conversation("Vacuum Chat")
+        m_keep = add_message(c_vac["id"], "user", "Keep me")
+        add_message(c_vac["id"], "assistant", "Short reply")
+        big_payload = "Z" * 350_000
+        m_big = add_message(c_vac["id"], "user", big_payload)
+        size_before = get_conv_db_size_bytes(c_vac["id"])
+        delete_messages_from(c_vac["id"], m_big["id"], include_self=True)
+        size_after = get_conv_db_size_bytes(c_vac["id"])
+        self.assertLess(size_after, size_before)
+        self.assertEqual(get_conversation(c_vac["id"])["messages"][0]["id"], m_keep["id"])
+
+        # 4. Unbounded quota normalization & byte-limit enforcement (blocking new sends, allowing edit/regen)
+        save_app_settings({"max_chat_size_mb": "0.001", "max_total_chats_size_mb": "1000000"})
+        cfg = get_app_settings()
+        self.assertEqual(cfg["max_chat_size_mb"], "0.001")
+        self.assertEqual(cfg["max_total_chats_size_mb"], "1000000")
+        save_app_settings({"max_total_chats_size_mb": "unlimited"})
+        self.assertEqual(get_app_settings()["max_total_chats_size_mb"], "0")
+        with self.assertRaises(ValueError):
+            save_app_settings({"max_chat_size_mb": "-1"})
+
+        bridge = DesktopBridge()
+        # Mock provider ready for edit/regenerate on already-oversized chat
+        with patch("chatint.client_manager.ClientManager.validate_provider_ready", return_value=None), patch.object(
+            bridge, "_start_stream", return_value="mock-stream"
+        ):
+            blocked = bridge.send_message("t1", c_vac["id"], "Over limit prompt", "openai", "gpt-4o")
+            self.assertIn("error", blocked)
+            self.assertTrue(blocked.get("quota_exceeded"))
+            # Edit and Regenerate MUST still work when over per-chat limit
+            edited = bridge.edit_message("t1", c_vac["id"], m_keep["id"], "Edited OK", "openai", "gpt-4o")
+            self.assertTrue(edited.get("success"))
+            regen_target = add_message(c_vac["id"], "assistant", "Retryable")
+            regen = bridge.regenerate_message("t1", c_vac["id"], regen_target["id"], "openai", "gpt-4o")
+            self.assertTrue(regen.get("success"))
+
+        # Total quota blocks new duplicate/import/send and recovers after delete
+        save_app_settings({"max_chat_size_mb": "0", "max_total_chats_size_mb": "0.001"})
+        summary = get_storage_summary()
+        self.assertGreater(summary["total_bytes"], 0)
+        dup_blocked = bridge.duplicate_conversation(cb["id"])
+        self.assertTrue(dup_blocked.get("quota_exceeded"))
+        imp_blocked = bridge.import_conversation_content(json.dumps({"title": "Blocked", "messages": [{"role": "user", "content": "hi"}]}), "b.json")
+        self.assertTrue(imp_blocked.get("quota_exceeded"))
+
+        # Raising total limit (or No limit) immediately unblocks duplicate & ledger import roundtrip
+        save_app_settings({"max_total_chats_size_mb": "0"})
+        imp_ok = bridge.import_conversation_content(
+            json.dumps({
+                "title": "Restored Ledger V6",
+                "messages": [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "ok"}],
+                "token_ledger": [{"provider_id": "openai", "provider_name": "OpenAI", "model_id": "gpt-4o", "prompt_tokens": 12, "completion_tokens": 8, "ddg_search_requests": 2, "cost_usd": 0.03}],
+            }),
+            "restored.json",
+        )
+        self.assertTrue(imp_ok.get("success"))
+        self.assertEqual(imp_ok["conversation"]["token_stats"]["grand_total"]["ddg_search_requests"], 2)
+        self.assertAlmostEqual(imp_ok["conversation"]["token_stats"]["grand_total"]["total_cost"], 0.03)
+
+        # 5. Sandbox blocks data/conversations and live DB paths without blocking user project .db files
+        with tempfile.TemporaryDirectory() as ws_tmp:
+            ws = Path(ws_tmp)
+            (ws / "data" / "conversations").mkdir(parents=True)
+            (ws / "data" / "conversations" / "chat1.db").write_text("secret", encoding="utf-8")
+            (ws / "user_project").mkdir()
+            (ws / "user_project" / "app.db").write_text("user ok", encoding="utf-8")
+
+            with self.assertRaises(PermissionError):
+                resolve_workspace_path(ws, "data/conversations/chat1.db")
+            self.assertFalse(tool_list_dir(ws, "data/conversations")["ok"])
+            ok_user_db = resolve_workspace_path(ws, "user_project/app.db")
+            self.assertTrue(ok_user_db.is_file())
+            with self.assertRaises(PermissionError):
+                resolve_workspace_path(get_conversations_dir().parent, f"conversations/{cb['id']}.db")
+            self.assertGreater(get_total_conv_dbs_size_bytes(), 0)
 
 
 if __name__ == "__main__":

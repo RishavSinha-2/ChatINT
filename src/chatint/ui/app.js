@@ -27,12 +27,14 @@ import {
   closeTab,
   createNewTab,
   disconnectPaneResizeObservers,
+  refreshAllPaneQuotaBanners,
   renderActivePanes,
   renderAllTabsPopover,
   renderTabs,
   syncAllPaneAgentControls,
   updateLiveApprovalCard,
   updateLiveToolTimeline,
+  updatePaneQuotaBanner,
 } from "./js/panes.js";
 import {
   closeModelConfigModal,
@@ -48,6 +50,7 @@ import {
 } from "./js/settings.js";
 import {
   MAX_IMPORT_BYTES,
+  deleteConversationById,
   downloadExport,
   handleImportedConversation,
   openConvSettingsModal,
@@ -119,11 +122,15 @@ uiHooks.scheduleNextEventPoll = scheduleNextEventPoll;
 uiHooks.renderConversationsList = renderConversationsList;
 uiHooks.openConvSettingsModal = openConvSettingsModal;
 uiHooks.openExportModal = openExportModal;
+uiHooks.openSettingsModal = openSettingsModal;
+uiHooks.deleteConversationFromUI = deleteConversationById;
 uiHooks.saveGeneralTabInputs = saveGeneralTabInputs;
 uiHooks.saveActiveProviderInputs = saveActiveProviderInputs;
 uiHooks.renderSettingsContent = renderSettingsContent;
 uiHooks.refreshProviderAccessibility = refreshProviderAccessibility;
 uiHooks.syncAllPaneAgentControls = syncAllPaneAgentControls;
+uiHooks.updatePaneQuotaBanner = updatePaneQuotaBanner;
+uiHooks.refreshPaneQuotaBanners = refreshAllPaneQuotaBanners;
 uiHooks.updateLiveToolTimeline = updateLiveToolTimeline;
 uiHooks.updateLiveApprovalCard = updateLiveApprovalCard;
 
@@ -543,16 +550,16 @@ function setupEventListeners() {
         el.allTabsPopover.classList.remove("open");
         return;
       }
+      if (el.exportModal && el.exportModal.classList.contains("open")) {
+        el.exportModal.classList.remove("open");
+        return;
+      }
       if (el.settingsModal && el.settingsModal.classList.contains("open")) {
         closeSettingsModal(false);
         return;
       }
       if (el.convSettingsModal && el.convSettingsModal.classList.contains("open")) {
         el.convSettingsModal.classList.remove("open");
-        return;
-      }
-      if (el.exportModal && el.exportModal.classList.contains("open")) {
-        el.exportModal.classList.remove("open");
       }
     } else if (!document.querySelector(".modal-overlay.open") && !e.altKey) {
       const keyLower = String(e.key || "").toLowerCase();

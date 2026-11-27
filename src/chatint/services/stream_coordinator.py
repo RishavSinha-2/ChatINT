@@ -10,6 +10,7 @@ import uuid
 from chatint.client_manager import ClientManager
 from chatint.db import (
     add_message,
+    get_conv_db_size_bytes,
     get_conversation,
     get_token_stats,
     is_default_conversation_title,
@@ -377,6 +378,7 @@ def stream_chat_completion_impl(
             )
 
     token_stats = get_token_stats(conversation_id)
+    conv_size_bytes = get_conv_db_size_bytes(conversation_id)
 
     if not stream_had_error:
         _safe_dispatch(
@@ -388,6 +390,7 @@ def stream_chat_completion_impl(
                 "stream_id": active_stream_id,
                 "message": msg_record,
                 "token_stats": token_stats,
+                "db_size_bytes": conv_size_bytes,
                 "was_aborted": abort_event.is_set(),
             },
         )
@@ -400,5 +403,6 @@ def stream_chat_completion_impl(
                 "conversation_id": conversation_id,
                 "stream_id": active_stream_id,
                 "token_stats": token_stats,
+                "db_size_bytes": conv_size_bytes,
             },
         )

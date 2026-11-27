@@ -26,7 +26,7 @@ def get_version() -> str:
     pyproject = PROJECT_ROOT / "pyproject.toml"
     with pyproject.open("rb") as f:
         data = tomllib.load(f)
-    return str(data.get("project", {}).get("version", "0.5.2"))
+    return str(data.get("project", {}).get("version", "0.5.3"))
 
 
 def compute_sha256(path: Path) -> str:
@@ -72,8 +72,12 @@ def prepare_clean_default_db() -> Path | None:
         with contextlib.closing(sqlite3.connect(source_db)) as src_conn, contextlib.closing(sqlite3.connect(clean_db)) as dst_conn:
             src_conn.backup(dst_conn)
         with contextlib.closing(sqlite3.connect(clean_db)) as conn:
+            existing_tbls = {
+                r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+            }
             for tbl in ("messages", "conversations", "token_ledger", "tab_sessions", "google_search_usage"):
-                conn.execute(f"DELETE FROM {tbl}")
+                if tbl in existing_tbls:
+                    conn.execute(f"DELETE FROM {tbl}")
             conn.execute("UPDATE providers SET api_key = ''")
             conn.execute("UPDATE app_settings SET value = '' WHERE key = 'default_workspace_dir'")
             conn.execute("UPDATE app_settings SET value = 'manual' WHERE key = 'default_agent_mode'")
@@ -112,6 +116,7 @@ def prepare_clean_default_db() -> Path | None:
         for leftover in (temp_env, clean_db.with_name(f"{clean_db.name}.bak"), clean_db.with_name(f"{clean_db.name}-wal"), clean_db.with_name(f"{clean_db.name}-shm")):
             if leftover.exists():
                 leftover.unlink()
+        shutil.rmtree(clean_dir / "conversations", ignore_errors=True)
 
     with contextlib.closing(sqlite3.connect(clean_db)) as conn:
         conn.execute("VACUUM")

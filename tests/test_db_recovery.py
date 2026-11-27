@@ -52,12 +52,16 @@ class TestDatabaseRecovery(unittest.TestCase):
         self.assertGreaterEqual(len(corrupt_files), 1)
         self.assertTrue(corrupt_files[0].read_bytes().startswith(b"CORRUPTED_SQLITE_DATA_HEADER"))
 
-        # 4. Verify new db is functional and has core tables
+        # 4. Verify new db is functional and has global v6 core tables (messages/ledger live per-conv)
         with open_db() as conn:
             tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
             self.assertIn("conversations", tables)
             self.assertIn("providers", tables)
             self.assertIn("app_settings", tables)
+            self.assertIn("tab_sessions", tables)
+            self.assertIn("google_search_usage", tables)
+            self.assertNotIn("messages", tables)
+            self.assertNotIn("token_ledger", tables)
 
     def test_corrupted_db_with_intact_backup(self):
         # 1. Initialize a valid DB first and insert a test marker
@@ -161,6 +165,52 @@ class TestDatabaseRecovery(unittest.TestCase):
             row = conn.execute("SELECT name FROM providers WHERE id = 'custom-p'").fetchone()
             self.assertIsNotNone(row)
             self.assertEqual(row["name"], "CustomProvider")
+
+    def test_per_conv_corruption_quarantine_and_bak_recovery_isolates_siblings(self):
+        import contextlib
+        import sqlite3
+        from chatint.storage.connection import get_conv_db_path, init_conv_db, open_conv_db
+        from chatint.storage.conversations_repo import add_message, create_conversation, get_conversation
+
+        init_db()
+        c_keep = create_conversation("Sibling Keep")
+        add_message(c_keep["id"], "user", "Sibling user prompt")
+        add_message(c_keep["id"], "assistant", "Sibling intact answer")
+
+        c_target = create_conversation("Recoverable Chat")
+        add_message(c_target["id"], "user", "Important prompt")
+        add_message(c_target["id"], "assistant", "Important reply")
+        target_db = get_conv_db_path(c_target["id"])
+        target_bak = target_db.with_name(f"{target_db.name}.bak")
+        with contextlib.closing(sqlite3.connect(target_db)) as src, contextlib.closing(sqlite3.connect(target_bak)) as dst:
+            src.backup(dst)
+
+        # Corrupt only c_target's DB file on disk
+        target_db.write_bytes(b"CORRUPTED_PER_CONV_BYTES" * 40)
+        init_conv_db(c_target["id"])
+
+        convs_dir = self.db_dir / "conversations"
+        quarantined = list(convs_dir.glob(f"{c_target['id']}.db.corrupted.*"))
+        self.assertGreaterEqual(len(quarantined), 1)
+
+        # Recovered c_target from its .bak without affecting sibling chat or main DB
+        recovered = get_conversation(c_target["id"])
+        self.assertIsNotNone(recovered)
+        self.assertEqual(len(recovered["messages"]), 2)
+        self.assertEqual(recovered["messages"][1]["content"], "Important reply")
+
+        sibling = get_conversation(c_keep["id"])
+        self.assertEqual(sibling["messages"][1]["content"], "Sibling intact answer")
+
+        # Corrupt c_target again WITH bad backup -> quarantines cleanly and leaves main DB & sibling untouched
+        target_bak.write_bytes(b"BAD_BAK" * 20)
+        target_db.write_bytes(b"CORRUPT_AGAIN" * 20)
+        with open_conv_db(c_target["id"]) as conn:
+            tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+            self.assertIn("messages", tables)
+            self.assertIn("token_ledger", tables)
+            self.assertIn("conv_meta", tables)
+        self.assertEqual(get_conversation(c_keep["id"])["messages"][1]["content"], "Sibling intact answer")
 
 
 if __name__ == "__main__":

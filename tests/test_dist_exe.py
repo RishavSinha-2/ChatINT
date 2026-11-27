@@ -20,7 +20,7 @@ def _resolve_dist_exe() -> Path:
         matches = sorted(dist_root.glob("**/ChatInt.exe"), key=lambda p: p.stat().st_mtime, reverse=True)
         if matches:
             return matches[0]
-    return Path("dist/v0.5.2/ChatInt.exe")
+    return Path("dist/v0.5.3/ChatInt.exe")
 
 
 DIST_EXE = _resolve_dist_exe()
@@ -105,29 +105,29 @@ class TestDistExecutable(unittest.TestCase):
                 c = conn.cursor()
                 c.execute("SELECT name FROM sqlite_master WHERE type='table'")
                 tables = {r[0] for r in c.fetchall()}
-                for required in ("conversations", "messages", "providers", "token_ledger", "app_settings"):
+                for required in ("conversations", "providers", "tab_sessions", "app_settings", "google_search_usage"):
                     self.assertIn(required, tables)
+                self.assertNotIn("messages", tables)
+                self.assertNotIn("token_ledger", tables)
 
                 c.execute("SELECT COUNT(*) FROM providers")
                 prov_count = c.fetchone()[0]
                 self.assertGreaterEqual(prov_count, 3)
 
-                self.assertEqual(c.execute("PRAGMA user_version").fetchone()[0], 5)
+                self.assertEqual(c.execute("PRAGMA user_version").fetchone()[0], 6)
                 c.execute("SELECT key, value FROM app_settings")
                 app_cfg = dict(c.fetchall())
                 self.assertEqual(app_cfg.get("use_gemini_web_search"), "false")
                 self.assertEqual(app_cfg.get("default_workspace_dir"), "")
                 self.assertEqual(app_cfg.get("default_agent_mode"), "manual")
+                self.assertEqual(app_cfg.get("max_chat_size_mb"), "50")
+                self.assertEqual(app_cfg.get("max_total_chats_size_mb"), "2048")
                 conv_cols = {r[1] for r in c.execute("PRAGMA table_info(conversations)").fetchall()}
                 self.assertIn("workspace_dir", conv_cols)
                 self.assertIn("agent_mode", conv_cols)
-                msg_cols = {r[1] for r in c.execute("PRAGMA table_info(messages)").fetchall()}
-                self.assertIn("tool_trace_json", msg_cols)
-                self.assertIn("worked_ms", msg_cols)
-                ledger_cols = {r[1] for r in c.execute("PRAGMA table_info(token_ledger)").fetchall()}
-                self.assertIn("ddg_search_requests", ledger_cols)
-                self.assertIn("provider_name", ledger_cols)
-                self.assertIn("cost_usd", ledger_cols)
+                self.assertIn("message_count", conv_cols)
+                self.assertIn("assistant_reply_count", conv_cols)
+                self.assertIn("db_size_bytes", conv_cols)
 
             proc2 = subprocess.run([str(DIST_EXE)], cwd=str(dist_dir), capture_output=True, timeout=15)
             self.assertEqual(proc2.returncode, 0, "Second instance must exit cleanly with code 0")

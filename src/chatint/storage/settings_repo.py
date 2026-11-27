@@ -1,6 +1,7 @@
 """Repository for app_settings, web_search_models, and persisted tab_sessions."""
 from __future__ import annotations
 
+from decimal import Decimal, InvalidOperation
 import json
 import time
 from typing import Any, Dict, List, Optional
@@ -21,9 +22,46 @@ ALLOWED_APP_SETTING_KEYS = {
     "use_gemini_web_search",
     "default_workspace_dir",
     "default_agent_mode",
+    "max_chat_size_mb",
+    "max_total_chats_size_mb",
 }
 _VALID_THINKING_LEVELS = {"none", "minimal", "low", "medium", "high", "xhigh", "max"}
 MAX_SETTING_VALUE_CHARS = 65_536
+_BYTES_PER_MB = Decimal(1_048_576)
+
+
+def normalize_storage_limit_mb(value: Any, setting_name: str = "storage limit") -> str:
+    """
+    Normalize a storage quota setting (in MB) with no upper architectural cap.
+    Accepts any finite non-negative number (int/decimal string) or '0'/'unlimited'/'no limit'.
+    """
+    raw = "" if value is None else str(value).strip()
+    if not raw or raw.lower() in ("0", "none", "unlimited", "no limit", "nolimit", "off"):
+        return "0"
+    try:
+        dec = Decimal(raw)
+    except (InvalidOperation, ValueError) as exc:
+        raise ValueError(f"Invalid value '{raw}' for {setting_name}.") from exc
+    if not dec.is_finite() or dec < 0:
+        raise ValueError(f"Storage limit '{setting_name}' must be 0 ('No limit') or a positive number.")
+    if dec == 0:
+        return "0"
+    norm = dec.normalize()
+    text = format(norm, "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text or "0"
+
+
+def mb_setting_to_bytes(value: Any) -> int:
+    """Convert a normalized MB quota string to exact integer bytes (`0` = No limit)."""
+    try:
+        clean = normalize_storage_limit_mb(value)
+    except ValueError:
+        return 0
+    if clean == "0":
+        return 0
+    return int((Decimal(clean) * _BYTES_PER_MB).to_integral_value())
 
 
 def get_app_settings() -> Dict[str, str]:
@@ -55,6 +93,8 @@ def save_app_settings(settings: Dict[str, Any]) -> None:
             val = "true" if val.strip().lower() in ("1", "true", "yes", "on") else "false"
         elif k == "default_agent_mode":
             val = "auto" if val.strip().lower() == "auto" else "manual"
+        elif k in ("max_chat_size_mb", "max_total_chats_size_mb"):
+            val = normalize_storage_limit_mb(val, setting_name=k)
         elif k in ("default_provider", "default_model", "default_workspace_dir"):
             val = val.strip()
         normalized_pairs.append((k, val))
