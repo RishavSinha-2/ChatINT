@@ -20,6 +20,9 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
 def get_version() -> str:
+    env_ver = os.environ.get("CHATINT_VERSION", "").strip().lstrip("vV")
+    if env_ver:
+        return env_ver
     pyproject = PROJECT_ROOT / "pyproject.toml"
     with pyproject.open("rb") as f:
         data = tomllib.load(f)
@@ -72,41 +75,46 @@ def prepare_clean_default_db() -> Path | None:
             for tbl in ("messages", "conversations", "token_ledger", "tab_sessions", "google_search_usage"):
                 conn.execute(f"DELETE FROM {tbl}")
             conn.execute("UPDATE providers SET api_key = ''")
+            conn.execute("UPDATE app_settings SET value = '' WHERE key = 'default_workspace_dir'")
+            conn.execute("UPDATE app_settings SET value = 'manual' WHERE key = 'default_agent_mode'")
             conn.commit()
-            conn.execute("VACUUM")
-    else:
-        src_dir = PROJECT_ROOT / "src"
-        if str(src_dir) not in sys.path:
-            sys.path.insert(0, str(src_dir))
 
-        import chatint.config as cfg
-        import chatint.db as db_mod
-        import chatint.storage.connection as conn_mod
-        import chatint.storage.secrets as sec_mod
+    src_dir = PROJECT_ROOT / "src"
+    if str(src_dir) not in sys.path:
+        sys.path.insert(0, str(src_dir))
 
-        orig_attrs = (
+    import chatint.config as cfg
+    import chatint.db as db_mod
+    import chatint.storage.connection as conn_mod
+    import chatint.storage.secrets as sec_mod
+
+    orig_attrs = (
+        cfg.DB_PATH,
+        cfg.ENV_PATH,
+        db_mod.DB_PATH,
+        db_mod.ENV_PATH,
+        conn_mod._DEFAULT_DB_PATH,
+        sec_mod._DEFAULT_ENV_PATH,
+    )
+    try:
+        cfg.DB_PATH = db_mod.DB_PATH = conn_mod._DEFAULT_DB_PATH = clean_db
+        cfg.ENV_PATH = db_mod.ENV_PATH = sec_mod._DEFAULT_ENV_PATH = temp_env
+        db_mod.init_db()
+    finally:
+        (
             cfg.DB_PATH,
             cfg.ENV_PATH,
             db_mod.DB_PATH,
             db_mod.ENV_PATH,
             conn_mod._DEFAULT_DB_PATH,
             sec_mod._DEFAULT_ENV_PATH,
-        )
-        try:
-            cfg.DB_PATH = db_mod.DB_PATH = conn_mod._DEFAULT_DB_PATH = clean_db
-            cfg.ENV_PATH = db_mod.ENV_PATH = sec_mod._DEFAULT_ENV_PATH = temp_env
-            db_mod.init_db()
-        finally:
-            (
-                cfg.DB_PATH,
-                cfg.ENV_PATH,
-                db_mod.DB_PATH,
-                db_mod.ENV_PATH,
-                conn_mod._DEFAULT_DB_PATH,
-                sec_mod._DEFAULT_ENV_PATH,
-            ) = orig_attrs
-            if temp_env.exists():
-                temp_env.unlink()
+        ) = orig_attrs
+        for leftover in (temp_env, clean_db.with_name(f"{clean_db.name}.bak"), clean_db.with_name(f"{clean_db.name}-wal"), clean_db.with_name(f"{clean_db.name}-shm")):
+            if leftover.exists():
+                leftover.unlink()
+
+    with contextlib.closing(sqlite3.connect(clean_db)) as conn:
+        conn.execute("VACUUM")
 
     print(f" -> Prepared clean baseline template database: {clean_db} ({clean_db.stat().st_size / 1024:.1f} KB)")
     return clean_db

@@ -112,13 +112,17 @@ hiddenimports = [
     'chatint.services',
     'chatint.services.import_export',
     'chatint.services.stream_coordinator',
+    'chatint.tools',
+    'chatint.tools.registry',
+    'chatint.tools.web_tools',
+    'chatint.tools.workspace_tools',
     'ctypes',
     'ctypes.wintypes',
     'ipaddress',
     'sqlite3',
 ]
 
-for pkg in ('webview', 'anthropic', 'openai', 'google.genai', 'google.auth', 'httpx2', 'httpx', 'certifi'):
+for pkg in ('webview', 'anthropic', 'openai', 'google.genai', 'google.auth', 'httpx2', 'httpx', 'certifi', 'ddgs', 'primp', 'lxml'):
     try:
         tmp_ret = collect_all(pkg)
         # Filter datas using the bundle destination path (item[1]) rather than the host source path (item[0])
@@ -152,7 +156,7 @@ for pkg in ('webview', 'anthropic', 'openai', 'google.genai', 'google.auth', 'ht
     except Exception:
         hiddenimports += collect_submodules(pkg)
 
-for dist_name in ('anthropic', 'google-genai', 'google-auth', 'openai', 'httpx', 'httpx2', 'pydantic', 'certifi'):
+for dist_name in ('anthropic', 'google-genai', 'google-auth', 'openai', 'httpx', 'httpx2', 'pydantic', 'certifi', 'ddgs', 'primp', 'lxml'):
     try:
         datas += [
             item for item in copy_metadata(dist_name)

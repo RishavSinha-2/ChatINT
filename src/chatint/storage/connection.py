@@ -22,7 +22,7 @@ from chatint.storage.secrets import (
 )
 
 _logger = get_logger("chatint.storage.connection")
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 5
 
 
 def _get_db_path() -> Path:
@@ -76,6 +76,8 @@ def _migration_v1(cursor: sqlite3.Cursor) -> None:
         max_context_messages INTEGER NOT NULL DEFAULT 30,
         is_imported INTEGER NOT NULL DEFAULT 0,
         is_auto_named INTEGER NOT NULL DEFAULT 0,
+        workspace_dir TEXT NOT NULL DEFAULT '',
+        agent_mode TEXT NOT NULL DEFAULT 'manual',
         created_at REAL NOT NULL,
         updated_at REAL NOT NULL
     )
@@ -100,6 +102,8 @@ def _migration_v1(cursor: sqlite3.Cursor) -> None:
         completion_tokens INTEGER NOT NULL DEFAULT 0,
         cached_tokens INTEGER NOT NULL DEFAULT 0,
         duration_ms INTEGER NOT NULL DEFAULT 0,
+        worked_ms INTEGER NOT NULL DEFAULT 0,
+        tool_trace_json TEXT NOT NULL DEFAULT '[]',
         created_at REAL NOT NULL,
         FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
     )
@@ -130,6 +134,9 @@ def _migration_v1(cursor: sqlite3.Cursor) -> None:
         completion_tokens INTEGER NOT NULL DEFAULT 0,
         cached_tokens INTEGER NOT NULL DEFAULT 0,
         google_search_requests INTEGER NOT NULL DEFAULT 0,
+        ddg_search_requests INTEGER NOT NULL DEFAULT 0,
+        provider_name TEXT NOT NULL DEFAULT '',
+        cost_usd REAL DEFAULT NULL,
         created_at REAL NOT NULL,
         FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
     )
@@ -138,6 +145,12 @@ def _migration_v1(cursor: sqlite3.Cursor) -> None:
     ledger_cols = {r["name"] for r in cursor.execute("PRAGMA table_info(token_ledger)").fetchall()}
     if "google_search_requests" not in ledger_cols:
         cursor.execute("ALTER TABLE token_ledger ADD COLUMN google_search_requests INTEGER NOT NULL DEFAULT 0")
+    if "ddg_search_requests" not in ledger_cols:
+        cursor.execute("ALTER TABLE token_ledger ADD COLUMN ddg_search_requests INTEGER NOT NULL DEFAULT 0")
+    if "provider_name" not in ledger_cols:
+        cursor.execute("ALTER TABLE token_ledger ADD COLUMN provider_name TEXT NOT NULL DEFAULT ''")
+    if "cost_usd" not in ledger_cols:
+        cursor.execute("ALTER TABLE token_ledger ADD COLUMN cost_usd REAL DEFAULT NULL")
 
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS google_search_usage (
@@ -193,10 +206,40 @@ def _migration_v3(cursor: sqlite3.Cursor) -> None:
         cursor.execute("ALTER TABLE messages ADD COLUMN provider_name TEXT NOT NULL DEFAULT ''")
 
 
+def _migration_v4(cursor: sqlite3.Cursor) -> None:
+    """Add workspace_dir, agent_mode on conversations and tool_trace_json on messages."""
+    conv_cols = {r["name"] for r in cursor.execute("PRAGMA table_info(conversations)").fetchall()}
+    if "workspace_dir" not in conv_cols:
+        cursor.execute("ALTER TABLE conversations ADD COLUMN workspace_dir TEXT NOT NULL DEFAULT ''")
+    if "agent_mode" not in conv_cols:
+        cursor.execute("ALTER TABLE conversations ADD COLUMN agent_mode TEXT NOT NULL DEFAULT 'manual'")
+
+    msg_cols = {r["name"] for r in cursor.execute("PRAGMA table_info(messages)").fetchall()}
+    if "tool_trace_json" not in msg_cols:
+        cursor.execute("ALTER TABLE messages ADD COLUMN tool_trace_json TEXT NOT NULL DEFAULT '[]'")
+
+
+def _migration_v5(cursor: sqlite3.Cursor) -> None:
+    """Add messages.worked_ms and token_ledger ddg_search_requests, provider_name, and cost_usd columns."""
+    msg_cols = {r["name"] for r in cursor.execute("PRAGMA table_info(messages)").fetchall()}
+    if "worked_ms" not in msg_cols:
+        cursor.execute("ALTER TABLE messages ADD COLUMN worked_ms INTEGER NOT NULL DEFAULT 0")
+
+    ledger_cols = {r["name"] for r in cursor.execute("PRAGMA table_info(token_ledger)").fetchall()}
+    if "ddg_search_requests" not in ledger_cols:
+        cursor.execute("ALTER TABLE token_ledger ADD COLUMN ddg_search_requests INTEGER NOT NULL DEFAULT 0")
+    if "provider_name" not in ledger_cols:
+        cursor.execute("ALTER TABLE token_ledger ADD COLUMN provider_name TEXT NOT NULL DEFAULT ''")
+    if "cost_usd" not in ledger_cols:
+        cursor.execute("ALTER TABLE token_ledger ADD COLUMN cost_usd REAL DEFAULT NULL")
+
+
 MIGRATIONS: List[Tuple[int, str, Callable[[sqlite3.Cursor], None]]] = [
     (1, "Base schema, composite indexes, and token ledger backfill", _migration_v1),
     (2, "Add conversations.is_auto_named column and backfill existing titled conversations", _migration_v2),
     (3, "Add messages.duration_ms and messages.provider_name columns", _migration_v3),
+    (4, "Add agent workspace_dir, agent_mode, and messages.tool_trace_json", _migration_v4),
+    (5, "Add messages.worked_ms and token_ledger ddg/provider_name/cost_usd columns", _migration_v5),
 ]
 
 
@@ -459,6 +502,9 @@ def _run_db_init(db_path: Path) -> None:
                 ("default_model", "gpt-4o"),
                 ("default_thinking", "medium"),
                 ("web_search_models", default_ws_models),
+                ("use_gemini_web_search", "false"),
+                ("default_workspace_dir", ""),
+                ("default_agent_mode", "manual"),
             ],
         )
 

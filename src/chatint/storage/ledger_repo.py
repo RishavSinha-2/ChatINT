@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from chatint.catalog import strip_model_prefix
 from chatint.logging_setup import get_logger
@@ -61,10 +61,20 @@ def record_token_usage(
     completion_tokens: int,
     cached_tokens: int = 0,
     google_search_requests: int = 0,
+    ddg_search_requests: int = 0,
+    provider_name: str = "",
+    cost_usd: Optional[float] = None,
 ) -> bool:
-    search_cnt = max(0, int(google_search_requests or 0))
+    g_cnt = max(0, int(google_search_requests or 0))
+    ddg_cnt = max(0, int(ddg_search_requests or 0))
+    clean_cost = float(cost_usd) if cost_usd is not None else None
     if not conversation_id or (
-        prompt_tokens == 0 and completion_tokens == 0 and cached_tokens == 0 and search_cnt == 0
+        prompt_tokens == 0
+        and completion_tokens == 0
+        and cached_tokens == 0
+        and g_cnt == 0
+        and ddg_cnt == 0
+        and clean_cost is None
     ):
         return False
     try:
@@ -72,22 +82,31 @@ def record_token_usage(
             cursor = conn.cursor()
             if not cursor.execute("SELECT 1 FROM conversations WHERE id = ?", (conversation_id,)).fetchone():
                 return False
+            resolved_prov_name = (provider_name or "").strip()
+            if not resolved_prov_name and provider_id:
+                prov_row = cursor.execute("SELECT name FROM providers WHERE id = ?", (provider_id,)).fetchone()
+                if prov_row and prov_row["name"]:
+                    resolved_prov_name = prov_row["name"]
             now = time.time()
             cursor.execute(
                 """
                 INSERT INTO token_ledger (
-                    conversation_id, provider_id, model_id,
-                    prompt_tokens, completion_tokens, cached_tokens, google_search_requests, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    conversation_id, provider_id, provider_name, model_id,
+                    prompt_tokens, completion_tokens, cached_tokens,
+                    google_search_requests, ddg_search_requests, cost_usd, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     conversation_id,
                     provider_id or "",
+                    resolved_prov_name,
                     model_id or "",
                     prompt_tokens,
                     completion_tokens,
                     cached_tokens,
-                    search_cnt,
+                    g_cnt,
+                    ddg_cnt,
+                    clean_cost,
                     now,
                 ),
             )
@@ -116,6 +135,8 @@ def get_token_stats(conversation_id: str) -> Dict[str, Any]:
                 "total_tokens": 0,
                 "total_cost": 0.0,
                 "google_search_requests": 0,
+                "ddg_search_requests": 0,
+                "web_search_requests": 0,
             },
             "active_turn_tokens": {
                 "prompt_tokens": 0,
@@ -136,20 +157,28 @@ def get_token_stats(conversation_id: str) -> Dict[str, Any]:
 
         conv_search_row = cursor.execute(
             """
-            SELECT COALESCE(SUM(google_search_requests), 0) as conv_searches
+            SELECT COALESCE(SUM(google_search_requests), 0) as conv_google_searches,
+                   COALESCE(SUM(ddg_search_requests), 0) as conv_ddg_searches
             FROM token_ledger
             WHERE conversation_id = ?
             """,
             (conversation_id,),
         ).fetchone()
-        conv_search_requests = int((conv_search_row["conv_searches"] if conv_search_row else 0) or 0)
+        conv_google_requests = int((conv_search_row["conv_google_searches"] if conv_search_row else 0) or 0)
+        conv_ddg_requests = int((conv_search_row["conv_ddg_searches"] if conv_search_row else 0) or 0)
+        conv_web_requests = conv_google_requests + conv_ddg_requests
 
         cursor.execute(
             """
             SELECT model_id, provider_id,
+                   MAX(provider_name) as ledger_provider_name,
                    SUM(prompt_tokens) as total_in,
                    SUM(completion_tokens) as total_out,
-                   SUM(cached_tokens) as total_cached
+                   SUM(cached_tokens) as total_cached,
+                   SUM(CASE WHEN cost_usd IS NULL THEN prompt_tokens ELSE 0 END) as live_in,
+                   SUM(CASE WHEN cost_usd IS NULL THEN completion_tokens ELSE 0 END) as live_out,
+                   SUM(CASE WHEN cost_usd IS NULL THEN cached_tokens ELSE 0 END) as live_cached,
+                   COALESCE(SUM(cost_usd), 0.0) as fixed_cost
             FROM token_ledger
             WHERE conversation_id = ? AND (model_id != '' OR prompt_tokens > 0)
             GROUP BY model_id, provider_id
@@ -163,9 +192,14 @@ def get_token_stats(conversation_id: str) -> Dict[str, Any]:
             cursor.execute(
                 """
                 SELECT model_id, provider_id,
+                       MAX(provider_name) as ledger_provider_name,
                        SUM(prompt_tokens) as total_in,
                        SUM(completion_tokens) as total_out,
-                       SUM(cached_tokens) as total_cached
+                       SUM(cached_tokens) as total_cached,
+                       SUM(prompt_tokens) as live_in,
+                       SUM(completion_tokens) as live_out,
+                       SUM(cached_tokens) as live_cached,
+                       0.0 as fixed_cost
                 FROM messages
                 WHERE conversation_id = ? AND role = 'assistant' AND (model_id != '' OR prompt_tokens > 0)
                 GROUP BY model_id, provider_id
@@ -256,13 +290,24 @@ def get_token_stats(conversation_id: str) -> Dict[str, Any]:
             aggregated_models[key] = {
                 "model_id": clean_mid,
                 "provider_id": pid,
+                "provider_name": "",
                 "total_in": 0,
                 "total_out": 0,
                 "total_cached": 0,
+                "live_in": 0,
+                "live_out": 0,
+                "live_cached": 0,
+                "fixed_cost": 0.0,
             }
+        if not aggregated_models[key]["provider_name"] and r["ledger_provider_name"]:
+            aggregated_models[key]["provider_name"] = str(r["ledger_provider_name"]).strip()
         aggregated_models[key]["total_in"] += r["total_in"] or 0
         aggregated_models[key]["total_out"] += r["total_out"] or 0
         aggregated_models[key]["total_cached"] += r["total_cached"] or 0
+        aggregated_models[key]["live_in"] += r["live_in"] or 0
+        aggregated_models[key]["live_out"] += r["live_out"] or 0
+        aggregated_models[key]["live_cached"] += r["live_cached"] or 0
+        aggregated_models[key]["fixed_cost"] += float(r["fixed_cost"] or 0.0)
 
     per_model = []
     grand_in = 0
@@ -290,10 +335,15 @@ def get_token_stats(conversation_id: str) -> Dict[str, Any]:
         cached_price = rates["cached_input_price"]
         out_price = rates["output_price"]
 
+        live_in = item["live_in"]
+        live_cached = item["live_cached"]
+        live_miss = max(0, live_in - live_cached)
+        live_out = item["live_out"]
         model_cost = (
-            (tmiss / 1_000_000.0) * in_price
-            + (tcached / 1_000_000.0) * cached_price
-            + (tout / 1_000_000.0) * out_price
+            (live_miss / 1_000_000.0) * in_price
+            + (live_cached / 1_000_000.0) * cached_price
+            + (live_out / 1_000_000.0) * out_price
+            + item["fixed_cost"]
         )
 
         grand_in += tin
@@ -304,7 +354,7 @@ def get_token_stats(conversation_id: str) -> Dict[str, Any]:
         per_model.append({
             "model_id": mid,
             "provider_id": pid,
-            "provider_name": provider_name_map.get(pid, ""),
+            "provider_name": provider_name_map.get(pid, "") or item["provider_name"],
             "prompt_tokens": tin,
             "completion_tokens": tout,
             "cached_tokens": tcached,
@@ -327,7 +377,9 @@ def get_token_stats(conversation_id: str) -> Dict[str, Any]:
             "cache_hit_rate": grand_hit_rate,
             "total_tokens": grand_in + grand_out,
             "total_cost": grand_cost,
-            "google_search_requests": conv_search_requests,
+            "google_search_requests": conv_google_requests,
+            "ddg_search_requests": conv_ddg_requests,
+            "web_search_requests": conv_web_requests,
         },
         "active_turn_tokens": active_turn_tokens,
         "google_search_totals": global_search_totals,

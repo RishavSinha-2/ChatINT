@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 from typing import Any, Dict, List, Optional
 
@@ -10,6 +11,7 @@ from chatint.client_manager import BackgroundModelSyncer, ClientManager
 from chatint.db import (
     PRIMARY_WEB_SEARCH_MODEL,
     get_api_key_from_env,
+    get_app_settings,
     get_web_search_models,
     record_google_search_requests,
     record_token_usage,
@@ -25,7 +27,7 @@ MAX_TOOL_ROUNDS = 10
 MAX_TOOL_CALLS_PER_PROMPT = 10
 
 _TOOL_DESCRIPTION = (
-    "Search the live web using Google Search for current events, real-time data, recent facts, "
+    "Search the live web for current events, real-time data, recent facts, "
     "prices, versions, or facts you are uncertain about. Provide a concise search query."
 )
 
@@ -34,7 +36,7 @@ _TOOL_PARAMETERS: Dict[str, Any] = {
     "properties": {
         "query": {
             "type": "string",
-            "description": "Concise search query to look up on Google Search.",
+            "description": "Concise search query to look up on the web.",
         }
     },
     "required": ["query"],
@@ -65,7 +67,7 @@ def get_web_search_system_hint() -> str:
     today = time.strftime("%Y-%m-%d")
     return (
         f"Today's date is {today}. When search is enabled, you have access to live web tools:\n"
-        f"1. `{WEB_SEARCH_TOOL_NAME}`: Live Google Search for current events, news, prices, versions, or verifiable facts.\n"
+        f"1. `{WEB_SEARCH_TOOL_NAME}`: Live web search for current events, news, prices, versions, or verifiable facts.\n"
         f"2. `{IMAGE_SEARCH_TOOL_NAME}`: Search for and retrieve relevant, high-quality images to visually illustrate and explain "
         f"concepts, landmarks, historical events, science, animals, diagrams, or products (limit: up to 3 images per call). "
         f"Use `{IMAGE_SEARCH_TOOL_NAME}` proactively whenever adding an illustration or photo helps explain the topic, as well as when the user asks for images.\n"
@@ -247,8 +249,16 @@ def _is_auth_exception_text(low: str) -> bool:
     return any(k in low for k in ("api_key_invalid", "api key not valid", "401", "403", "unauthorized", "permission denied"))
 
 
+def is_gemini_web_search_enabled() -> bool:
+    """Return True only when the user explicitly opts into Gemini-grounded Google Search."""
+    return str(get_app_settings().get("use_gemini_web_search", "false")).strip().lower() == "true"
+
+
 def is_web_search_available() -> tuple[bool, str]:
-    """Check whether Gemini credentials and at least one configured Web Search model are ready."""
+    """Check whether Web Search is ready (DuckDuckGo by default, or Gemini when opted in)."""
+    if not is_gemini_web_search_enabled():
+        return True, ""
+
     provider = ClientManager.get_provider("gemini")
     if not provider:
         return False, "NO API KEY"
@@ -334,11 +344,155 @@ def _extract_concise_facts(raw_text: str) -> tuple[str, List[str]]:
     return summary, fallback_facts[:6]
 
 
+def execute_ddg_web_search(
+    query: str,
+    max_results: int = 6,
+    conversation_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Execute a keyless web search using ddgs and track actual per-chat HTTP requests sent."""
+    clean_query = (query or "").strip()[:300]
+    if not clean_query:
+        return {
+            "ok": False,
+            "query": "",
+            "provider_used": "duckduckgo",
+            "queries_executed": [],
+            "search_requests_used": 0,
+            "ddg_requests_used": 0,
+            "error": "Empty search query.",
+            "sources": [],
+            "results": [],
+        }
+
+    limit = max(1, min(int(max_results or 6), 10))
+    raw_results: List[Dict[str, Any]] = []
+    last_exc: Optional[Exception] = None
+    http_req_count = 0
+    text_attempts = 0
+    req_lock = threading.Lock()
+    try:
+        from ddgs import DDGS
+
+        ddg_client = DDGS(timeout=12)
+        if callable(getattr(type(ddg_client), "_get_engines", None)):
+            orig_get_engines = ddg_client._get_engines
+
+            def _counting_get_engines(category: str, backend: str, _orig=orig_get_engines):
+                engines = _orig(category, backend)
+                for eng in engines or ():
+                    hc = getattr(eng, "http_client", None)
+                    if hc is not None and not getattr(hc, "_chatint_counted", False):
+                        orig_req = getattr(hc, "request", None)
+                        if callable(orig_req):
+                            def _counted_req(*args: Any, _orig_req=orig_req, **kwargs: Any):
+                                nonlocal http_req_count
+                                with req_lock:
+                                    http_req_count += 1
+                                return _orig_req(*args, **kwargs)
+
+                            hc.request = _counted_req
+                            hc._chatint_counted = True
+                return engines
+
+            ddg_client._get_engines = _counting_get_engines
+
+        for backend_group in ("auto", "startpage, yahoo, duckduckgo, wikipedia"):
+            text_attempts += 1
+            try:
+                candidate = ddg_client.text(
+                    clean_query,
+                    max_results=max(limit, 8),
+                    backend=backend_group,
+                )
+                if candidate:
+                    raw_results = list(candidate)[:limit]
+                    last_exc = None
+                    break
+            except Exception as bk_exc:
+                last_exc = bk_exc
+        if not raw_results and last_exc is not None:
+            raise last_exc
+    except Exception as exc:
+        ddg_requests_used = http_req_count if http_req_count > 0 else text_attempts
+        if conversation_id and ddg_requests_used > 0:
+            record_token_usage(
+                conversation_id=conversation_id,
+                provider_id="websearch",
+                model_id="",
+                prompt_tokens=0,
+                completion_tokens=0,
+                cached_tokens=0,
+                ddg_search_requests=ddg_requests_used,
+            )
+        _logger.warning("DuckDuckGo metasearch failed for %r: %s", clean_query, exc)
+        return {
+            "ok": False,
+            "query": clean_query,
+            "provider_used": "duckduckgo",
+            "queries_executed": [clean_query],
+            "search_requests_used": 0,
+            "ddg_requests_used": ddg_requests_used,
+            "error": str(exc) or "Web search failed.",
+            "sources": [],
+            "results": [],
+        }
+
+    ddg_requests_used = http_req_count if http_req_count > 0 else text_attempts
+    if conversation_id and ddg_requests_used > 0:
+        record_token_usage(
+            conversation_id=conversation_id,
+            provider_id="websearch",
+            model_id="",
+            prompt_tokens=0,
+            completion_tokens=0,
+            cached_tokens=0,
+            ddg_search_requests=ddg_requests_used,
+        )
+
+    results: List[Dict[str, str]] = []
+    sources: List[Dict[str, str]] = []
+    key_facts: List[str] = []
+    seen_urls: set[str] = set()
+
+    for item in raw_results or []:
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("title") or "").strip()
+        url = str(item.get("href") or item.get("url") or "").strip()
+        snippet = str(item.get("body") or item.get("snippet") or "").strip()
+        if not title and not snippet and not url:
+            continue
+        results.append({"title": title or url, "url": url, "snippet": snippet})
+        if url and url not in seen_urls:
+            seen_urls.add(url)
+            sources.append({"title": title or url, "url": url})
+        fact_line = f"{title}: {snippet}".strip(": ") if title else snippet
+        if fact_line:
+            key_facts.append(fact_line)
+
+    summary = key_facts[0] if key_facts else ""
+    return {
+        "ok": len(results) > 0,
+        "query": clean_query,
+        "provider_used": "duckduckgo",
+        "queries_executed": [clean_query],
+        "search_requests_used": 0,
+        "ddg_requests_used": ddg_requests_used,
+        "answer": summary,
+        "key_facts": key_facts[:6],
+        "results": results,
+        "sources": sources[:6],
+    }
+
+
 def execute_web_search(query: str, conversation_id: Optional[str] = None) -> Dict[str, Any]:
     """
-    Execute a Google Search using gemini-3.1-flash-lite (with native GoogleSearch grounding)
-    and return a compact structured JSON-ready dict for the active chat model.
+    Execute a live web search: uses keyless DuckDuckGo metasearch by default,
+    or Gemini-grounded Google Search when `use_gemini_web_search` is enabled.
     """
+    if not is_gemini_web_search_enabled():
+        return execute_ddg_web_search(query, conversation_id=conversation_id)
+
     from google.genai import types as genai_types
 
     clean_query = (query or "").strip()[:300]
@@ -346,6 +500,7 @@ def execute_web_search(query: str, conversation_id: Optional[str] = None) -> Dic
         return {
             "ok": False,
             "query": "",
+            "provider_used": "gemini",
             "queries_executed": [],
             "search_requests_used": 0,
             "error": "Empty search query.",
@@ -492,6 +647,7 @@ def execute_web_search(query: str, conversation_id: Optional[str] = None) -> Dic
     return {
         "ok": True,
         "query": clean_query,
+        "provider_used": "gemini",
         "model_used": used_model_id,
         "queries_executed": queries_executed,
         "search_requests_used": search_requests_used,

@@ -113,6 +113,13 @@ export function formatTokenSpeed(completionTokens, durationMs) {
   return `${tps >= 100 ? Math.round(tps) : tps.toFixed(1)} tok/s`;
 }
 
+export function formatWorkedDuration(workedMs) {
+  const ms = Number(workedMs) || 0;
+  if (ms <= 0) return "";
+  const rounded = Math.max(0.1, Number((ms / 1000).toFixed(1)));
+  return `${rounded}s`;
+}
+
 export function generateClientStreamId() {
   return "stream_" + Date.now() + "_" + Math.random().toString(36).slice(2, 10);
 }
@@ -142,6 +149,9 @@ export const state = {
     default_provider: "openai",
     default_model: "gpt-4o",
     default_thinking: "medium",
+    use_gemini_web_search: "false",
+    default_workspace_dir: "",
+    default_agent_mode: "manual",
   },
   conversations: [],
   recentlyDeletedConvIds: new Set(),
@@ -247,7 +257,13 @@ export function getDropdownProviders() {
   });
 }
 
-export function getWebSearchAvailability(geminiProvider = null, wsModelsList = null) {
+export function getWebSearchAvailability(geminiProvider = null, wsModelsList = null, appSettings = null) {
+  const settingsObj = appSettings || state.settings || {};
+  const useGemini = String(settingsObj.use_gemini_web_search || "false").trim().toLowerCase() === "true";
+  if (!useGemini) {
+    return { available: true, reason: "Web Search (DuckDuckGo — works with any model)" };
+  }
+
   const gemini = geminiProvider || state.providers.find((p) => p.id === "gemini");
   const hasKey =
     gemini && !gemini.clear_api_key && Boolean(gemini.has_api_key || (gemini.api_key && gemini.api_key.trim()));
@@ -285,6 +301,24 @@ export function getWebSearchAvailability(geminiProvider = null, wsModelsList = n
   return { available: true, reason: "Web Search (Google Search via configured Gemini search models)" };
 }
 
+export function getEffectiveWorkspaceDir(tab) {
+  const tabWs = String(tab?.workspaceDir || "").trim();
+  if (tabWs) return tabWs;
+  return String(state.settings?.default_workspace_dir || "").trim();
+}
+
+export function getEffectiveAgentMode(tab) {
+  const mode = tab?.agentMode || state.settings?.default_agent_mode || "manual";
+  return String(mode).toLowerCase() === "auto" ? "auto" : "manual";
+}
+
+export function getWorkspaceLabel(pathStr) {
+  const clean = String(pathStr || "").trim();
+  if (!clean) return "No Workspace";
+  const parts = clean.split(/[\\/]+/).filter(Boolean);
+  return parts.length ? parts[parts.length - 1] : clean;
+}
+
 export function resetTabStreamBuffers(tab) {
   if (!tab) return;
   tab.streamingContent = "";
@@ -292,6 +326,8 @@ export function resetTabStreamBuffers(tab) {
   tab.hasAutoCollapsedThinking = false;
   tab.isActivelyThinking = false;
   tab.activeToolStatus = null;
+  tab.toolSteps = [];
+  tab.pendingApproval = null;
 }
 
 export function createTabObject(overrides = {}) {
@@ -335,10 +371,19 @@ export function createTabObject(overrides = {}) {
     _userSelectedThinking: Boolean(overrides.userSelectedThinking),
     _usingTempFallback: false,
     webSearchEnabled: Boolean(overrides.webSearchEnabled),
+    agentEnabled: Boolean(overrides.agentEnabled),
+    agentMode: overrides.agentMode === "auto"
+      ? "auto"
+      : (overrides.agentMode === "manual"
+        ? "manual"
+        : (state.settings?.default_agent_mode === "auto" ? "auto" : "manual")),
+    workspaceDir: String(overrides.workspaceDir || ""),
     draftInput: overrides.draftInput || "",
     hasUnansweredPrompt: Boolean(overrides.hasUnansweredPrompt),
     pendingUserDraft: null,
     activeToolStatus: null,
+    toolSteps: Array.isArray(overrides.toolSteps) ? overrides.toolSteps : [],
+    pendingApproval: overrides.pendingApproval || null,
     _streamGen: 0,
     isStreaming: false,
     activeStreamId: null,

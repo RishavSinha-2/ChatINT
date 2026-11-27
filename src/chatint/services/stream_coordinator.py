@@ -1,6 +1,7 @@
 """Stream lifecycle registry, background auto-naming, and completion coordinator."""
 from __future__ import annotations
 
+import inspect
 import threading
 import time
 from typing import Any, Callable, Dict, List, Optional
@@ -25,28 +26,83 @@ _logger = get_logger("chatint.services.stream_coordinator")
 class StreamManager:
     _streams_by_tab: Dict[str, tuple[str, threading.Event, str]] = {}
     _streams_by_id: Dict[str, tuple[str, threading.Event, str]] = {}
+    _pending_approvals: Dict[tuple[str, str], Dict[str, Any]] = {}
     _lock = threading.Lock()
+
+    @classmethod
+    def _wake_approvals_for_stream(cls, stream_id: str, decision: str = "deny") -> None:
+        for (sid, aid), entry in list(cls._pending_approvals.items()):
+            if sid == stream_id:
+                if entry.get("decision") is None:
+                    entry["decision"] = decision
+                entry["event"].set()
+
+    @classmethod
+    def request_approval(
+        cls,
+        tab_id: str,
+        stream_id: str,
+        approval_id: str,
+        abort_event: threading.Event,
+        timeout: float = 300.0,
+    ) -> str:
+        """Block the stream thread waiting for user approval, abort, or timeout."""
+        ev = threading.Event()
+        key = (stream_id, approval_id)
+        with cls._lock:
+            cls._pending_approvals[key] = {"event": ev, "decision": None, "tab_id": tab_id}
+
+        deadline = time.monotonic() + max(1.0, float(timeout))
+        try:
+            while not abort_event.is_set():
+                if ev.wait(timeout=0.1):
+                    with cls._lock:
+                        entry = cls._pending_approvals.get(key)
+                        decision = str((entry or {}).get("decision") or "deny")
+                    return decision if decision in ("allow_once", "allow_all_tab", "deny") else "deny"
+                if time.monotonic() >= deadline:
+                    return "deny"
+            return "deny"
+        finally:
+            with cls._lock:
+                cls._pending_approvals.pop(key, None)
+
+    @classmethod
+    def resolve_approval(cls, stream_id: str, approval_id: str, decision: str) -> bool:
+        """Resolve a pending tool approval request and wake the blocked stream thread."""
+        clean_decision = decision if decision in ("allow_once", "allow_all_tab", "deny") else "deny"
+        with cls._lock:
+            entry = cls._pending_approvals.get((stream_id, approval_id))
+            if not entry:
+                return False
+            entry["decision"] = clean_decision
+            entry["event"].set()
+            return True
 
     @classmethod
     def abort_stream(cls, tab_id: str, stream_id: Optional[str] = None) -> None:
         with cls._lock:
             if stream_id and stream_id in cls._streams_by_id:
                 cls._streams_by_id[stream_id][1].set()
+                cls._wake_approvals_for_stream(stream_id, "deny")
             entry = cls._streams_by_tab.get(tab_id)
             if entry:
                 entry[1].set()
+                cls._wake_approvals_for_stream(entry[0], "deny")
 
     @classmethod
     def abort_conversation(cls, conversation_id: str) -> None:
         if not conversation_id:
             return
         with cls._lock:
-            for _sid, (_tid, ev, cid) in list(cls._streams_by_id.items()):
+            for sid, (_tid, ev, cid) in list(cls._streams_by_id.items()):
                 if cid == conversation_id:
                     ev.set()
-            for _tid, (_sid, ev, cid) in list(cls._streams_by_tab.items()):
+                    cls._wake_approvals_for_stream(sid, "deny")
+            for _tid, (sid, ev, cid) in list(cls._streams_by_tab.items()):
                 if cid == conversation_id:
                     ev.set()
+                    cls._wake_approvals_for_stream(sid, "deny")
 
     @classmethod
     def register_stream(
@@ -68,6 +124,7 @@ class StreamManager:
             prev = cls._streams_by_tab.get(tab_id)
             if prev and prev[0] != sid:
                 prev[1].set()
+                cls._wake_approvals_for_stream(prev[0], "deny")
 
             event = threading.Event()
             cls._streams_by_tab[tab_id] = (sid, event, conversation_id or "")
@@ -79,6 +136,7 @@ class StreamManager:
         with cls._lock:
             if stream_id:
                 cls._streams_by_id.pop(stream_id, None)
+                cls._wake_approvals_for_stream(stream_id, "deny")
                 cur = cls._streams_by_tab.get(tab_id)
                 if cur and cur[0] == stream_id:
                     cls._streams_by_tab.pop(tab_id, None)
@@ -86,6 +144,7 @@ class StreamManager:
                 cur = cls._streams_by_tab.pop(tab_id, None)
                 if cur:
                     cls._streams_by_id.pop(cur[0], None)
+                    cls._wake_approvals_for_stream(cur[0], "deny")
 
 
 def run_auto_naming(
@@ -164,6 +223,9 @@ def stream_chat_completion_impl(
     *,
     sdk_streamers: Dict[str, Callable[..., Any]],
     auto_naming_fn: Callable[..., None],
+    agent_enabled: bool = False,
+    workspace_dir: str = "",
+    agent_mode: str = "manual",
 ) -> None:
     """Coordinate provider streaming, partial/aborted token persistence, auto-naming, and final done event."""
     active_stream_id = stream_id or str(uuid.uuid4())
@@ -173,6 +235,36 @@ def stream_chat_completion_impl(
     provider_name = (provider.get("name") if provider else "") or ""
     sdk_type = ClientManager.get_sdk_type(provider, provider_id)
     stream_fn = sdk_streamers.get(sdk_type) or sdk_streamers["openai"]
+    norm_agent_mode = "auto" if str(agent_mode or "manual").strip().lower() == "auto" else "manual"
+    tool_trace_collector: List[Dict[str, Any]] = []
+    timing_stats_collector: Dict[str, int] = {"model_ms": 0}
+
+    stream_kwargs: Dict[str, Any] = {
+        "bridge": bridge,
+        "tab_id": tab_id,
+        "conversation_id": conversation_id,
+        "messages": messages,
+        "provider_id": provider_id,
+        "model_id": model_id,
+        "thinking_level": thinking_level,
+        "assistant_msg_id": assistant_msg_id,
+        "abort_event": abort_event,
+        "user_question": user_question,
+        "web_search_enabled": bool(web_search_enabled),
+        "stream_id": active_stream_id,
+    }
+    try:
+        sig = inspect.signature(stream_fn)
+        has_varkw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+        if has_varkw or "agent_enabled" in sig.parameters:
+            stream_kwargs["agent_enabled"] = bool(agent_enabled)
+            stream_kwargs["workspace_dir"] = str(workspace_dir or "").strip()
+            stream_kwargs["agent_mode"] = norm_agent_mode
+            stream_kwargs["tool_trace"] = tool_trace_collector
+        if has_varkw or "timing_stats" in sig.parameters:
+            stream_kwargs["timing_stats"] = timing_stats_collector
+    except (TypeError, ValueError):
+        pass
 
     t_start = time.perf_counter()
     try:
@@ -185,20 +277,7 @@ def stream_chat_completion_impl(
                 cached_tokens,
                 stream_had_error,
                 actual_thinking_level,
-            ) = stream_fn(
-                bridge=bridge,
-                tab_id=tab_id,
-                conversation_id=conversation_id,
-                messages=messages,
-                provider_id=provider_id,
-                model_id=model_id,
-                thinking_level=thinking_level,
-                assistant_msg_id=assistant_msg_id,
-                abort_event=abort_event,
-                user_question=user_question,
-                web_search_enabled=bool(web_search_enabled),
-                stream_id=active_stream_id,
-            )
+            ) = stream_fn(**stream_kwargs)
         except Exception as e:
             _logger.exception("Unhandled streaming exception on tab=%s conv=%s", tab_id, conversation_id)
             _emit_error(
@@ -207,7 +286,10 @@ def stream_chat_completion_impl(
             return
     finally:
         StreamManager.unregister_stream(tab_id, stream_id=active_stream_id)
-    duration_ms = max(0, int(round((time.perf_counter() - t_start) * 1000)))
+    wall_ms = max(0, int(round((time.perf_counter() - t_start) * 1000)))
+    model_ms = max(0, int(timing_stats_collector.get("model_ms") or 0))
+    duration_ms = model_ms if model_ms > 0 else wall_ms
+    worked_ms = wall_ms
 
     final_content_str = "".join(full_content).strip()
     final_thinking_str = "".join(full_thinking).strip()
@@ -271,7 +353,9 @@ def stream_chat_completion_impl(
         cached_tokens=cached_tokens,
         msg_id=assistant_msg_id,
         duration_ms=duration_ms,
+        worked_ms=worked_ms,
         provider_name=provider_name,
+        tool_trace=tool_trace_collector,
     )
     if msg_record is None:
         return

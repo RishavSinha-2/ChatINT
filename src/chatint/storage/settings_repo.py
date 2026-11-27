@@ -18,6 +18,9 @@ ALLOWED_APP_SETTING_KEYS = {
     "default_model",
     "default_thinking",
     "web_search_models",
+    "use_gemini_web_search",
+    "default_workspace_dir",
+    "default_agent_mode",
 }
 _VALID_THINKING_LEVELS = {"none", "minimal", "low", "medium", "high", "xhigh", "max"}
 MAX_SETTING_VALUE_CHARS = 65_536
@@ -48,7 +51,11 @@ def save_app_settings(settings: Dict[str, Any]) -> None:
         elif k == "default_thinking":
             low = val.strip().lower()
             val = low if low in _VALID_THINKING_LEVELS else "medium"
-        elif k in ("default_provider", "default_model"):
+        elif k == "use_gemini_web_search":
+            val = "true" if val.strip().lower() in ("1", "true", "yes", "on") else "false"
+        elif k == "default_agent_mode":
+            val = "auto" if val.strip().lower() == "auto" else "manual"
+        elif k in ("default_provider", "default_model", "default_workspace_dir"):
             val = val.strip()
         normalized_pairs.append((k, val))
 

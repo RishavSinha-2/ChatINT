@@ -4,34 +4,32 @@ from __future__ import annotations
 import json
 import re
 import threading
+import time
 from typing import Any, Dict, List, Optional
 
 from chatint.client_manager import ClientManager
 from chatint.logging_setup import get_logger
 from chatint.providers.base import (
     ProviderAdapter,
-    _append_search_system_hint,
     _emit_api_error,
     _emit_chunk,
     _emit_error,
     _emit_start,
     _ensure_post_tool_separator,
     _ensure_post_tool_thinking_separator,
+    _execute_adapter_tool_call,
     _flush_think_buffer,
     _prepare_system_and_turns,
+    _prepare_tool_session,
     _process_text_with_think_tags,
+    _record_model_ms,
     _resolve_search_enabled,
     _run_web_search_tool_call,
     clear_resolved_thinking_cache,
     get_unified_thinking_chain,
     record_resolved_thinking_level,
 )
-from chatint.web_search_tool import (
-    MAX_TOOL_CALLS_PER_PROMPT,
-    MAX_TOOL_ROUNDS,
-    get_anthropic_image_tool_spec,
-    get_anthropic_tool_spec,
-)
+from chatint.tools import to_anthropic_tools
 
 _logger = get_logger("chatint.providers.anthropic")
 
@@ -130,6 +128,11 @@ class AnthropicAdapter(ProviderAdapter):
         user_question: str,
         web_search_enabled: bool = False,
         stream_id: Optional[str] = None,
+        agent_enabled: bool = False,
+        workspace_dir: str = "",
+        agent_mode: str = "manual",
+        tool_trace: Optional[List[Dict[str, Any]]] = None,
+        timing_stats: Optional[Dict[str, int]] = None,
     ) -> tuple[List[str], List[str], int, int, int, bool, str]:
         return _stream_anthropic(
             bridge=bridge,
@@ -144,6 +147,11 @@ class AnthropicAdapter(ProviderAdapter):
             user_question=user_question,
             web_search_enabled=web_search_enabled,
             stream_id=stream_id,
+            agent_enabled=agent_enabled,
+            workspace_dir=workspace_dir,
+            agent_mode=agent_mode,
+            tool_trace=tool_trace,
+            timing_stats=timing_stats,
         )
 
 
@@ -160,6 +168,11 @@ def _stream_anthropic(
     user_question: str,
     web_search_enabled: bool = False,
     stream_id: Optional[str] = None,
+    agent_enabled: bool = False,
+    workspace_dir: str = "",
+    agent_mode: str = "manual",
+    tool_trace: Optional[List[Dict[str, Any]]] = None,
+    timing_stats: Optional[Dict[str, int]] = None,
 ) -> tuple[List[str], List[str], int, int, int, bool, str]:
     import anthropic
 
@@ -178,17 +191,31 @@ def _stream_anthropic(
 
     try:
         system_prompt, raw_turns = _prepare_system_and_turns(messages)
-        search_enabled = _resolve_search_enabled(web_search_enabled)
-        system_prompt = _append_search_system_hint(system_prompt, search_enabled)
+        (
+            search_enabled,
+            clean_ws,
+            active_specs,
+            system_prompt,
+            max_tool_rounds,
+            max_tool_calls,
+            runtime_state,
+        ) = _prepare_tool_session(
+            web_search_enabled=web_search_enabled,
+            agent_enabled=bool(agent_enabled),
+            workspace_dir=workspace_dir,
+            agent_mode=agent_mode,
+            system_prompt=system_prompt,
+            resolve_search_fn=_resolve_search_enabled,
+        )
         turns: List[Dict[str, Any]] = list(raw_turns)
-        anthropic_tools = [get_anthropic_tool_spec(), get_anthropic_image_tool_spec()] if search_enabled else []
+        anthropic_tools = to_anthropic_tools(active_specs)
 
         has_emitted_start = False
         stream_had_error = False
         actual_thinking_level = "none"
         total_executed_tool_calls = 0
 
-        for tool_round in range(MAX_TOOL_ROUNDS + 1):
+        for tool_round in range(max_tool_rounds + 1):
             if abort_event.is_set():
                 break
             if tool_round > 0:
@@ -209,6 +236,7 @@ def _stream_anthropic(
 
             response_stream = None
             last_api_err = None
+            round_api_start: Optional[float] = None
             try:
                 for effort in effort_chain:
                     if abort_event.is_set():
@@ -218,8 +246,8 @@ def _stream_anthropic(
                     for cand in effort_candidates:
                         if (
                             anthropic_tools
-                            and tool_round < MAX_TOOL_ROUNDS
-                            and total_executed_tool_calls < MAX_TOOL_CALLS_PER_PROMPT
+                            and tool_round < max_tool_rounds
+                            and total_executed_tool_calls < max_tool_calls
                         ):
                             attempt_list.append({**base_kwargs, **cand, "tools": anthropic_tools})
                         attempt_list.append({**base_kwargs, **cand})
@@ -229,7 +257,9 @@ def _stream_anthropic(
                         if abort_event.is_set():
                             break
                         try:
+                            attempt_start = time.perf_counter()
                             response_stream = client.messages.create(**attempt_kwargs)
+                            round_api_start = attempt_start
                             actual_thinking_level = effort if effort is not None else "none"
                             record_resolved_thinking_level(provider_id, model_id, thinking_level, actual_thinking_level)
                             last_api_err = None
@@ -467,6 +497,8 @@ def _stream_anthropic(
                     stream_had_error,
                     actual_thinking_level,
                 )
+            finally:
+                _record_model_ms(timing_stats, round_api_start)
 
             _flush_think_buffer(
                 think_buffer,
@@ -484,7 +516,7 @@ def _stream_anthropic(
 
             ordered_blocks = [blocks_by_idx[i] for i in sorted(blocks_by_idx)]
             tool_calls = [b for b in ordered_blocks if b.get("type") == "tool_use"]
-            if not tool_calls or abort_event.is_set() or tool_round >= MAX_TOOL_ROUNDS:
+            if not tool_calls or abort_event.is_set() or tool_round >= max_tool_rounds:
                 break
 
             assistant_blocks: List[Dict[str, Any]] = []
@@ -525,20 +557,27 @@ def _stream_anthropic(
                     continue
                 if abort_event.is_set():
                     break
-                if total_executed_tool_calls >= MAX_TOOL_CALLS_PER_PROMPT:
+                if total_executed_tool_calls >= max_tool_calls:
                     res = {
                         "ok": False,
-                        "error": f"Tool call budget limit ({MAX_TOOL_CALLS_PER_PROMPT}) reached for this prompt.",
+                        "error": f"Tool call budget limit ({max_tool_calls}) reached for this prompt.",
                     }
                 else:
-                    res = _run_web_search_tool_call(
-                        bridge,
-                        tab_id,
-                        conversation_id,
-                        tb["name"],
-                        tb.get("input") or {},
-                        abort_event,
+                    res = _execute_adapter_tool_call(
+                        bridge=bridge,
+                        tab_id=tab_id,
+                        conversation_id=conversation_id,
+                        tool_name=tb["name"],
+                        raw_args=tb.get("input") or {},
+                        abort_event=abort_event,
                         stream_id=stream_id,
+                        call_id=tb.get("id"),
+                        workspace_dir=clean_ws,
+                        runtime_state=runtime_state,
+                        tool_trace=tool_trace,
+                        web_search_enabled=search_enabled,
+                        agent_enabled=bool(agent_enabled),
+                        web_runner=_run_web_search_tool_call,
                     )
                     total_executed_tool_calls += 1
                 tool_results.append({

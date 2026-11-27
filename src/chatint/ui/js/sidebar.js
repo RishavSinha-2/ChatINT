@@ -14,11 +14,13 @@ import {
   createTabObject,
   el,
   escapeHtml,
+  getEffectiveAgentMode,
   refreshPaneHeaderLabels,
   renderIcons,
   resetTabStreamBuffers,
   sanitizeSplitTabIds,
   state,
+  uiHooks,
 } from "./state.js";
 
 export const MAX_IMPORT_BYTES = 25 * 1024 * 1024;
@@ -66,6 +68,9 @@ export function renderConversationsList() {
             title: newConv.title,
             systemPrompt: newConv.system_prompt || (activeTab ? activeTab.systemPrompt : ""),
             maxContextMessages: newConv.max_context_messages || (activeTab ? activeTab.maxContextMessages : 30),
+            workspaceDir: newConv.workspace_dir !== undefined ? newConv.workspace_dir : (activeTab ? activeTab.workspaceDir : ""),
+            agentMode: newConv.agent_mode || (activeTab ? activeTab.agentMode : "manual"),
+            agentEnabled: activeTab ? activeTab.agentEnabled : false,
             providerId: activeTab ? (activeTab._preferredProviderId || activeTab.providerId) : undefined,
             modelId: activeTab ? (activeTab._preferredModelId || activeTab.modelId) : undefined,
             thinkingLevel: activeTab ? (activeTab._preferredThinkingLevel || activeTab.thinkingLevel) : undefined,
@@ -145,6 +150,8 @@ export function renderConversationsList() {
               t.title = "New Chat";
               t.systemPrompt = "";
               t.maxContextMessages = 30;
+              t.workspaceDir = "";
+              t.agentMode = state.settings?.default_agent_mode === "auto" ? "auto" : "manual";
               t.hasUnansweredPrompt = false;
               t.pendingUserDraft = null;
               resetTabStreamBuffers(t);
@@ -183,6 +190,8 @@ export function renderConversationsList() {
             activeTab.title = conv.title;
             activeTab.systemPrompt = conv.system_prompt || "";
             activeTab.maxContextMessages = conv.max_context_messages || 30;
+            activeTab.workspaceDir = conv.workspace_dir || "";
+            activeTab.agentMode = conv.agent_mode || (state.settings?.default_agent_mode === "auto" ? "auto" : "manual");
             activeTab.hasUnansweredPrompt = false;
             activeTab.pendingUserDraft = null;
             resetTabStreamBuffers(activeTab);
@@ -213,6 +222,8 @@ export async function openConvSettingsModal(tabOrId) {
   let currentTitle = tab.title || "New Chat";
   let currentPrompt = tab.systemPrompt || "";
   let currentLimit = tab.maxContextMessages || 30;
+  let currentWorkspace = tab.workspaceDir || "";
+  let currentAgentMode = getEffectiveAgentMode(tab);
 
   if (tab.conversationId) {
     try {
@@ -221,6 +232,8 @@ export async function openConvSettingsModal(tabOrId) {
         currentTitle = conv.title || currentTitle;
         currentPrompt = conv.system_prompt !== undefined ? conv.system_prompt : currentPrompt;
         currentLimit = conv.max_context_messages || currentLimit;
+        currentWorkspace = conv.workspace_dir !== undefined ? (conv.workspace_dir || "") : currentWorkspace;
+        currentAgentMode = conv.agent_mode === "auto" ? "auto" : (conv.agent_mode === "manual" ? "manual" : currentAgentMode);
       }
     } catch (e) {
       console.warn("[openConvSettingsModal] Error fetching conv:", e);
@@ -231,6 +244,30 @@ export async function openConvSettingsModal(tabOrId) {
   el.convSystemPromptInput.value = currentPrompt;
   el.convContextSlider.value = currentLimit;
   el.convContextLimitVal.textContent = currentLimit;
+
+  const convWsInput = document.getElementById("conv-workspace-input");
+  const convWsBrowseBtn = document.getElementById("conv-workspace-browse-btn");
+  const convWsClearBtn = document.getElementById("conv-workspace-clear-btn");
+  const convAgentModeSelect = document.getElementById("conv-agent-mode-select");
+  if (convWsInput) convWsInput.value = currentWorkspace;
+  if (convAgentModeSelect) convAgentModeSelect.value = currentAgentMode;
+  if (convWsBrowseBtn) {
+    convWsBrowseBtn.onclick = async () => {
+      const res = await callApi("select_workspace_folder");
+      if (res && res.error) {
+        showNoticeDialog(res.error);
+        return;
+      }
+      if (res && !res.cancelled && res.path && convWsInput) {
+        convWsInput.value = res.path;
+      }
+    };
+  }
+  if (convWsClearBtn) {
+    convWsClearBtn.onclick = () => {
+      if (convWsInput) convWsInput.value = "";
+    };
+  }
 
   el.convContextSlider.oninput = () => {
     el.convContextLimitVal.textContent = el.convContextSlider.value;
@@ -249,25 +286,46 @@ export async function saveConvSettings() {
   const newTitle = el.convTitleInput.value.trim() || "New Chat";
   const newPrompt = el.convSystemPromptInput.value.trim();
   const newLimit = parseInt(el.convContextSlider.value, 10) || 30;
-
-  tab.title = newTitle;
-  tab.systemPrompt = newPrompt;
-  tab.maxContextMessages = newLimit;
+  const convWsInput = document.getElementById("conv-workspace-input");
+  const convAgentModeSelect = document.getElementById("conv-agent-mode-select");
+  const newWorkspace = convWsInput ? convWsInput.value.trim() : (tab.workspaceDir || "");
+  const newAgentMode = convAgentModeSelect && convAgentModeSelect.value === "auto" ? "auto" : "manual";
 
   if (tab.conversationId) {
+    const updRes = await callApi("update_conversation_settings", tab.conversationId, newPrompt, newLimit, newWorkspace, newAgentMode);
+    if (updRes && updRes.error) {
+      showNoticeDialog(updRes.error);
+      return;
+    }
     const renameRes = await callApi("rename_conversation", tab.conversationId, newTitle);
-    await callApi("update_conversation_settings", tab.conversationId, newPrompt, newLimit);
-
     const resolvedTitle = (renameRes && renameRes.title) || newTitle;
     tab.title = resolvedTitle;
+    tab.systemPrompt = newPrompt;
+    tab.maxContextMessages = newLimit;
+    tab.workspaceDir = newWorkspace;
+    tab.agentMode = newAgentMode;
+
     const conv = state.conversations.find((c) => c.id === tab.conversationId);
     if (conv) {
       conv.title = resolvedTitle;
       conv.system_prompt = newPrompt;
       conv.max_context_messages = newLimit;
+      conv.workspace_dir = newWorkspace;
+      conv.agent_mode = newAgentMode;
     }
+    state.tabs.forEach((otherTab) => {
+      if (otherTab.conversationId === tab.conversationId) {
+        otherTab.workspaceDir = newWorkspace;
+        otherTab.agentMode = newAgentMode;
+      }
+    });
   } else {
-    const conv = await callApi("create_conversation", newTitle, newPrompt, newLimit);
+    tab.title = newTitle;
+    tab.systemPrompt = newPrompt;
+    tab.maxContextMessages = newLimit;
+    tab.workspaceDir = newWorkspace;
+    tab.agentMode = newAgentMode;
+    const conv = await callApi("create_conversation", newTitle, newPrompt, newLimit, newWorkspace, newAgentMode);
     if (conv && conv.id) {
       tab.conversationId = conv.id;
       if (conv.title) tab.title = conv.title;
@@ -279,6 +337,7 @@ export async function saveConvSettings() {
   renderConversationsList();
   renderTabs();
   refreshPaneHeaderLabels();
+  uiHooks.syncAllPaneAgentControls?.();
 }
 
 export function openExportModal(convId) {
@@ -364,6 +423,9 @@ export function handleImportedConversation(newConv) {
     title: newConv.title,
     systemPrompt: newConv.system_prompt || "",
     maxContextMessages: newConv.max_context_messages || 30,
+    workspaceDir: newConv.workspace_dir || "",
+    agentMode: newConv.agent_mode || (state.settings?.default_agent_mode === "auto" ? "auto" : "manual"),
+    agentEnabled: activeTab ? activeTab.agentEnabled : false,
     providerId: activeTab ? (activeTab._preferredProviderId || activeTab.providerId) : undefined,
     modelId: activeTab ? (activeTab._preferredModelId || activeTab.modelId) : undefined,
     thinkingLevel: activeTab ? (activeTab._preferredThinkingLevel || activeTab.thinkingLevel) : undefined,

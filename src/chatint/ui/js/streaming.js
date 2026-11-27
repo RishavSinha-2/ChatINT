@@ -213,16 +213,61 @@ export function onStreamEvent(event) {
       tool: event.tool,
       query: event.query || "",
       ok: Boolean(event.ok),
+      provider_used: event.provider_used || "",
+      results_count: Number(event.results_count || 0),
       images_found: Number(event.images_found || 0),
       search_requests_used: Number(event.search_requests_used || 0),
     };
+    if (!Array.isArray(tab.toolSteps)) tab.toolSteps = [];
+    const callId = event.call_id || `step-${tab.toolSteps.length + 1}`;
+    const existingIdx = tab.toolSteps.findIndex((s) => s.call_id === callId);
+    const stepRecord = {
+      call_id: callId,
+      tool: event.tool || "tool",
+      status: event.status || "running",
+      summary: event.summary || (event.query ? `${event.tool}: ${event.query}` : String(event.tool || "")),
+      args_preview: event.args_preview || event.query || "",
+      result_preview: event.result_preview || "",
+      diff: event.diff || "",
+      duration_ms: Number(event.duration_ms || 0),
+    };
+    if (existingIdx !== -1) {
+      tab.toolSteps[existingIdx] = { ...tab.toolSteps[existingIdx], ...stepRecord };
+    } else {
+      tab.toolSteps.push(stepRecord);
+    }
     if (pane && messagesContainer) {
       const toolBanner = document.getElementById(`live-tool-status-${tab.id}`);
       if (toolBanner) {
         renderToolStatusBanner(toolBanner, tab.activeToolStatus);
-        messagesContainer.scrollTop = messagesContainer.scrollHeight;
       }
+      uiHooks.updateLiveToolTimeline?.(tab.id);
+      messagesContainer.scrollTop = messagesContainer.scrollHeight;
     }
+  } else if (event.type === "tool_approval_required") {
+    tab.pendingApproval = {
+      approval_id: event.approval_id || "",
+      call_id: event.call_id || "",
+      stream_id: event.stream_id || tab.activeStreamId || "",
+      tool: event.tool || "write_file",
+      path: event.path || "",
+      summary: event.summary || "Approve workspace file modification",
+      diff: event.diff || "",
+      resolving: false,
+    };
+    if (pane && messagesContainer) {
+      uiHooks.updateLiveApprovalCard?.(tab.id);
+      messagesContainer.scrollTop = messagesContainer.scrollHeight;
+    }
+  } else if (event.type === "agent_mode_changed") {
+    const nextMode = event.agent_mode === "auto" ? "auto" : "manual";
+    tab.agentMode = nextMode;
+    if (tab.conversationId) {
+      const conv = state.conversations.find((c) => c.id === tab.conversationId);
+      if (conv) conv.agent_mode = nextMode;
+    }
+    persistTabsState();
+    uiHooks.syncAllPaneAgentControls?.();
   } else if (event.type === "thinking_chunk") {
     tab.streamingThinking += event.chunk || "";
     if (event.chunk && String(event.chunk).trim().length > 0) {
@@ -315,9 +360,19 @@ export function onStreamEvent(event) {
     tab._streamGen = (tab._streamGen || 0) + 1;
     tab.isStreaming = false;
     tab.activeStreamId = null;
+    tab.pendingApproval = null;
     tab.lastStreamError = event.error || "Streaming error";
 
     if (pane && messagesContainer) {
+      if (Array.isArray(tab.toolSteps) && tab.toolSteps.length > 0) {
+        tab.toolSteps = tab.toolSteps.map((s) =>
+          (s.status === "running" || s.status === "searching" || s.status === "awaiting_approval")
+            ? { ...s, status: "error" }
+            : s
+        );
+        uiHooks.updateLiveToolTimeline?.(tab.id);
+      }
+      uiHooks.updateLiveApprovalCard?.(tab.id);
       if (tab.streamingThinking || tab.streamingContent) {
         tab.isActivelyThinking = false;
         applyLiveStreamRender(tab.id);

@@ -15,11 +15,15 @@ import {
   formatCost,
   formatTokenSpeed,
   formatTokens,
+  formatWorkedDuration,
   generateClientStreamId,
   getDefaultThinkingLevel,
   getDropdownProviders,
+  getEffectiveAgentMode,
+  getEffectiveWorkspaceDir,
   getVerifiedProviderModels,
   getWebSearchAvailability,
+  getWorkspaceLabel,
   refreshPaneHeaderLabels,
   renderIcons,
   resetTabStreamBuffers,
@@ -356,6 +360,9 @@ export async function branchActiveTabToSplitPane() {
     title: newConv.title,
     systemPrompt: newConv.system_prompt || activeTab.systemPrompt || "",
     maxContextMessages: newConv.max_context_messages || activeTab.maxContextMessages || 30,
+    workspaceDir: newConv.workspace_dir !== undefined ? (newConv.workspace_dir || "") : (activeTab.workspaceDir || ""),
+    agentMode: newConv.agent_mode || activeTab.agentMode || "manual",
+    agentEnabled: Boolean(activeTab.agentEnabled),
     providerId: activeTab._preferredProviderId || activeTab.providerId,
     modelId: activeTab._preferredModelId || activeTab.modelId,
     thinkingLevel: activeTab._preferredThinkingLevel || activeTab.thinkingLevel,
@@ -575,10 +582,28 @@ export function createPaneElement(tab, index, totalPanes) {
         <textarea class="chat-input" id="input-${tab.id}" rows="1" placeholder="Ask anything..."></textarea>
         <div class="input-controls">
           <div class="input-model-hint" id="hint-${tab.id}">
-            <button type="button" class="web-search-toggle-btn" id="web-search-btn-${tab.id}" aria-pressed="false" title="Toggle Web Search">
-              <i data-lucide="globe" style="width: 13px; height: 13px;"></i>
-              <span>Web Search</span>
+            <span class="ws-btn-wrap" id="ws-wrap-${tab.id}">
+              <button type="button" class="web-search-toggle-btn" id="web-search-btn-${tab.id}" aria-pressed="false" title="Toggle Web Search">
+                <i data-lucide="globe" style="width: 13px; height: 13px;"></i>
+                <span>Web Search</span>
+              </button>
+            </span>
+            <button type="button" class="web-search-toggle-btn agent-toggle-btn" id="agent-mode-btn-${tab.id}" aria-pressed="false" title="Toggle Agent Tools (Workspace Files & URL Fetch)">
+              <i data-lucide="bot" style="width: 13px; height: 13px;"></i>
+              <span>Agent</span>
             </button>
+            <button type="button" class="agent-policy-pill" id="agent-policy-btn-${tab.id}" style="display: none;" title="Toggle Agent Approval Mode (Manual vs Auto)">
+              <span class="agent-policy-text">Manual</span>
+            </button>
+            <div class="workspace-pill-group" id="workspace-group-${tab.id}">
+              <button type="button" class="workspace-pill-btn" id="workspace-btn-${tab.id}" title="Select Workspace Folder for Agent Tools">
+                <i data-lucide="folder" style="width: 12px; height: 12px;"></i>
+                <span class="workspace-pill-label" id="workspace-label-${tab.id}">No Workspace</span>
+              </button>
+              <button type="button" class="workspace-clear-btn" id="workspace-clear-btn-${tab.id}" style="display: none;" title="Clear Per-Chat Workspace Override">
+                <i data-lucide="x" style="width: 11px; height: 11px;"></i>
+              </button>
+            </div>
           </div>
           <div style="display: flex; gap: 6px;">
             <button class="stop-btn" id="stop-btn-${tab.id}" style="display: none;" title="Stop Generating">
@@ -792,7 +817,7 @@ export function updatePaneModelDropdown(pane, tab) {
 }
 
 export function updatePaneWebSearchButton(pane, tab) {
-  const hintEl = pane.querySelector(`#hint-${tab.id}`);
+  const wrapEl = pane.querySelector(`#ws-wrap-${tab.id}`) || pane.querySelector(`#hint-${tab.id}`);
   const btn = pane.querySelector(`#web-search-btn-${tab.id}`);
   if (!btn) return;
   const { available, reason } = getWebSearchAvailability();
@@ -801,12 +826,12 @@ export function updatePaneWebSearchButton(pane, tab) {
   btn.classList.toggle("active", active);
   btn.setAttribute("aria-pressed", active ? "true" : "false");
   btn.title = reason;
-  if (hintEl) {
-    hintEl.title = reason;
+  if (wrapEl) {
+    wrapEl.title = reason;
     if (!available && reason) {
-      hintEl.setAttribute("data-tooltip", reason);
+      wrapEl.setAttribute("data-tooltip", reason);
     } else {
-      hintEl.removeAttribute("data-tooltip");
+      wrapEl.removeAttribute("data-tooltip");
     }
   }
 }
@@ -820,6 +845,262 @@ export function syncAllPaneWebSearchButtons() {
       updatePaneWebSearchButton(paneEl, targetTab);
     }
   });
+}
+
+export function updatePaneAgentControls(pane, tab) {
+  if (!pane || !tab) return;
+  const agentBtn = pane.querySelector(`#agent-mode-btn-${tab.id}`);
+  const policyBtn = pane.querySelector(`#agent-policy-btn-${tab.id}`);
+  const wsBtn = pane.querySelector(`#workspace-btn-${tab.id}`);
+  const wsLabelEl = pane.querySelector(`#workspace-label-${tab.id}`);
+  const wsClearBtn = pane.querySelector(`#workspace-clear-btn-${tab.id}`);
+
+  const agentOn = Boolean(tab.agentEnabled);
+  const mode = getEffectiveAgentMode(tab);
+  const overrideWs = String(tab.workspaceDir || "").trim();
+  const effectiveWs = getEffectiveWorkspaceDir(tab);
+
+  if (agentBtn) {
+    agentBtn.classList.toggle("active", agentOn);
+    agentBtn.setAttribute("aria-pressed", agentOn ? "true" : "false");
+    agentBtn.title = agentOn
+      ? "Agent Mode ON (file read/write + URL fetch enabled)"
+      : "Agent Mode OFF (click to enable workspace tools & URL fetch)";
+  }
+  if (policyBtn) {
+    policyBtn.style.display = agentOn ? "inline-flex" : "none";
+    policyBtn.classList.toggle("is-auto", mode === "auto");
+    const txtEl = policyBtn.querySelector(".agent-policy-text");
+    if (txtEl) txtEl.textContent = mode === "auto" ? "Auto" : "Manual";
+    policyBtn.title = mode === "auto"
+      ? "Auto Mode: writes and edits execute automatically (click for Manual)"
+      : "Manual Mode: prompts before writing or editing files (click for Auto)";
+  }
+  if (wsLabelEl) {
+    wsLabelEl.textContent = getWorkspaceLabel(effectiveWs);
+  }
+  if (wsBtn) {
+    wsBtn.classList.toggle("has-workspace", Boolean(effectiveWs));
+    wsBtn.title = effectiveWs
+      ? `${effectiveWs} (${overrideWs ? "Per-Chat Override" : "Global Default"}) — click to change`
+      : "No Workspace folder set — click to choose a folder for file tools";
+  }
+  if (wsClearBtn) {
+    wsClearBtn.style.display = overrideWs ? "inline-flex" : "none";
+  }
+}
+
+export function syncAllPaneAgentControls() {
+  if (!el.panesContainer) return;
+  el.panesContainer.querySelectorAll(".chat-pane").forEach((paneEl) => {
+    const tabId = paneEl.dataset.tabId;
+    const targetTab = state.tabs.find((t) => t.id === tabId);
+    if (targetTab) {
+      updatePaneAgentControls(paneEl, targetTab);
+    }
+  });
+}
+
+function formatDurationLabel(ms) {
+  const val = Number(ms || 0);
+  if (!val || val <= 0) return "";
+  if (val < 1000) return `${Math.round(val)} ms`;
+  return `${(val / 1000).toFixed(1)} s`;
+}
+
+function formatUnifiedDiffHtml(diffText) {
+  const lines = String(diffText || "").split(/\r?\n/).slice(0, 120);
+  return lines
+    .map((line) => {
+      let cls = "ctx";
+      if (line.startsWith("+++") || line.startsWith("---")) cls = "meta";
+      else if (line.startsWith("@@")) cls = "hunk";
+      else if (line.startsWith("+")) cls = "add";
+      else if (line.startsWith("-")) cls = "del";
+      return `<span class="diff-line ${cls}">${escapeHtml(line)}</span>`;
+    })
+    .join("\n");
+}
+
+function renderStepStatusIcon(status) {
+  if (status === "running" || status === "searching") {
+    return '<span class="tool-step-dot active"></span>';
+  }
+  if (status === "awaiting_approval") {
+    return '<span class="tool-step-dot waiting"></span>';
+  }
+  if (status === "denied") {
+    return '<i data-lucide="slash" style="width: 11px; height: 11px; color: #f59e0b;"></i>';
+  }
+  if (status === "error") {
+    return '<i data-lucide="alert-circle" style="width: 11px; height: 11px; color: #e53935;"></i>';
+  }
+  return '<i data-lucide="check" style="width: 11px; height: 11px; color: #34a853;"></i>';
+}
+
+export function buildToolTimelineHtml(steps, { isStreaming = false, collapsed = true } = {}) {
+  if (!Array.isArray(steps) || steps.length === 0) return "";
+  const activeStep = steps.find(
+    (s) => s.status === "running" || s.status === "searching" || s.status === "awaiting_approval"
+  );
+  const totalMs = steps.reduce((acc, s) => acc + Number(s.duration_ms || 0), 0);
+  const durLabel = formatDurationLabel(totalMs);
+  const issueCount = steps.filter((s) => s.status === "error" || s.status === "denied").length;
+
+  let headerText = "";
+  if (activeStep) {
+    headerText = activeStep.summary || `Running ${activeStep.tool}...`;
+  } else {
+    const noun = steps.length === 1 ? "tool" : "tools";
+    headerText = `Used ${steps.length} ${noun}`;
+    if (durLabel) headerText += ` · ${durLabel}`;
+    if (issueCount > 0) headerText += ` · ${issueCount} ${issueCount === 1 ? "issue" : "issues"}`;
+  }
+
+  const stepsHtml = steps
+    .map((step) => {
+      const st = step.status || "done";
+      const durText = formatDurationLabel(step.duration_ms);
+      const hasDiff = Boolean(step.diff && String(step.diff).trim());
+      const hasPreview = Boolean(step.result_preview && String(step.result_preview).trim());
+      const detailBlock = hasDiff || hasPreview
+        ? `<details class="tool-step-details">
+            <summary>${hasDiff ? "View diff" : "Result preview"}</summary>
+            ${
+              hasDiff
+                ? `<pre class="tool-diff-view">${formatUnifiedDiffHtml(step.diff)}</pre>`
+                : `<pre class="tool-result-preview">${escapeHtml(step.result_preview)}</pre>`
+            }
+          </details>`
+        : "";
+      return `
+        <div class="tool-timeline-step status-${escapeHtml(st)}">
+          <div class="tool-step-main">
+            <span class="tool-step-status">${renderStepStatusIcon(st)}</span>
+            <code class="tool-chip">${escapeHtml(step.tool || "tool")}</code>
+            <span class="tool-step-summary">${escapeHtml(step.summary || step.args_preview || step.tool || "")}</span>
+            ${durText ? `<span class="tool-step-duration">${escapeHtml(durText)}</span>` : ""}
+          </div>
+          ${detailBlock}
+        </div>
+      `;
+    })
+    .join("");
+
+  const collapsedCls = collapsed ? " collapsed" : "";
+  const leftIndicator = activeStep && isStreaming
+    ? '<div class="thinking-pulse"></div>'
+    : '<i data-lucide="wrench" style="width: 12px; height: 12px; color: var(--accent-color);"></i>';
+
+  return `
+    <div class="tool-timeline-accordion${collapsedCls}">
+      <div class="tool-timeline-header">
+        <div class="tool-timeline-title-left">
+          ${leftIndicator}
+          <span style="font-weight: 500;">${escapeHtml(headerText)}</span>
+        </div>
+        <i data-lucide="chevron-down" class="tool-timeline-toggle-icon" style="width: 13px; height: 13px;"></i>
+      </div>
+      <div class="tool-timeline-body">${stepsHtml}</div>
+    </div>
+  `;
+}
+
+export function updateLiveToolTimeline(tabId) {
+  const tab = state.tabs.find((t) => t.id === tabId);
+  const slot = document.getElementById(`live-tool-timeline-${tabId}`);
+  if (!tab || !slot) return;
+  if (!Array.isArray(tab.toolSteps) || tab.toolSteps.length === 0) {
+    slot.innerHTML = "";
+    slot.style.display = "none";
+    return;
+  }
+  const prevAcc = slot.querySelector(".tool-timeline-accordion");
+  const userToggled = prevAcc?.dataset?.userToggled === "1";
+  const wasCollapsed = prevAcc ? prevAcc.classList.contains("collapsed") : false;
+  const shouldCollapse = userToggled ? wasCollapsed : !tab.isStreaming;
+  slot.style.display = "block";
+  slot.innerHTML = buildToolTimelineHtml(tab.toolSteps, {
+    isStreaming: Boolean(tab.isStreaming),
+    collapsed: shouldCollapse,
+  });
+  if (userToggled) {
+    const newAcc = slot.querySelector(".tool-timeline-accordion");
+    if (newAcc) newAcc.dataset.userToggled = "1";
+  }
+  renderIcons(slot);
+}
+
+export function renderLiveApprovalCard(slotEl, tab) {
+  if (!slotEl) return;
+  const pa = tab?.pendingApproval;
+  if (!pa) {
+    slotEl.innerHTML = "";
+    slotEl.style.display = "none";
+    return;
+  }
+  slotEl.style.display = "block";
+  const diffSection = pa.diff && String(pa.diff).trim()
+    ? `<pre class="tool-diff-view approval-diff-preview">${formatUnifiedDiffHtml(pa.diff)}</pre>`
+    : `<div class="approval-summary-note">${escapeHtml(pa.summary || "Confirm file modification inside workspace.")}</div>`;
+  const disabledAttr = pa.resolving ? " disabled" : "";
+
+  slotEl.innerHTML = `
+    <div class="tool-approval-card" data-approval-id="${escapeHtml(pa.approval_id)}">
+      <div class="tool-approval-header">
+        <div class="tool-approval-title">
+          <i data-lucide="shield-alert" style="width: 14px; height: 14px; color: #f59e0b;"></i>
+          <span>Permission Required</span>
+          <code class="tool-chip">${escapeHtml(pa.tool || "write_file")}</code>
+        </div>
+        <span class="approval-path">${escapeHtml(pa.path || "")}</span>
+      </div>
+      ${diffSection}
+      <div class="tool-approval-actions">
+        <button type="button" class="btn-primary approval-allow-btn" data-decision="allow_once"${disabledAttr}>Allow</button>
+        <button type="button" class="btn-secondary approval-auto-btn" data-decision="allow_all_tab"${disabledAttr}>Switch Tab to Auto</button>
+        <button type="button" class="btn-danger approval-deny-btn" data-decision="deny"${disabledAttr}>Deny</button>
+      </div>
+    </div>
+  `;
+
+  slotEl.querySelectorAll("button[data-decision]").forEach((btn) => {
+    btn.onclick = async () => {
+      if (!tab.pendingApproval || tab.pendingApproval.resolving) return;
+      const decision = btn.getAttribute("data-decision") || "deny";
+      tab.pendingApproval.resolving = true;
+      slotEl.querySelectorAll("button[data-decision]").forEach((b) => {
+        b.disabled = true;
+      });
+      btn.textContent = "Submitting...";
+      const res = await callApi(
+        "resolve_tool_approval",
+        tab.id,
+        pa.stream_id || tab.activeStreamId || "",
+        pa.approval_id,
+        decision
+      );
+      if (res && res.error) {
+        if (tab.pendingApproval) tab.pendingApproval.resolving = false;
+        renderLiveApprovalCard(slotEl, tab);
+        showNoticeDialog(res.error);
+        return;
+      }
+      if (tab.pendingApproval && tab.pendingApproval.approval_id === pa.approval_id) {
+        tab.pendingApproval = null;
+        renderLiveApprovalCard(slotEl, tab);
+      }
+    };
+  });
+  renderIcons(slotEl);
+}
+
+export function updateLiveApprovalCard(tabId) {
+  const tab = state.tabs.find((t) => t.id === tabId);
+  const slot = document.getElementById(`live-approval-slot-${tabId}`);
+  if (tab && slot) {
+    renderLiveApprovalCard(slot, tab);
+  }
 }
 
 export function syncAllPaneModelDropdowns() {
@@ -845,7 +1126,9 @@ export function renderToolStatusBanner(toolBanner, toolState) {
     if (toolState.tool === "image_search") {
       toolBanner.innerHTML = `<i data-lucide="image" style="width: 12px; height: 12px; color: var(--accent-color);"></i><span>Searching images${toolState.query ? `: "${escapeHtml(toolState.query)}"` : "..."}</span>`;
     } else {
-      toolBanner.innerHTML = `<i data-lucide="globe" style="width: 12px; height: 12px;"></i><span>Searching Google${toolState.query ? `: "${escapeHtml(toolState.query)}"` : "..."}</span>`;
+      const useGemini = String(state.settings?.use_gemini_web_search || "false").toLowerCase() === "true";
+      const label = useGemini ? "Searching Google" : "Searching web";
+      toolBanner.innerHTML = `<i data-lucide="globe" style="width: 12px; height: 12px;"></i><span>${label}${toolState.query ? `: "${escapeHtml(toolState.query)}"` : "..."}</span>`;
     }
     renderIcons(toolBanner);
   } else if (toolState.status === "done") {
@@ -862,9 +1145,16 @@ export function renderToolStatusBanner(toolBanner, toolState) {
       }
     } else {
       const reqUsed = Number(toolState.search_requests_used || 0);
+      const resCount = Number(toolState.results_count || 0);
       if (toolState.ok) {
         toolBanner.style.display = "inline-flex";
-        toolBanner.innerHTML = `<i data-lucide="check" style="width: 12px; height: 12px; color: #34a853;"></i><span>Google Search complete (${reqUsed} ${reqUsed === 1 ? "request" : "requests"})</span>`;
+        const isGemini = toolState.provider_used === "gemini" || reqUsed > 0;
+        const doneText = isGemini
+          ? `Google Search complete (${reqUsed} ${reqUsed === 1 ? "request" : "requests"})`
+          : (resCount > 0
+              ? `Web search complete (${resCount} ${resCount === 1 ? "result" : "results"})`
+              : "Web search complete");
+        toolBanner.innerHTML = `<i data-lucide="check" style="width: 12px; height: 12px; color: #34a853;"></i><span>${doneText}</span>`;
       } else {
         toolBanner.style.display = "none";
       }
@@ -907,6 +1197,8 @@ export function createLiveStreamingRow(tab) {
       <div class="thinking-body" id="live-thinking-body-${tab.id}"></div>
     </div>
     <div class="tool-status-banner" id="live-tool-status-${tab.id}" style="display: none;"></div>
+    <div class="live-tool-timeline-slot" id="live-tool-timeline-${tab.id}" style="display: none;"></div>
+    <div class="live-approval-slot" id="live-approval-slot-${tab.id}" style="display: none;"></div>
     <div class="assistant-markdown-content" id="live-content-${tab.id}"></div>
   `;
 
@@ -916,6 +1208,19 @@ export function createLiveStreamingRow(tab) {
   }
   if (tab.activeToolStatus) {
     renderToolStatusBanner(liveRow.querySelector(`#live-tool-status-${tab.id}`), tab.activeToolStatus);
+  }
+  if (Array.isArray(tab.toolSteps) && tab.toolSteps.length > 0) {
+    const timelineSlot = liveRow.querySelector(`#live-tool-timeline-${tab.id}`);
+    if (timelineSlot) {
+      timelineSlot.style.display = "block";
+      timelineSlot.innerHTML = buildToolTimelineHtml(tab.toolSteps, {
+        isStreaming: Boolean(tab.isStreaming),
+        collapsed: !tab.isStreaming,
+      });
+    }
+  }
+  if (tab.pendingApproval) {
+    renderLiveApprovalCard(liveRow.querySelector(`#live-approval-slot-${tab.id}`), tab);
   }
   if (tab.streamingContent) {
     const contentDiv = liveRow.querySelector(`#live-content-${tab.id}`);
@@ -1071,7 +1376,10 @@ export function appendStreamErrorBanner(tab, pane, messagesContainer, errorText,
       tab.lastStreamError = null;
       tab.activeStreamId = clientStreamId;
       setTabStreamingUI(pane, tab, true);
-      const useWebSearch = Boolean(tab.webSearchEnabled && getWebSearchAvailability().available);
+        const useWebSearch = Boolean(tab.webSearchEnabled && getWebSearchAvailability().available);
+        const useAgent = Boolean(tab.agentEnabled);
+        const wsDirArg = String(tab.workspaceDir || "").trim();
+        const modeArg = getEffectiveAgentMode(tab);
 
       try {
         let res = null;
@@ -1086,7 +1394,10 @@ export function appendStreamErrorBanner(tab, pane, messagesContainer, errorText,
             tab.modelId,
             tab.thinkingLevel,
             useWebSearch,
-            clientStreamId
+            clientStreamId,
+            useAgent,
+            wsDirArg,
+            modeArg
           );
         } else {
           res = await callApi(
@@ -1101,7 +1412,10 @@ export function appendStreamErrorBanner(tab, pane, messagesContainer, errorText,
             tab.systemPrompt || "",
             tab.maxContextMessages || 30,
             useWebSearch,
-            clientStreamId
+            clientStreamId,
+            useAgent,
+            wsDirArg,
+            modeArg
           );
         }
         if (!res || res.error) {
@@ -1142,6 +1456,28 @@ export async function populatePaneContent(pane, tab) {
 
   updatePaneModelDropdown(pane, tab);
   updatePaneWebSearchButton(pane, tab);
+  updatePaneAgentControls(pane, tab);
+
+  const persistConvAgentState = () => {
+    const mode = getEffectiveAgentMode(tab);
+    const ws = String(tab.workspaceDir || "").trim();
+    if (tab.conversationId) {
+      const conv = state.conversations.find((c) => c.id === tab.conversationId);
+      if (conv) {
+        conv.workspace_dir = ws;
+        conv.agent_mode = mode;
+      }
+      callApi(
+        "update_conversation_settings",
+        tab.conversationId,
+        tab.systemPrompt || "",
+        tab.maxContextMessages || 30,
+        ws,
+        mode
+      ).catch(() => {});
+    }
+    persistTabsState();
+  };
 
   if (branchBtn) {
     branchBtn.onclick = () => {
@@ -1157,6 +1493,50 @@ export async function populatePaneContent(pane, tab) {
       tab.webSearchEnabled = !tab.webSearchEnabled;
       updatePaneWebSearchButton(pane, tab);
       persistTabsState();
+    };
+  }
+
+  const agentBtn = pane.querySelector(`#agent-mode-btn-${tab.id}`);
+  if (agentBtn) {
+    agentBtn.onclick = () => {
+      tab.agentEnabled = !tab.agentEnabled;
+      updatePaneAgentControls(pane, tab);
+      persistTabsState();
+    };
+  }
+
+  const policyBtn = pane.querySelector(`#agent-policy-btn-${tab.id}`);
+  if (policyBtn) {
+    policyBtn.onclick = () => {
+      tab.agentMode = getEffectiveAgentMode(tab) === "auto" ? "manual" : "auto";
+      updatePaneAgentControls(pane, tab);
+      persistConvAgentState();
+    };
+  }
+
+  const wsBtn = pane.querySelector(`#workspace-btn-${tab.id}`);
+  if (wsBtn) {
+    wsBtn.onclick = async () => {
+      const res = await callApi("select_workspace_folder");
+      if (res && res.error) {
+        showNoticeDialog(res.error);
+        return;
+      }
+      if (res && !res.cancelled && res.path) {
+        tab.workspaceDir = res.path;
+        updatePaneAgentControls(pane, tab);
+        persistConvAgentState();
+      }
+    };
+  }
+
+  const wsClearBtn = pane.querySelector(`#workspace-clear-btn-${tab.id}`);
+  if (wsClearBtn) {
+    wsClearBtn.onclick = (e) => {
+      e.stopPropagation();
+      tab.workspaceDir = "";
+      updatePaneAgentControls(pane, tab);
+      persistConvAgentState();
     };
   }
 
@@ -1263,6 +1643,9 @@ export async function populatePaneContent(pane, tab) {
     messagesContainer.innerHTML = "";
     tab.systemPrompt = conv.system_prompt || tab.systemPrompt || "";
     tab.maxContextMessages = conv.max_context_messages || tab.maxContextMessages || 30;
+    if (conv.workspace_dir !== undefined) tab.workspaceDir = conv.workspace_dir || "";
+    if (conv.agent_mode) tab.agentMode = conv.agent_mode === "auto" ? "auto" : "manual";
+    updatePaneAgentControls(pane, tab);
 
     if (conv.messages && conv.messages.length > 0) {
       tab.tokenStats = conv.token_stats;
@@ -1346,6 +1729,11 @@ export function createMessageElement(tab, msg, pane) {
       `;
     }
 
+    const traceHtml =
+      Array.isArray(msg.tool_trace) && msg.tool_trace.length > 0
+        ? buildToolTimelineHtml(msg.tool_trace, { isStreaming: false, collapsed: true })
+        : "";
+
     let tokensTag = "";
     if (msg.prompt_tokens || msg.completion_tokens) {
       const cachedStr = msg.cached_tokens ? ` (${formatTokens(msg.cached_tokens)} cached)` : "";
@@ -1356,17 +1744,24 @@ export function createMessageElement(tab, msg, pane) {
       tokensTag = `<span class="msg-token-meta"${durTitle}>${formatTokens(msg.prompt_tokens)} in / ${formatTokens(msg.completion_tokens)} out${cachedStr}${speedPart}</span>`;
     }
 
+    const workedStr = !isSystemMsg ? formatWorkedDuration(msg.worked_ms) : "";
+    const workedMetaHtml = workedStr
+      ? `<div class="assistant-worked-meta" title="Total time: ${(Number(msg.worked_ms) / 1000).toFixed(2)}s">Worked for ${escapeHtml(workedStr)}</div>`
+      : "";
+
     const provDataAttrs = isSystemMsg
       ? ""
       : ` data-provider-id="${escapeHtml(rawProvId)}" data-provider-name="${escapeHtml(rawProvName)}"`;
 
     row.innerHTML = `
+      ${workedMetaHtml}
       <div class="assistant-header-badge">
         <span class="provider-tag"${provDataAttrs}>${escapeHtml(provTag)}</span>
         <span>${escapeHtml(modelTag)}${escapeHtml(thinkBadge)}</span>
         ${tokensTag}
       </div>
       ${thinkingHtml}
+      ${traceHtml}
       <div class="assistant-markdown-content">${renderMarkdownWithEnhancements(msg.content)}</div>
       <div class="assistant-actions">
         <button class="assistant-action-btn copy-msg-btn" title="Copy response">
@@ -1402,6 +1797,9 @@ export function createMessageElement(tab, msg, pane) {
         setTabStreamingUI(pane, tab, true);
         const realMsgId = row.dataset.msgId || msg.id;
         const useWebSearch = Boolean(tab.webSearchEnabled && getWebSearchAvailability().available);
+        const useAgent = Boolean(tab.agentEnabled);
+        const wsDirArg = String(tab.workspaceDir || "").trim();
+        const modeArg = getEffectiveAgentMode(tab);
         try {
           const res = await callApi(
             "regenerate_message",
@@ -1412,7 +1810,10 @@ export function createMessageElement(tab, msg, pane) {
             tab.modelId,
             tab.thinkingLevel,
             useWebSearch,
-            clientStreamId
+            clientStreamId,
+            useAgent,
+            wsDirArg,
+            modeArg
           );
           if (!res || res.error) {
             regenBtn.disabled = false;
@@ -1519,6 +1920,9 @@ export function inlineEditUserMessage(row, tab, msg, pane) {
     setTabStreamingUI(pane, tab, true);
     const realMsgId = row.dataset.msgId || msg.id;
     const useWebSearch = Boolean(tab.webSearchEnabled && getWebSearchAvailability().available);
+    const useAgent = Boolean(tab.agentEnabled);
+    const wsDirArg = String(tab.workspaceDir || "").trim();
+    const modeArg = getEffectiveAgentMode(tab);
 
     try {
       const res = await callApi(
@@ -1531,7 +1935,10 @@ export function inlineEditUserMessage(row, tab, msg, pane) {
         tab.modelId,
         tab.thinkingLevel,
         useWebSearch,
-        clientStreamId
+        clientStreamId,
+        useAgent,
+        wsDirArg,
+        modeArg
       );
       if (!res || res.error) {
         saveBtn.disabled = false;
@@ -1630,6 +2037,9 @@ export async function sendMessageFromPane(pane, tab) {
   };
 
   const useWebSearch = Boolean(tab.webSearchEnabled && getWebSearchAvailability().available);
+  const useAgent = Boolean(tab.agentEnabled);
+  const wsDirArg = String(tab.workspaceDir || "").trim();
+  const modeArg = getEffectiveAgentMode(tab);
   try {
     const res = await callApi(
       "send_message",
@@ -1643,7 +2053,10 @@ export async function sendMessageFromPane(pane, tab) {
       tab.systemPrompt || "",
       tab.maxContextMessages || 30,
       useWebSearch,
-      clientStreamId
+      clientStreamId,
+      useAgent,
+      wsDirArg,
+      modeArg
     );
     if (!res || res.error) {
       rollbackPendingSend();
@@ -1709,20 +2122,33 @@ export function renderTokenStats(pane, tabId, stats) {
       summaryEl.title = "Click to view cache breakdown";
     }
   }
-  const chatSearches = Number(gt.google_search_requests || 0);
-  const gTotals =
-    (stats && stats.google_search_totals) || state.googleSearchTotals || { monthly: 0, all_time: 0 };
-  const monthSearches = Number(gTotals.monthly || 0);
-  const allTimeSearches = Number(gTotals.all_time || 0);
+  const googleSearches = Number(gt.google_search_requests || 0);
+  const ddgSearches = Number(gt.ddg_search_requests || 0);
+  const totalWebSearches =
+    gt.web_search_requests !== undefined
+      ? Number(gt.web_search_requests || 0)
+      : (googleSearches + ddgSearches);
   const activeBreakdownHtml =
     actTurn && actTurn.total_tokens && actTurn.total_tokens !== gt.total_tokens
       ? `<div style="font-size: 11px; color: var(--text-muted); padding: 4px 0 2px 0;">Active messages: ${actTurn.prompt_tokens.toLocaleString()} in / ${actTurn.completion_tokens.toLocaleString()} out (${formatTokens(actTurn.total_tokens)} context) · Cumulative chat spend: ${formatTokens(gt.total_tokens)} total</div>`
       : "";
   const searchSummaryHtml = `
     ${activeBreakdownHtml}
-    <div class="search-requests-row">
-      <span class="search-requests-label"><i data-lucide="globe" style="width: 12px; height: 12px;"></i> Google Search Requests</span>
-      <span class="search-requests-values">${chatSearches.toLocaleString()} this chat · ${monthSearches.toLocaleString()} / 5,000 this month · ${allTimeSearches.toLocaleString()} total</span>
+    <div class="search-requests-section">
+      <div class="search-requests-row">
+        <span class="search-requests-label"><i data-lucide="globe" style="width: 12px; height: 12px;"></i> Web Search</span>
+        <span class="search-requests-values">${totalWebSearches.toLocaleString()}</span>
+      </div>
+      <div class="search-requests-sublist">
+        <div class="search-requests-subrow">
+          <span>Google Search</span>
+          <span class="search-requests-values">${googleSearches.toLocaleString()}</span>
+        </div>
+        <div class="search-requests-subrow">
+          <span>DuckDuckGo Search</span>
+          <span class="search-requests-values">${ddgSearches.toLocaleString()}</span>
+        </div>
+      </div>
     </div>
   `;
 

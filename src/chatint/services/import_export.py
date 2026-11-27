@@ -70,16 +70,30 @@ def _unescape_details_from_markdown(thought: str) -> str:
     return re.sub(r"&lt;/details&gt;", "</details>", thought, flags=re.IGNORECASE)
 
 
+def _dump_meta_json(payload: Dict[str, Any]) -> str:
+    return json.dumps(payload, separators=(",", ":")).replace("-->", "--\\u003e")
+
+
 def format_conversation_markdown(conv: Dict[str, Any]) -> str:
-    """Export a conversation to Markdown while preserving metadata, system turns, and literal </details>."""
+    """Export a conversation to Markdown while preserving settings, per-message metrics, traces, and ledger totals."""
     lines = [f"# {conv.get('title') or 'Conversation'}\n"]
 
     conv_meta: Dict[str, Any] = {
         "max_context_messages": _clamp_max_context(conv.get("max_context_messages"), default=30),
+        "agent_mode": "auto" if str(conv.get("agent_mode") or "manual").strip().lower() == "auto" else "manual",
+        "is_auto_named": bool(conv.get("is_auto_named", True)),
     }
+    if conv.get("workspace_dir"):
+        conv_meta["workspace_dir"] = str(conv["workspace_dir"])
     if isinstance(conv.get("created_at"), (int, float)):
         conv_meta["created_at"] = float(conv["created_at"])
-    lines.append(f"<!-- chatint-conv-meta: {json.dumps(conv_meta, separators=(',', ':'))} -->\n")
+    if isinstance(conv.get("updated_at"), (int, float)):
+        conv_meta["updated_at"] = float(conv["updated_at"])
+    if isinstance(conv.get("token_stats"), dict):
+        conv_meta["token_stats"] = conv["token_stats"]
+    if isinstance(conv.get("token_ledger"), list) and conv["token_ledger"]:
+        conv_meta["token_ledger"] = conv["token_ledger"]
+    lines.append(f"<!-- chatint-conv-meta: {_dump_meta_json(conv_meta)} -->\n")
 
     if conv.get("system_prompt"):
         sys_lines = str(conv["system_prompt"]).splitlines() or [""]
@@ -106,13 +120,15 @@ def format_conversation_markdown(conv: Dict[str, Any]) -> str:
             msg_meta["model_id"] = msg["model_id"]
         if msg.get("thinking_level") and msg.get("thinking_level") != "none":
             msg_meta["thinking_level"] = msg["thinking_level"]
-        for tok_k in ("prompt_tokens", "completion_tokens", "cached_tokens", "duration_ms"):
+        for tok_k in ("prompt_tokens", "completion_tokens", "cached_tokens", "duration_ms", "worked_ms"):
             if _safe_nonneg_int(msg.get(tok_k)) > 0:
                 msg_meta[tok_k] = _safe_nonneg_int(msg.get(tok_k))
+        if isinstance(msg.get("tool_trace"), list) and msg["tool_trace"]:
+            msg_meta["tool_trace"] = [item for item in msg["tool_trace"] if isinstance(item, dict)]
         if isinstance(msg.get("created_at"), (int, float)):
             msg_meta["created_at"] = float(msg["created_at"])
         if msg_meta:
-            lines.append(f"<!-- chatint-msg-meta: {json.dumps(msg_meta, separators=(',', ':'))} -->\n")
+            lines.append(f"<!-- chatint-msg-meta: {_dump_meta_json(msg_meta)} -->\n")
 
         if msg.get("thinking_content"):
             escaped_thought = _escape_details_for_markdown(str(msg["thinking_content"]))
@@ -127,6 +143,8 @@ def format_conversation_markdown(conv: Dict[str, Any]) -> str:
 
 
 def _normalize_json_msg(m: Dict[str, Any]) -> Dict[str, Any]:
+    raw_trace = m.get("tool_trace")
+    tool_trace = [item for item in raw_trace if isinstance(item, dict)] if isinstance(raw_trace, list) else []
     out: Dict[str, Any] = {
         "role": _sanitize_msg_role(m.get("role", "user")),
         "content": str(m.get("content", "") or ""),
@@ -139,6 +157,8 @@ def _normalize_json_msg(m: Dict[str, Any]) -> Dict[str, Any]:
         "completion_tokens": _safe_nonneg_int(m.get("completion_tokens")),
         "cached_tokens": _safe_nonneg_int(m.get("cached_tokens")),
         "duration_ms": _safe_nonneg_int(m.get("duration_ms")),
+        "worked_ms": _safe_nonneg_int(m.get("worked_ms")),
+        "tool_trace": tool_trace,
     }
     if isinstance(m.get("created_at"), (int, float)):
         out["created_at"] = float(m["created_at"])
@@ -185,10 +205,20 @@ def parse_chat_file_content(content: str, filename: str = "") -> Dict[str, Any]:
                 "title": title,
                 "system_prompt": system_prompt,
                 "max_context": max_context,
+                "workspace_dir": str(data.get("workspace_dir") or "").strip(),
+                "agent_mode": "auto" if str(data.get("agent_mode") or "manual").strip().lower() == "auto" else "manual",
                 "messages": messages,
             }
+            if isinstance(data.get("is_auto_named"), bool):
+                res["is_auto_named"] = data["is_auto_named"]
             if isinstance(data.get("created_at"), (int, float)):
                 res["created_at"] = float(data["created_at"])
+            if isinstance(data.get("updated_at"), (int, float)):
+                res["updated_at"] = float(data["updated_at"])
+            if isinstance(data.get("token_stats"), dict):
+                res["token_stats"] = data["token_stats"]
+            if isinstance(data.get("token_ledger"), list):
+                res["token_ledger"] = [r for r in data["token_ledger"] if isinstance(r, dict)]
             return res
         if isinstance(data, list):
             messages = [_normalize_json_msg(m) for m in data if isinstance(m, dict)]
@@ -196,6 +226,8 @@ def parse_chat_file_content(content: str, filename: str = "") -> Dict[str, Any]:
                 "title": (Path(filename).stem if filename else "") or "Imported Chat",
                 "system_prompt": "",
                 "max_context": 30,
+                "workspace_dir": "",
+                "agent_mode": "manual",
                 "messages": messages,
             }
     except (json.JSONDecodeError, TypeError, ValueError):
@@ -204,7 +236,13 @@ def parse_chat_file_content(content: str, filename: str = "") -> Dict[str, Any]:
     # 2. Parse Markdown format (fence-aware with unclosed-fence protection, system turns, and metadata)
     title = ""
     max_context = 30
+    conv_workspace_dir = ""
+    conv_agent_mode = "manual"
+    conv_is_auto_named: Optional[bool] = None
     conv_created_at: Optional[float] = None
+    conv_updated_at: Optional[float] = None
+    conv_token_stats: Optional[Dict[str, Any]] = None
+    conv_token_ledger: Optional[List[Dict[str, Any]]] = None
     system_lines: List[str] = []
     messages = []
 
@@ -238,6 +276,8 @@ def parse_chat_file_content(content: str, filename: str = "") -> Dict[str, Any]:
         resolved_thinking = _normalize_thinking_level(
             current_msg_meta.get("thinking_level") or ("medium" if thinking_content else "none")
         )
+        raw_trace = current_msg_meta.get("tool_trace")
+        msg_trace = [item for item in raw_trace if isinstance(item, dict)] if isinstance(raw_trace, list) else []
         msg_entry: Dict[str, Any] = {
             "role": current_role,
             "content": body,
@@ -250,6 +290,8 @@ def parse_chat_file_content(content: str, filename: str = "") -> Dict[str, Any]:
             "completion_tokens": _safe_nonneg_int(current_msg_meta.get("completion_tokens")),
             "cached_tokens": _safe_nonneg_int(current_msg_meta.get("cached_tokens")),
             "duration_ms": _safe_nonneg_int(current_msg_meta.get("duration_ms")),
+            "worked_ms": _safe_nonneg_int(current_msg_meta.get("worked_ms")),
+            "tool_trace": msg_trace,
         }
         if isinstance(current_msg_meta.get("created_at"), (int, float)):
             msg_entry["created_at"] = float(current_msg_meta["created_at"])
@@ -301,8 +343,22 @@ def parse_chat_file_content(content: str, filename: str = "") -> Dict[str, Any]:
                         parsed_cm = json.loads(cm_match.group(1))
                         if isinstance(parsed_cm, dict):
                             max_context = _clamp_max_context(parsed_cm.get("max_context_messages"), default=30)
+                            if parsed_cm.get("workspace_dir"):
+                                conv_workspace_dir = str(parsed_cm["workspace_dir"]).strip()
+                            if parsed_cm.get("agent_mode"):
+                                conv_agent_mode = (
+                                    "auto" if str(parsed_cm["agent_mode"]).strip().lower() == "auto" else "manual"
+                                )
+                            if isinstance(parsed_cm.get("is_auto_named"), bool):
+                                conv_is_auto_named = parsed_cm["is_auto_named"]
                             if isinstance(parsed_cm.get("created_at"), (int, float)):
                                 conv_created_at = float(parsed_cm["created_at"])
+                            if isinstance(parsed_cm.get("updated_at"), (int, float)):
+                                conv_updated_at = float(parsed_cm["updated_at"])
+                            if isinstance(parsed_cm.get("token_stats"), dict):
+                                conv_token_stats = parsed_cm["token_stats"]
+                            if isinstance(parsed_cm.get("token_ledger"), list):
+                                conv_token_ledger = [r for r in parsed_cm["token_ledger"] if isinstance(r, dict)]
                     except (json.JSONDecodeError, TypeError, ValueError):
                         pass
                     continue
@@ -379,14 +435,26 @@ def parse_chat_file_content(content: str, filename: str = "") -> Dict[str, Any]:
             "completion_tokens": 0,
             "cached_tokens": 0,
             "duration_ms": 0,
+            "worked_ms": 0,
+            "tool_trace": [],
         })
 
     result: Dict[str, Any] = {
         "title": title,
         "system_prompt": system_prompt,
         "max_context": max_context,
+        "workspace_dir": conv_workspace_dir,
+        "agent_mode": conv_agent_mode,
         "messages": messages,
     }
+    if conv_is_auto_named is not None:
+        result["is_auto_named"] = conv_is_auto_named
     if conv_created_at is not None:
         result["created_at"] = conv_created_at
+    if conv_updated_at is not None:
+        result["updated_at"] = conv_updated_at
+    if conv_token_stats is not None:
+        result["token_stats"] = conv_token_stats
+    if conv_token_ledger is not None:
+        result["token_ledger"] = conv_token_ledger
     return result

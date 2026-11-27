@@ -91,6 +91,8 @@ PUBLIC_RPC_METHODS: tuple[str, ...] = (
     "regenerate_message",
     "edit_message",
     "stop_streaming",
+    "select_workspace_folder",
+    "resolve_tool_approval",
 )
 
 
@@ -105,6 +107,48 @@ def _clamp_max_context(value: Any, default: int = 30) -> int:
 def _normalize_thinking_level(level: Any) -> str:
     val = str(level or "none").strip().lower()
     return val if val in _VALID_THINKING_LEVELS else "none"
+
+
+def _normalize_agent_mode(mode: Any) -> str:
+    return "auto" if str(mode or "manual").strip().lower() == "auto" else "manual"
+
+
+def _validate_workspace_dir(raw_ws: Any) -> tuple[str, Optional[str]]:
+    cleaned = str(raw_ws or "").strip()
+    if not cleaned:
+        return "", None
+    p = Path(cleaned)
+    if not p.is_dir():
+        return "", f"Workspace folder does not exist: {cleaned}"
+    try:
+        return str(p.resolve()), None
+    except Exception:
+        return cleaned, None
+
+
+def _format_tool_trace_summary(tool_trace: Any) -> str:
+    if not isinstance(tool_trace, list) or not tool_trace:
+        return ""
+    items: List[str] = []
+    for step in tool_trace[:12]:
+        if not isinstance(step, dict):
+            continue
+        tname = str(step.get("tool") or "").strip()
+        if not tname:
+            continue
+        arg_p = str(step.get("args_preview") or "").strip()
+        label = f"{tname}({arg_p})" if arg_p else tname
+        status = str(step.get("status") or "").strip().lower()
+        if status == "denied":
+            label += " [denied]"
+        elif status == "error":
+            label += " [error]"
+        items.append(label)
+    if not items:
+        return ""
+    if len(tool_trace) > 12:
+        items.append(f"+{len(tool_trace) - 12} more")
+    return f"[Tools used: {', '.join(items)}]"
 
 
 def _normalize_file_uri_key(url: str) -> str:
@@ -446,6 +490,10 @@ class DesktopBridge:
             role = m.get("role", "user")
             raw_content = m.get("content", "")
             content = raw_content if (raw_content or "").strip() else ("[Response stopped]" if role == "assistant" else "")
+            if role == "assistant" and m.get("tool_trace"):
+                trace_note = _format_tool_trace_summary(m.get("tool_trace"))
+                if trace_note:
+                    content = f"{content}\n\n{trace_note}" if content else trace_note
             if not content:
                 continue
             if context_msgs and context_msgs[-1]["role"] == role and role in ("user", "assistant"):
@@ -658,12 +706,20 @@ class DesktopBridge:
 
     @_guarded_rpc
     def create_conversation(
-        self, title: str = "New Chat", system_prompt: str = "", max_context: int = 30
+        self,
+        title: str = "New Chat",
+        system_prompt: str = "",
+        max_context: int = 30,
+        workspace_dir: str = "",
+        agent_mode: str = "manual",
     ) -> Dict[str, Any]:
+        valid_ws, _ws_err = _validate_workspace_dir(workspace_dir)
         return create_conversation(
             title=title,
             system_prompt=system_prompt,
             max_context=_clamp_max_context(max_context, default=30),
+            workspace_dir=valid_ws,
+            agent_mode=_normalize_agent_mode(agent_mode),
         )
 
     @_guarded_rpc
@@ -719,6 +775,12 @@ class DesktopBridge:
                     max_context=parsed["max_context"],
                     messages=parsed["messages"],
                     created_at=parsed.get("created_at"),
+                    workspace_dir=parsed.get("workspace_dir", ""),
+                    agent_mode=parsed.get("agent_mode", "manual"),
+                    is_auto_named=parsed.get("is_auto_named"),
+                    updated_at=parsed.get("updated_at"),
+                    token_ledger=parsed.get("token_ledger"),
+                    token_stats=parsed.get("token_stats"),
                 )
                 return {"success": True, "conversation": new_conv}
             except Exception as e:
@@ -735,6 +797,12 @@ class DesktopBridge:
                 max_context=parsed["max_context"],
                 messages=parsed["messages"],
                 created_at=parsed.get("created_at"),
+                workspace_dir=parsed.get("workspace_dir", ""),
+                agent_mode=parsed.get("agent_mode", "manual"),
+                is_auto_named=parsed.get("is_auto_named"),
+                updated_at=parsed.get("updated_at"),
+                token_ledger=parsed.get("token_ledger"),
+                token_stats=parsed.get("token_stats"),
             )
             return {"success": True, "conversation": new_conv}
         except Exception as e:
@@ -742,13 +810,25 @@ class DesktopBridge:
 
     @_guarded_rpc
     def update_conversation_settings(
-        self, conv_id: str, system_prompt: str, max_context_messages: int
+        self,
+        conv_id: str,
+        system_prompt: str,
+        max_context_messages: int,
+        workspace_dir: Optional[str] = None,
+        agent_mode: Optional[str] = None,
     ) -> Dict[str, Any]:
-        update_conversation(
-            conv_id,
-            system_prompt=system_prompt,
-            max_context_messages=_clamp_max_context(max_context_messages, default=30),
-        )
+        update_kwargs: Dict[str, Any] = {
+            "system_prompt": system_prompt,
+            "max_context_messages": _clamp_max_context(max_context_messages, default=30),
+        }
+        if workspace_dir is not None:
+            valid_ws, ws_err = _validate_workspace_dir(workspace_dir)
+            if ws_err:
+                return {"error": ws_err}
+            update_kwargs["workspace_dir"] = valid_ws
+        if agent_mode is not None:
+            update_kwargs["agent_mode"] = _normalize_agent_mode(agent_mode)
+        update_conversation(conv_id, **update_kwargs)
         return {"success": True}
 
     @_guarded_rpc
@@ -831,6 +911,35 @@ class DesktopBridge:
             except Exception as exc:
                 _logger.warning("Failed flushing tab state on close: %s", exc)
 
+    @staticmethod
+    def _resolve_stream_agent_config(
+        conv: Dict[str, Any],
+        workspace_dir: Optional[str] = None,
+        agent_mode: Optional[str] = None,
+    ) -> tuple[str, str]:
+        settings = get_app_settings()
+        candidates = [
+            (workspace_dir or "").strip() if workspace_dir is not None else "",
+            (conv.get("workspace_dir") or "").strip(),
+            (settings.get("default_workspace_dir") or "").strip(),
+        ]
+        resolved_ws = ""
+        for cand in candidates:
+            if not cand:
+                continue
+            valid_ws, _err = _validate_workspace_dir(cand)
+            if valid_ws:
+                resolved_ws = valid_ws
+                break
+
+        if agent_mode is not None and str(agent_mode).strip():
+            resolved_mode = _normalize_agent_mode(agent_mode)
+        elif (conv.get("agent_mode") or "").strip():
+            resolved_mode = _normalize_agent_mode(conv.get("agent_mode"))
+        else:
+            resolved_mode = _normalize_agent_mode(settings.get("default_agent_mode", "manual"))
+        return resolved_ws, resolved_mode
+
     def _start_stream(
         self,
         tab_id: str,
@@ -840,12 +949,16 @@ class DesktopBridge:
         thinking_level: str,
         web_search_enabled: bool = False,
         stream_id: Optional[str] = None,
+        agent_enabled: bool = False,
+        workspace_dir: Optional[str] = None,
+        agent_mode: Optional[str] = None,
     ) -> Optional[str]:
         conv = get_conversation(conversation_id)
         if not conv:
             return None
         sid = (str(stream_id or "").strip()) or str(uuid.uuid4())
         clean_thinking = _normalize_thinking_level(thinking_level)
+        resolved_ws, resolved_mode = self._resolve_stream_agent_config(conv, workspace_dir, agent_mode)
         StreamManager.register_stream(tab_id, stream_id=sid, conversation_id=conversation_id)
         context_msgs = self._build_context_messages(conv)
         threading.Thread(
@@ -860,6 +973,9 @@ class DesktopBridge:
                 "thinking_level": clean_thinking,
                 "web_search_enabled": bool(web_search_enabled),
                 "stream_id": sid,
+                "agent_enabled": bool(agent_enabled),
+                "workspace_dir": resolved_ws,
+                "agent_mode": resolved_mode,
             },
             daemon=True,
         ).start()
@@ -879,21 +995,33 @@ class DesktopBridge:
         max_context_messages: int = 30,
         web_search_enabled: bool = False,
         stream_id: Optional[str] = None,
+        agent_enabled: bool = False,
+        workspace_dir: Optional[str] = None,
+        agent_mode: Optional[str] = None,
     ) -> Dict[str, Any]:
         clean_provider = (provider_id or "").strip()
         clean_model = (model_id or "").strip()
         if not clean_provider or not clean_model:
             return {"error": "Please select a provider and model before sending."}
 
+        valid_explicit_ws, ws_err = _validate_workspace_dir(workspace_dir)
+        if ws_err:
+            return {"error": ws_err}
+
         clean_thinking = _normalize_thinking_level(thinking_level)
         clamped_ctx = _clamp_max_context(max_context_messages, default=30)
 
         conv = get_conversation(conversation_id) if conversation_id else None
         if not conv:
+            init_mode = _normalize_agent_mode(
+                agent_mode if (agent_mode is not None and str(agent_mode).strip()) else get_app_settings().get("default_agent_mode", "manual")
+            )
             conv = create_conversation(
                 title=title or "New Chat",
                 system_prompt=system_prompt or "",
                 max_context=clamped_ctx,
+                workspace_dir=valid_explicit_ws,
+                agent_mode=init_mode,
             )
             conversation_id = conv["id"]
         else:
@@ -901,6 +1029,12 @@ class DesktopBridge:
                 update_conversation(conversation_id, title=title.strip())
             if system_prompt and not conv.get("system_prompt"):
                 update_conversation(conversation_id, system_prompt=system_prompt)
+            if workspace_dir is not None and valid_explicit_ws != (conv.get("workspace_dir") or ""):
+                update_conversation(conversation_id, workspace_dir=valid_explicit_ws)
+            if agent_mode is not None and str(agent_mode).strip():
+                norm_mode = _normalize_agent_mode(agent_mode)
+                if norm_mode != conv.get("agent_mode"):
+                    update_conversation(conversation_id, agent_mode=norm_mode)
 
         user_msg = add_message(
             conversation_id=conversation_id,
@@ -921,6 +1055,9 @@ class DesktopBridge:
             clean_thinking,
             web_search_enabled,
             stream_id=stream_id,
+            agent_enabled=bool(agent_enabled),
+            workspace_dir=valid_explicit_ws if workspace_dir is not None else None,
+            agent_mode=agent_mode,
         )
         if not active_sid:
             return {"error": "Conversation not found"}
@@ -938,6 +1075,9 @@ class DesktopBridge:
         thinking_level: str = "none",
         web_search_enabled: bool = False,
         stream_id: Optional[str] = None,
+        agent_enabled: bool = False,
+        workspace_dir: Optional[str] = None,
+        agent_mode: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Validate provider & abort active streams BEFORE deleting downstream messages (fixes NEW-H3)."""
         clean_message_id = (message_id or "").strip()
@@ -948,6 +1088,10 @@ class DesktopBridge:
         clean_model = (model_id or "").strip()
         if not clean_provider or not clean_model:
             return {"error": "Please select a provider and model before regenerating."}
+
+        valid_explicit_ws, ws_err = _validate_workspace_dir(workspace_dir)
+        if ws_err:
+            return {"error": ws_err}
 
         if not conversation_id or not get_conversation(conversation_id):
             return {"error": "Conversation not found"}
@@ -967,6 +1111,9 @@ class DesktopBridge:
             clean_thinking,
             web_search_enabled,
             stream_id=stream_id,
+            agent_enabled=bool(agent_enabled),
+            workspace_dir=valid_explicit_ws if workspace_dir is not None else None,
+            agent_mode=agent_mode,
         )
         if not active_sid:
             return {"error": "Conversation not found"}
@@ -984,12 +1131,19 @@ class DesktopBridge:
         thinking_level: str = "none",
         web_search_enabled: bool = False,
         stream_id: Optional[str] = None,
+        agent_enabled: bool = False,
+        workspace_dir: Optional[str] = None,
+        agent_mode: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Validate message & provider readiness and abort active streams BEFORE mutating SQLite (fixes NEW-H3)."""
         clean_provider = (provider_id or "").strip()
         clean_model = (model_id or "").strip()
         if not clean_provider or not clean_model:
             return {"error": "Please select a provider and model before sending."}
+
+        valid_explicit_ws, ws_err = _validate_workspace_dir(workspace_dir)
+        if ws_err:
+            return {"error": ws_err}
 
         clean_thinking = _normalize_thinking_level(thinking_level)
         if message_id.startswith("user_temp_") or not message_id:
@@ -1033,6 +1187,9 @@ class DesktopBridge:
             clean_thinking,
             web_search_enabled,
             stream_id=stream_id,
+            agent_enabled=bool(agent_enabled),
+            workspace_dir=valid_explicit_ws if workspace_dir is not None else None,
+            agent_mode=agent_mode,
         )
         if not active_sid:
             return {"error": "Conversation not found"}
@@ -1042,3 +1199,42 @@ class DesktopBridge:
     def stop_streaming(self, tab_id: str, stream_id: Optional[str] = None) -> Dict[str, Any]:
         StreamManager.abort_stream(tab_id, stream_id=stream_id)
         return {"success": True}
+
+    @_guarded_rpc
+    def select_workspace_folder(self) -> Dict[str, Any]:
+        """Open a native folder picker dialog for selecting an Agent workspace folder."""
+        win = getattr(self, "_window", None)
+        if win is None and webview.windows:
+            win = webview.windows[0]
+        if win is None:
+            return {"error": "Desktop window is unavailable."}
+        try:
+            dialog_cls = getattr(webview, "FileDialog", None)
+            folder_mode = (
+                dialog_cls.FOLDER if (dialog_cls and hasattr(dialog_cls, "FOLDER")) else webview.FOLDER_DIALOG
+            )
+            selected = win.create_file_dialog(folder_mode, allow_multiple=False)
+        except Exception as exc:
+            return {"error": f"Failed to open folder picker: {exc}"}
+
+        if not selected:
+            return {"cancelled": True, "path": ""}
+        chosen = str(selected[0] if isinstance(selected, (list, tuple)) else selected).strip()
+        if not chosen:
+            return {"cancelled": True, "path": ""}
+        valid_ws, ws_err = _validate_workspace_dir(chosen)
+        if ws_err:
+            return {"error": ws_err}
+        return {"success": True, "cancelled": False, "path": valid_ws}
+
+    @_guarded_rpc
+    def resolve_tool_approval(
+        self,
+        tab_id: str,
+        stream_id: str,
+        approval_id: str,
+        decision: str,
+    ) -> Dict[str, Any]:
+        """Resolve an active Manual-mode file write/edit prompt for the running stream."""
+        ok = StreamManager.resolve_approval(stream_id, approval_id, decision)
+        return {"success": bool(ok), "decision": decision}

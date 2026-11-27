@@ -5,6 +5,7 @@ import itertools
 import json
 import re
 import threading
+import time
 from typing import Any, Dict, List, Optional
 
 from chatint.client_manager import ClientManager
@@ -18,15 +19,19 @@ from chatint.providers.base import (
     _emit_start,
     _ensure_post_tool_separator,
     _ensure_post_tool_thinking_separator,
+    _execute_adapter_tool_call,
     _flush_think_buffer,
     _prepare_system_and_turns,
+    _prepare_tool_session,
     _process_text_with_think_tags,
+    _record_model_ms,
     _resolve_search_enabled,
     _run_web_search_tool_call,
     clear_resolved_thinking_cache,
     get_unified_thinking_chain,
     record_resolved_thinking_level,
 )
+from chatint.tools import to_openai_tools
 from chatint.web_search_tool import (
     MAX_TOOL_CALLS_PER_PROMPT,
     MAX_TOOL_ROUNDS,
@@ -132,20 +137,30 @@ class OpenAIAdapter(ProviderAdapter):
         user_question: str,
         web_search_enabled: bool = False,
         stream_id: Optional[str] = None,
+        agent_enabled: bool = False,
+        workspace_dir: str = "",
+        agent_mode: str = "manual",
+        tool_trace: Optional[List[Dict[str, Any]]] = None,
+        timing_stats: Optional[Dict[str, int]] = None,
     ) -> tuple[List[str], List[str], int, int, int, bool, str]:
         return _stream_openai(
-            bridge=bridge,
-            tab_id=tab_id,
-            conversation_id=conversation_id,
-            messages=messages,
-            provider_id=provider_id,
-            model_id=model_id,
-            thinking_level=thinking_level,
-            assistant_msg_id=assistant_msg_id,
-            abort_event=abort_event,
-            user_question=user_question,
+            bridge,
+            tab_id,
+            conversation_id,
+            messages,
+            provider_id,
+            model_id,
+            thinking_level,
+            assistant_msg_id,
+            abort_event,
+            user_question,
             web_search_enabled=web_search_enabled,
             stream_id=stream_id,
+            agent_enabled=agent_enabled,
+            workspace_dir=workspace_dir,
+            agent_mode=agent_mode,
+            tool_trace=tool_trace,
+            timing_stats=timing_stats,
         )
 
 
@@ -162,6 +177,11 @@ def _stream_openai(
     user_question: str,
     web_search_enabled: bool = False,
     stream_id: Optional[str] = None,
+    agent_enabled: bool = False,
+    workspace_dir: str = "",
+    agent_mode: str = "manual",
+    tool_trace: Optional[List[Dict[str, Any]]] = None,
+    timing_stats: Optional[Dict[str, int]] = None,
 ) -> tuple[List[str], List[str], int, int, int, bool, str]:
     import openai
 
@@ -182,12 +202,26 @@ def _stream_openai(
 
     try:
         system_prompt, turns = _prepare_system_and_turns(messages)
-        search_enabled = _resolve_search_enabled(web_search_enabled)
-        system_prompt = _append_search_system_hint(system_prompt, search_enabled)
+        (
+            search_enabled,
+            clean_ws,
+            active_specs,
+            system_prompt,
+            max_tool_rounds,
+            max_tool_calls,
+            runtime_state,
+        ) = _prepare_tool_session(
+            web_search_enabled=web_search_enabled,
+            agent_enabled=bool(agent_enabled),
+            workspace_dir=workspace_dir,
+            agent_mode=agent_mode,
+            system_prompt=system_prompt,
+            resolve_search_fn=_resolve_search_enabled,
+        )
         normalized_messages: List[Dict[str, Any]] = (
             [{"role": "system", "content": system_prompt}] if system_prompt else []
         ) + [dict(t) for t in turns]
-        openai_tools = [get_openai_tool_spec(), get_openai_image_tool_spec()] if search_enabled else []
+        openai_tools = to_openai_tools(active_specs)
 
         has_emitted_start = False
         stream_had_error = False
@@ -195,7 +229,7 @@ def _stream_openai(
         include_stream_options = True
         total_executed_tool_calls = 0
 
-        for tool_round in range(MAX_TOOL_ROUNDS + 1):
+        for tool_round in range(max_tool_rounds + 1):
             if abort_event.is_set():
                 break
             if tool_round > 0:
@@ -203,11 +237,12 @@ def _stream_openai(
 
             round_tools = (
                 openai_tools
-                if (tool_round < MAX_TOOL_ROUNDS and total_executed_tool_calls < MAX_TOOL_CALLS_PER_PROMPT)
+                if (tool_round < max_tool_rounds and total_executed_tool_calls < max_tool_calls)
                 else []
             )
             response_stream = None
             last_api_err = None
+            round_api_start: Optional[float] = None
 
             if tool_round == 0:
                 raw_chain = get_unified_thinking_chain(thinking_level, provider_id, model_id)
@@ -232,7 +267,7 @@ def _stream_openai(
                 use_tools: bool,
                 active_tools: Optional[List[Dict[str, Any]]] = None,
             ):
-                nonlocal include_stream_options, actual_thinking_level, last_api_err
+                nonlocal include_stream_options, actual_thinking_level, last_api_err, round_api_start
                 kw: Dict[str, Any] = {
                     "model": model_id,
                     "messages": normalized_messages,
@@ -247,8 +282,10 @@ def _stream_openai(
                     kw["tool_choice"] = "auto"
 
                 try:
+                    attempt_start = time.perf_counter()
                     raw_stream = client.chat.completions.create(**kw)
                     wrapped_stream = _peek_and_wrap(raw_stream)
+                    round_api_start = attempt_start
                     actual_thinking_level = eff_val if eff_val is not None else "none"
                     record_resolved_thinking_level(provider_id, model_id, thinking_level, actual_thinking_level)
                     last_api_err = None
@@ -270,8 +307,10 @@ def _stream_openai(
                         kw_no_so = dict(kw)
                         kw_no_so.pop("stream_options", None)
                         try:
+                            attempt_start = time.perf_counter()
                             raw_stream = client.chat.completions.create(**kw_no_so)
                             wrapped_stream = _peek_and_wrap(raw_stream)
+                            round_api_start = attempt_start
                             include_stream_options = False
                             actual_thinking_level = eff_val if eff_val is not None else "none"
                             record_resolved_thinking_level(provider_id, model_id, thinking_level, actual_thinking_level)
@@ -456,6 +495,8 @@ def _stream_openai(
                     stream_had_error,
                     actual_thinking_level,
                 )
+            finally:
+                _record_model_ms(timing_stats, round_api_start)
 
             _flush_think_buffer(
                 think_buffer,
@@ -472,7 +513,7 @@ def _stream_openai(
             cached_tokens += round_cached
 
             ordered_calls = [tool_calls_acc[i] for i in sorted(tool_calls_acc) if tool_calls_acc[i].get("name")]
-            if not ordered_calls or abort_event.is_set() or tool_round >= MAX_TOOL_ROUNDS:
+            if not ordered_calls or abort_event.is_set() or tool_round >= max_tool_rounds:
                 break
 
             assistant_msg: Dict[str, Any] = {
@@ -496,20 +537,27 @@ def _stream_openai(
                 if abort_event.is_set():
                     break
                 call_id = tc["id"] or f"call_{tool_round}_{idx}"
-                if total_executed_tool_calls >= MAX_TOOL_CALLS_PER_PROMPT:
+                if total_executed_tool_calls >= max_tool_calls:
                     res = {
                         "ok": False,
-                        "error": f"Tool call budget limit ({MAX_TOOL_CALLS_PER_PROMPT}) reached for this prompt.",
+                        "error": f"Tool call budget limit ({max_tool_calls}) reached for this prompt.",
                     }
                 else:
-                    res = _run_web_search_tool_call(
-                        bridge,
-                        tab_id,
-                        conversation_id,
-                        tc["name"],
-                        tc.get("arguments") or "{}",
-                        abort_event,
+                    res = _execute_adapter_tool_call(
+                        bridge=bridge,
+                        tab_id=tab_id,
+                        conversation_id=conversation_id,
+                        tool_name=tc["name"],
+                        raw_args=tc.get("arguments") or "{}",
+                        abort_event=abort_event,
                         stream_id=stream_id,
+                        call_id=call_id,
+                        workspace_dir=clean_ws,
+                        runtime_state=runtime_state,
+                        tool_trace=tool_trace,
+                        web_search_enabled=search_enabled,
+                        agent_enabled=bool(agent_enabled),
+                        web_runner=_run_web_search_tool_call,
                     )
                     total_executed_tool_calls += 1
                 normalized_messages.append({

@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import re
 import sqlite3
 import time
 from typing import Any, Dict, List, Optional
 import uuid
 
+from chatint.catalog import strip_model_prefix
 from chatint.logging_setup import get_logger
 from chatint.storage.connection import open_db
 from chatint.storage.ledger_repo import get_token_stats
@@ -15,7 +17,15 @@ from chatint.storage.ledger_repo import get_token_stats
 _logger = get_logger("chatint.storage.conversations_repo")
 _DEFAULT_TITLE_RE = re.compile(r"^new chat(?:\s*\(\d+\))?$", re.IGNORECASE)
 
-_ALLOWED_CONV_COLUMNS = {"title", "system_prompt", "max_context_messages", "is_imported", "is_auto_named"}
+_ALLOWED_CONV_COLUMNS = {
+    "title",
+    "system_prompt",
+    "max_context_messages",
+    "is_imported",
+    "is_auto_named",
+    "workspace_dir",
+    "agent_mode",
+}
 _ALLOWED_MSG_COLUMNS = {
     "role",
     "content",
@@ -28,7 +38,25 @@ _ALLOWED_MSG_COLUMNS = {
     "completion_tokens",
     "cached_tokens",
     "duration_ms",
+    "worked_ms",
+    "tool_trace_json",
 }
+
+
+def _normalize_agent_mode(mode: Any) -> str:
+    return "auto" if str(mode or "manual").strip().lower() == "auto" else "manual"
+
+
+def _parse_tool_trace(raw_json: Any) -> List[Dict[str, Any]]:
+    if isinstance(raw_json, list):
+        return [item for item in raw_json if isinstance(item, dict)]
+    if not raw_json:
+        return []
+    try:
+        parsed = json.loads(raw_json)
+        return [item for item in parsed if isinstance(item, dict)] if isinstance(parsed, list) else []
+    except Exception:
+        return []
 
 
 def is_default_conversation_title(title: Optional[str]) -> bool:
@@ -109,10 +137,16 @@ def get_branch_title(
 
 
 def create_conversation(
-    title: str = "New Chat", system_prompt: str = "", max_context: int = 30
+    title: str = "New Chat",
+    system_prompt: str = "",
+    max_context: int = 30,
+    workspace_dir: str = "",
+    agent_mode: str = "manual",
 ) -> Dict[str, Any]:
     raw_title = (title or "").strip()
     is_unnamed_placeholder = raw_title.lower() in ("", "new chat")
+    clean_ws = str(workspace_dir or "").strip()
+    clean_mode = _normalize_agent_mode(agent_mode)
 
     with open_db() as conn:
         conn.execute("BEGIN IMMEDIATE")
@@ -130,11 +164,12 @@ def create_conversation(
         cursor.execute(
             """
             INSERT INTO conversations (
-                id, title, system_prompt, max_context_messages, is_imported, is_auto_named, created_at, updated_at
+                id, title, system_prompt, max_context_messages, is_imported, is_auto_named,
+                workspace_dir, agent_mode, created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, 0, ?, ?, ?)
+            VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?)
             """,
-            (conv_id, resolved_title, system_prompt, max_context, is_auto_named, now, now),
+            (conv_id, resolved_title, system_prompt, max_context, is_auto_named, clean_ws, clean_mode, now, now),
         )
         conn.commit()
     return {
@@ -144,6 +179,8 @@ def create_conversation(
         "max_context_messages": max_context,
         "is_imported": False,
         "is_auto_named": bool(is_auto_named),
+        "workspace_dir": clean_ws,
+        "agent_mode": clean_mode,
         "created_at": now,
         "updated_at": now,
         "messages": [],
@@ -155,7 +192,7 @@ def get_conversations() -> List[Dict[str, Any]]:
         cursor = conn.cursor()
         cursor.execute("""
             SELECT c.id, c.title, c.system_prompt, c.max_context_messages, c.is_imported, c.is_auto_named,
-                   c.created_at, c.updated_at,
+                   c.workspace_dir, c.agent_mode, c.created_at, c.updated_at,
                    COALESCE(SUM(CASE WHEN m.role = 'assistant' AND (LENGTH(TRIM(m.content)) > 0 OR LENGTH(TRIM(m.thinking_content)) > 0) THEN 1 ELSE 0 END), 0) as message_count,
                    COUNT(m.id) as total_messages
             FROM conversations c
@@ -174,6 +211,8 @@ def get_conversations() -> List[Dict[str, Any]]:
             "max_context_messages": r["max_context_messages"],
             "is_imported": bool(r["is_imported"]),
             "is_auto_named": bool(r["is_auto_named"]),
+            "workspace_dir": r["workspace_dir"] or "",
+            "agent_mode": _normalize_agent_mode(r["agent_mode"]),
             "created_at": r["created_at"],
             "updated_at": r["updated_at"],
             "message_count": r["message_count"],
@@ -195,6 +234,18 @@ def get_conversation(conv_id: str) -> Optional[Dict[str, Any]]:
             (conv_id,),
         )
         msg_rows = cursor.fetchall()
+        cursor.execute(
+            """
+            SELECT provider_id, provider_name, model_id,
+                   prompt_tokens, completion_tokens, cached_tokens,
+                   google_search_requests, ddg_search_requests, cost_usd, created_at
+            FROM token_ledger
+            WHERE conversation_id = ?
+            ORDER BY id ASC
+            """,
+            (conv_id,),
+        )
+        ledger_rows = cursor.fetchall()
 
     messages = [
         {
@@ -211,9 +262,26 @@ def get_conversation(conv_id: str) -> Optional[Dict[str, Any]]:
             "completion_tokens": m["completion_tokens"],
             "cached_tokens": m["cached_tokens"],
             "duration_ms": m["duration_ms"],
+            "worked_ms": m["worked_ms"] if "worked_ms" in m.keys() else 0,
+            "tool_trace": _parse_tool_trace(m["tool_trace_json"] if "tool_trace_json" in m.keys() else "[]"),
             "created_at": m["created_at"],
         }
         for m in msg_rows
+    ]
+    token_ledger = [
+        {
+            "provider_id": r["provider_id"],
+            "provider_name": r["provider_name"],
+            "model_id": r["model_id"],
+            "prompt_tokens": r["prompt_tokens"],
+            "completion_tokens": r["completion_tokens"],
+            "cached_tokens": r["cached_tokens"],
+            "google_search_requests": r["google_search_requests"],
+            "ddg_search_requests": r["ddg_search_requests"],
+            "cost_usd": r["cost_usd"],
+            "created_at": r["created_at"],
+        }
+        for r in ledger_rows
     ]
 
     conv_keys = conv_row.keys()
@@ -224,9 +292,12 @@ def get_conversation(conv_id: str) -> Optional[Dict[str, Any]]:
         "max_context_messages": conv_row["max_context_messages"],
         "is_imported": bool(conv_row["is_imported"]) if "is_imported" in conv_keys else False,
         "is_auto_named": bool(conv_row["is_auto_named"]) if "is_auto_named" in conv_keys else False,
+        "workspace_dir": (conv_row["workspace_dir"] or "") if "is_imported" in conv_keys and "workspace_dir" in conv_keys else ((conv_row["workspace_dir"] or "") if "workspace_dir" in conv_keys else ""),
+        "agent_mode": _normalize_agent_mode(conv_row["agent_mode"] if "agent_mode" in conv_keys else "manual"),
         "created_at": conv_row["created_at"],
         "updated_at": conv_row["updated_at"],
         "messages": messages,
+        "token_ledger": token_ledger,
         "token_stats": get_token_stats(conv_id),
     }
 
@@ -252,6 +323,10 @@ def update_conversation(conv_id: str, only_if_default: bool = False, **kwargs) -
             clean_title = raw_title or "New Chat"
             kwargs["title"] = get_unique_conversation_title(clean_title, exclude_conv_id=conv_id, conn=conn)
             kwargs.setdefault("is_auto_named", 1)
+        if "workspace_dir" in kwargs:
+            kwargs["workspace_dir"] = str(kwargs["workspace_dir"] or "").strip()
+        if "agent_mode" in kwargs:
+            kwargs["agent_mode"] = _normalize_agent_mode(kwargs["agent_mode"])
 
         fields = [f"{k} = ?" for k in kwargs]
         values = list(kwargs.values())
@@ -282,9 +357,10 @@ def duplicate_conversation(conv_id: str) -> Optional[Dict[str, Any]]:
         cursor.execute(
             """
             INSERT INTO conversations (
-                id, title, system_prompt, max_context_messages, is_imported, is_auto_named, created_at, updated_at
+                id, title, system_prompt, max_context_messages, is_imported, is_auto_named,
+                workspace_dir, agent_mode, created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, 1, ?, ?)
+            VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
             """,
             (
                 new_conv_id,
@@ -292,6 +368,8 @@ def duplicate_conversation(conv_id: str) -> Optional[Dict[str, Any]]:
                 conv.get("system_prompt", ""),
                 conv.get("max_context_messages", 30),
                 1 if conv.get("is_imported") else 0,
+                conv.get("workspace_dir", ""),
+                _normalize_agent_mode(conv.get("agent_mode", "manual")),
                 now,
                 now,
             ),
@@ -300,13 +378,14 @@ def duplicate_conversation(conv_id: str) -> Optional[Dict[str, Any]]:
         for idx, m in enumerate(conv.get("messages", [])):
             new_msg_id = str(uuid.uuid4())
             msg_time = now + (idx * 0.001)
+            trace_json = json.dumps(_parse_tool_trace(m.get("tool_trace")))
             cursor.execute(
                 """
                 INSERT INTO messages (
                     id, conversation_id, role, content, thinking_content,
                     provider_id, provider_name, model_id, thinking_level,
-                    prompt_tokens, completion_tokens, cached_tokens, duration_ms, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, ?)
+                    prompt_tokens, completion_tokens, cached_tokens, duration_ms, worked_ms, tool_trace_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 0, ?, ?)
                 """,
                 (
                     new_msg_id,
@@ -318,6 +397,7 @@ def duplicate_conversation(conv_id: str) -> Optional[Dict[str, Any]]:
                     m.get("provider_name", ""),
                     m.get("model_id", ""),
                     m.get("thinking_level", "none"),
+                    trace_json,
                     msg_time,
                 ),
             )
@@ -326,16 +406,136 @@ def duplicate_conversation(conv_id: str) -> Optional[Dict[str, Any]]:
     return get_conversation(new_conv_id)
 
 
+def _restore_imported_ledger(
+    cursor: sqlite3.Cursor,
+    conv_id: str,
+    token_ledger: Optional[List[Dict[str, Any]]],
+    token_stats: Optional[Dict[str, Any]],
+    fallback_ts: float,
+) -> None:
+    """Restore exported token_ledger rows and/or token_stats summary on chat import."""
+    per_model_meta: Dict[tuple[str, str], Dict[str, Any]] = {}
+    if isinstance(token_stats, dict):
+        for pm in token_stats.get("per_model") or []:
+            if not isinstance(pm, dict):
+                continue
+            pid = str(pm.get("provider_id") or "unknown")
+            mid = strip_model_prefix(str(pm.get("model_id") or "default"))
+            per_model_meta[(pid, mid)] = pm
+
+    raw_rows = [r for r in (token_ledger or []) if isinstance(r, dict)]
+    inserted_g_req = 0
+    inserted_d_req = 0
+
+    if raw_rows:
+        assigned_cost_keys: set[tuple[str, str]] = set()
+        explicit_cost_keys = {
+            (str(r.get("provider_id") or "unknown"), strip_model_prefix(str(r.get("model_id") or "default")))
+            for r in raw_rows
+            if r.get("cost_usd") is not None
+        }
+        for idx, r in enumerate(raw_rows):
+            pid = str(r.get("provider_id") or "")
+            mid = str(r.get("model_id") or "")
+            clean_mid = strip_model_prefix(mid or "default")
+            key = (pid or "unknown", clean_mid)
+            pm = per_model_meta.get(key)
+            pname = str(r.get("provider_name") or (pm.get("provider_name") if pm else "") or "").strip()
+            cost_val = r.get("cost_usd")
+            if cost_val is None and pm is not None and key not in explicit_cost_keys and (mid or r.get("prompt_tokens")):
+                if key not in assigned_cost_keys:
+                    assigned_cost_keys.add(key)
+                    cost_val = float(pm.get("cost") or 0.0)
+                else:
+                    cost_val = 0.0
+            clean_cost = float(cost_val) if cost_val is not None else None
+            g_req = max(0, int(r.get("google_search_requests") or 0))
+            d_req = max(0, int(r.get("ddg_search_requests") or 0))
+            inserted_g_req += g_req
+            inserted_d_req += d_req
+            ts_val = r.get("created_at")
+            row_ts = float(ts_val) if isinstance(ts_val, (int, float)) and ts_val > 0 else (fallback_ts + idx * 0.0001)
+            cursor.execute(
+                """
+                INSERT INTO token_ledger (
+                    conversation_id, provider_id, provider_name, model_id,
+                    prompt_tokens, completion_tokens, cached_tokens,
+                    google_search_requests, ddg_search_requests, cost_usd, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    conv_id,
+                    pid,
+                    pname,
+                    mid,
+                    max(0, int(r.get("prompt_tokens") or 0)),
+                    max(0, int(r.get("completion_tokens") or 0)),
+                    max(0, int(r.get("cached_tokens") or 0)),
+                    g_req,
+                    d_req,
+                    clean_cost,
+                    row_ts,
+                ),
+            )
+    elif isinstance(token_stats, dict):
+        for idx, pm in enumerate(token_stats.get("per_model") or []):
+            if not isinstance(pm, dict):
+                continue
+            cursor.execute(
+                """
+                INSERT INTO token_ledger (
+                    conversation_id, provider_id, provider_name, model_id,
+                    prompt_tokens, completion_tokens, cached_tokens,
+                    google_search_requests, ddg_search_requests, cost_usd, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?)
+                """,
+                (
+                    conv_id,
+                    str(pm.get("provider_id") or ""),
+                    str(pm.get("provider_name") or "").strip(),
+                    str(pm.get("model_id") or ""),
+                    max(0, int(pm.get("prompt_tokens") or 0)),
+                    max(0, int(pm.get("completion_tokens") or 0)),
+                    max(0, int(pm.get("cached_tokens") or 0)),
+                    float(pm.get("cost") or 0.0),
+                    fallback_ts + idx * 0.0001,
+                ),
+            )
+
+    if isinstance(token_stats, dict):
+        gt = token_stats.get("grand_total") or {}
+        if isinstance(gt, dict):
+            g_delta = max(0, int(gt.get("google_search_requests") or 0) - inserted_g_req)
+            d_delta = max(0, int(gt.get("ddg_search_requests") or 0) - inserted_d_req)
+            if g_delta > 0 or d_delta > 0:
+                cursor.execute(
+                    """
+                    INSERT INTO token_ledger (
+                        conversation_id, provider_id, provider_name, model_id,
+                        prompt_tokens, completion_tokens, cached_tokens,
+                        google_search_requests, ddg_search_requests, cost_usd, created_at
+                    ) VALUES (?, 'websearch', '', '', 0, 0, 0, ?, ?, NULL, ?)
+                    """,
+                    (conv_id, g_delta, d_delta, fallback_ts),
+                )
+
+
 def import_conversation_data(
     title: str,
     system_prompt: str = "",
     max_context: int = 30,
     messages: Optional[List[Dict[str, Any]]] = None,
     created_at: Optional[float] = None,
+    workspace_dir: str = "",
+    agent_mode: str = "manual",
+    is_auto_named: Optional[bool] = None,
+    updated_at: Optional[float] = None,
+    token_ledger: Optional[List[Dict[str, Any]]] = None,
+    token_stats: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     Import a conversation from parsed JSON/Markdown data with a deduplicated title.
-    Preserves per-message token metadata while starting token_ledger spend at 0.
+    Restores conversation settings, per-message metrics/traces, and exported token/cost/search ledger data.
     """
     with open_db() as conn:
         conn.execute("BEGIN IMMEDIATE")
@@ -344,21 +544,29 @@ def import_conversation_data(
         new_conv_id = str(uuid.uuid4())
         now = time.time()
         conv_created = float(created_at) if isinstance(created_at, (int, float)) and created_at > 0 else now
+        conv_updated = float(updated_at) if isinstance(updated_at, (int, float)) and updated_at > 0 else now
+        clean_ws = str(workspace_dir or "").strip()
+        clean_mode = _normalize_agent_mode(agent_mode)
+        auto_named_val = 1 if (is_auto_named is None or is_auto_named) else 0
 
         cursor.execute(
             """
             INSERT INTO conversations (
-                id, title, system_prompt, max_context_messages, is_imported, is_auto_named, created_at, updated_at
+                id, title, system_prompt, max_context_messages, is_imported, is_auto_named,
+                workspace_dir, agent_mode, created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, 1, 1, ?, ?)
+            VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?)
             """,
             (
                 new_conv_id,
                 unique_title,
                 system_prompt or "",
                 max(1, min(500, int(max_context or 30))),
+                auto_named_val,
+                clean_ws,
+                clean_mode,
                 conv_created,
-                now,
+                conv_updated,
             ),
         )
 
@@ -373,13 +581,15 @@ def import_conversation_data(
                 c_tok = max(0, int(m.get("completion_tokens") or 0))
                 cache_tok = max(0, int(m.get("cached_tokens") or 0))
                 dur_ms = max(0, int(m.get("duration_ms") or 0))
+                wrk_ms = max(0, int(m.get("worked_ms") or 0))
+                trace_json = json.dumps(_parse_tool_trace(m.get("tool_trace")))
                 cursor.execute(
                     """
                     INSERT INTO messages (
                         id, conversation_id, role, content, thinking_content,
                         provider_id, provider_name, model_id, thinking_level,
-                        prompt_tokens, completion_tokens, cached_tokens, duration_ms, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        prompt_tokens, completion_tokens, cached_tokens, duration_ms, worked_ms, tool_trace_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         new_msg_id,
@@ -395,10 +605,13 @@ def import_conversation_data(
                         c_tok,
                         cache_tok,
                         dur_ms,
+                        wrk_ms,
+                        trace_json,
                         msg_time,
                     ),
                 )
 
+        _restore_imported_ledger(cursor, new_conv_id, token_ledger, token_stats, conv_created)
         conn.commit()
     return get_conversation(new_conv_id)
 
@@ -460,7 +673,9 @@ def add_message(
     cached_tokens: int = 0,
     msg_id: Optional[str] = None,
     duration_ms: int = 0,
+    worked_ms: int = 0,
     provider_name: str = "",
+    tool_trace: Optional[List[Dict[str, Any]]] = None,
 ) -> Optional[Dict[str, Any]]:
     if not conversation_id:
         return None
@@ -468,7 +683,10 @@ def add_message(
         msg_id = str(uuid.uuid4())
     now = time.time()
     clean_duration_ms = max(0, int(duration_ms or 0))
+    clean_worked_ms = max(0, int(worked_ms or 0))
     resolved_provider_name = (provider_name or "").strip()
+    clean_trace = _parse_tool_trace(tool_trace)
+    trace_json = json.dumps(clean_trace)
 
     try:
         with open_db() as conn:
@@ -487,8 +705,8 @@ def add_message(
                 INSERT INTO messages (
                     id, conversation_id, role, content, thinking_content,
                     provider_id, provider_name, model_id, thinking_level,
-                    prompt_tokens, completion_tokens, cached_tokens, duration_ms, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    prompt_tokens, completion_tokens, cached_tokens, duration_ms, worked_ms, tool_trace_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     msg_id,
@@ -504,6 +722,8 @@ def add_message(
                     completion_tokens,
                     cached_tokens,
                     clean_duration_ms,
+                    clean_worked_ms,
+                    trace_json,
                     now,
                 ),
             )
@@ -514,13 +734,14 @@ def add_message(
                 cursor.execute(
                     """
                     INSERT INTO token_ledger (
-                        conversation_id, provider_id, model_id,
+                        conversation_id, provider_id, provider_name, model_id,
                         prompt_tokens, completion_tokens, cached_tokens, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         conversation_id,
                         provider_id or "",
+                        resolved_provider_name,
                         model_id or "",
                         prompt_tokens,
                         completion_tokens,
@@ -548,6 +769,8 @@ def add_message(
         "completion_tokens": completion_tokens,
         "cached_tokens": cached_tokens,
         "duration_ms": clean_duration_ms,
+        "worked_ms": clean_worked_ms,
+        "tool_trace": clean_trace,
         "created_at": now,
     }
 

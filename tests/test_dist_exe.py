@@ -15,21 +15,12 @@ def _resolve_dist_exe() -> Path:
     override = os.environ.get("CHATINT_EXE_PATH", "").strip()
     if override:
         return Path(override)
-    default_candidate = Path("dist/v0.5.2/ChatInt.exe")
-    if default_candidate.exists():
-        return default_candidate
-    fallback_v051 = Path("dist/v0.5.1/ChatInt.exe")
-    if fallback_v051.exists():
-        return fallback_v051
-    fallback_v050 = Path("dist/v0.5.0/ChatInt.exe")
-    if fallback_v050.exists():
-        return fallback_v050
     dist_root = Path("dist")
     if dist_root.exists():
         matches = sorted(dist_root.glob("**/ChatInt.exe"), key=lambda p: p.stat().st_mtime, reverse=True)
         if matches:
             return matches[0]
-    return default_candidate
+    return Path("dist/v0.5.2/ChatInt.exe")
 
 
 DIST_EXE = _resolve_dist_exe()
@@ -52,8 +43,17 @@ class TestDistVersionInfo(unittest.TestCase):
 
         with Path("pyproject.toml").open("rb") as fh:
             project_meta = tomllib.load(fh)["project"]
-            expected_version = project_meta["version"]
             expected_description = project_meta.get("description", "ChatInt App")
+            folder_ver = (
+                exe_path.parent.name[1:]
+                if exe_path.parent.name.lower().startswith("v") and len(exe_path.parent.name) > 1
+                else ""
+            )
+            expected_version = (
+                os.environ.get("CHATINT_VERSION", "").strip().lstrip("vV")
+                or folder_ver
+                or project_meta["version"]
+            )
 
         rendered = str(vi)
         self.assertIn("StringStruct('ProductName', 'ChatInt')", rendered)
@@ -111,6 +111,23 @@ class TestDistExecutable(unittest.TestCase):
                 c.execute("SELECT COUNT(*) FROM providers")
                 prov_count = c.fetchone()[0]
                 self.assertGreaterEqual(prov_count, 3)
+
+                self.assertEqual(c.execute("PRAGMA user_version").fetchone()[0], 5)
+                c.execute("SELECT key, value FROM app_settings")
+                app_cfg = dict(c.fetchall())
+                self.assertEqual(app_cfg.get("use_gemini_web_search"), "false")
+                self.assertEqual(app_cfg.get("default_workspace_dir"), "")
+                self.assertEqual(app_cfg.get("default_agent_mode"), "manual")
+                conv_cols = {r[1] for r in c.execute("PRAGMA table_info(conversations)").fetchall()}
+                self.assertIn("workspace_dir", conv_cols)
+                self.assertIn("agent_mode", conv_cols)
+                msg_cols = {r[1] for r in c.execute("PRAGMA table_info(messages)").fetchall()}
+                self.assertIn("tool_trace_json", msg_cols)
+                self.assertIn("worked_ms", msg_cols)
+                ledger_cols = {r[1] for r in c.execute("PRAGMA table_info(token_ledger)").fetchall()}
+                self.assertIn("ddg_search_requests", ledger_cols)
+                self.assertIn("provider_name", ledger_cols)
+                self.assertIn("cost_usd", ledger_cols)
 
             proc2 = subprocess.run([str(DIST_EXE)], cwd=str(dist_dir), capture_output=True, timeout=15)
             self.assertEqual(proc2.returncode, 0, "Second instance must exit cleanly with code 0")

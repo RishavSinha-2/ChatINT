@@ -238,7 +238,7 @@ FRONTEND_RUNNER_SCRIPT = r"""
   <script type="module">
     try {
       const { _isSafeUrl, renderMarkdownWithEnhancements } = await import("./js/markdown.js");
-      const { createTabObject, el, getDropdownProviders, state, uiHooks } = await import("./js/state.js");
+      const { createTabObject, el, getDropdownProviders, getWebSearchAvailability, state, uiHooks } = await import("./js/state.js");
       const { callApi, flushTabsState, isTabsStateDirty, persistTabsState } = await import("./js/api.js");
       const { copyText } = await import("./js/dialogs.js");
       const {
@@ -249,6 +249,7 @@ FRONTEND_RUNNER_SCRIPT = r"""
         renderActivePanes,
         renderTabs,
         renderTokenStats,
+        renderToolStatusBanner,
         sendMessageFromPane,
       } = await import("./js/panes.js");
       const { renderConversationsList } = await import("./js/sidebar.js");
@@ -257,6 +258,7 @@ FRONTEND_RUNNER_SCRIPT = r"""
         renderSettingsContent,
         saveActiveProviderInputs,
         saveGeneralTabInputs,
+        saveWebSearchTabInputs,
         refreshProviderAccessibility,
       } = await import("./js/settings.js");
       const { onStreamEvent } = await import("./js/streaming.js");
@@ -626,9 +628,13 @@ FRONTEND_RUNNER_SCRIPT = r"""
             completion_tokens: 467,
             cached_tokens: 0,
             duration_ms: 9630,
+            worked_ms: 22410,
           }, pane);
           assertEqual(msgEl.querySelector(".provider-tag").textContent, "BONSAI", "message badge must show Settings provider name");
           assertEqual(msgEl.querySelector(".msg-token-meta").textContent, "171 in / 467 out · 48.5 tok/s", "message metadata must include tok/s");
+          const workedEl = msgEl.querySelector(".assistant-worked-meta");
+          assert(workedEl && workedEl.textContent === "Worked for 22.4s", "Worked for Xs line must render when worked_ms > 0");
+          assertEqual(msgEl.firstElementChild, workedEl, "Worked for Xs must sit as first line above metrics row");
 
           const cachedFastEl = createMessageElement(tab, {
             id: "m_deepseek",
@@ -661,6 +667,7 @@ FRONTEND_RUNNER_SCRIPT = r"""
           }, pane);
           assertEqual(legacyEl.querySelector(".provider-tag").textContent, "CUSTOM", "deleted custom provider without name must not show raw ID");
           assertEqual(legacyEl.querySelector(".msg-token-meta").textContent, "171 in / 467 out", "zero duration_ms omits tok/s");
+          assertEqual(legacyEl.querySelector(".assistant-worked-meta"), null, "zero worked_ms omits Worked for Xs");
 
           renderTokenStats(pane, tab.id, {
             per_model: [{
@@ -683,12 +690,20 @@ FRONTEND_RUNNER_SCRIPT = r"""
               cache_hit_rate: 0,
               total_tokens: 638,
               total_cost: 0,
-              google_search_requests: 0,
+              google_search_requests: 2,
+              ddg_search_requests: 5,
+              web_search_requests: 7,
             },
           });
           const statsText = pane.querySelector(".stats-table").textContent;
           assert(statsText.includes("Bonsai"), "stats table must show Settings provider name");
           assert(!statsText.includes("provider_1795606486438"), "stats table must not leak raw provider_id");
+          const searchSection = pane.querySelector(".search-requests-section");
+          assert(searchSection, "Web Search summary section must render");
+          assert(searchSection.textContent.includes("Web Search") && searchSection.textContent.includes("7"), "Web Search total mismatch");
+          assert(searchSection.textContent.includes("Google Search") && searchSection.textContent.includes("2"), "Google Search subfield mismatch");
+          assert(searchSection.textContent.includes("DuckDuckGo Search") && searchSection.textContent.includes("5"), "DuckDuckGo Search subfield mismatch");
+          assert(!searchSection.textContent.includes("this month") && !searchSection.textContent.includes("5,000"), "monthly count must not appear");
         } finally {
           state.providers = origProviders;
         }
@@ -808,6 +823,44 @@ FRONTEND_RUNNER_SCRIPT = r"""
         } finally {
           window.pywebview.api.get_conversation = origGetConv;
           window.pywebview.api.send_message = origSend;
+        }
+      }],
+
+      ["test_stage1_web_search_out_of_box_and_gemini_toggle", async () => {
+        const origSettings = { ...state.settings };
+        state.settings.use_gemini_web_search = "false";
+        try {
+          const ddgAvail = getWebSearchAvailability();
+          assertEqual(ddgAvail.available, true, "web search must be available out of box with no Gemini key");
+
+          const tab = createTabObject({ providerId: "openai", modelId: "gpt-5" });
+          state.tabs = [tab];
+          state.activeTabId = tab.id;
+          state.splitTabIds = [tab.id];
+          renderActivePanes();
+          const wsBtn = document.getElementById(`web-search-btn-${tab.id}`);
+          assertEqual(wsBtn.disabled, false, "Web Search toggle must be enabled for non-Gemini models by default");
+
+          const banner = document.createElement("div");
+          renderToolStatusBanner(banner, { status: "done", tool: "web_search", ok: true, provider_used: "duckduckgo", results_count: 3 });
+          assert(banner.textContent.includes("Web search complete (3 results)"), "DDG status banner text must display result count");
+
+          state.masterSettingsTab = "websearch";
+          openSettingsModal();
+          const geminiToggle = document.getElementById("setting-use-gemini-web-search");
+          assert(Boolean(geminiToggle), "Use Gemini Google Search toggle must render in Settings -> Web Search");
+          assertEqual(geminiToggle.checked, false, "Use Gemini Google Search toggle must default to unchecked");
+
+          geminiToggle.checked = true;
+          geminiToggle.dispatchEvent(new Event("change"));
+          saveWebSearchTabInputs();
+          assertEqual(state.settingsBuffer.settings.use_gemini_web_search, "true", "toggling updates buffered setting");
+          const modalText = el.settingsTabContent.textContent || "";
+          assert(modalText.includes("NO API KEY"), "enabling Gemini search without Gemini key surfaces NO API KEY status");
+          el.settingsModal.classList.remove("open");
+        } finally {
+          state.settings = origSettings;
+          state.masterSettingsTab = "general";
         }
       }],
     ];
@@ -999,6 +1052,355 @@ class TestFrontendBehavioralUI(unittest.TestCase):
         if failures:
             formatted = "\n\n".join(f"[{f['name']}]\n{f.get('error')}" for f in failures)
             self.fail(f"{len(failures)} frontend behavioral test(s) failed:\n{formatted}")
+
+    def test_stage2_workspace_timeline_and_approval_ui(self):
+        edge_bin = _find_edge_binary()
+        if not edge_bin:
+            self.skipTest("Microsoft Edge/Chromium binary not available for headless Stage 2 UI tests.")
+
+        stage2_mock_api_js = r"""
+window.__stage2ApprovalCalls = [];
+window.__stage2ConvUpdates = [];
+const __stage2Factory = new Function("fn", "return function() { return fn.apply(this, arguments); };");
+window.pywebview = {
+  api: {
+    get_initial_data: __stage2Factory(async () => ({
+      ok: true,
+      error: null,
+      data: {
+        providers: [
+          {
+            id: "openai",
+            name: "OpenAI",
+            base_url: "https://api.openai.com/v1",
+            is_enabled: true,
+            has_api_key: true,
+            api_key_mask: "sk-s2••••1234",
+            sync_status: "ready",
+            sync_error: "",
+            is_accessible: true,
+            fetched_model_ids: ["gpt-5"],
+            models: [{ id: "gpt-5", name: "gpt-5", input_price: 1.0, cached_input_price: 0.1, output_price: 5.0 }],
+          },
+        ],
+        settings: {
+          theme: "dark",
+          global_system_prompt: "Helpful",
+          default_provider: "openai",
+          default_model: "gpt-5",
+          default_thinking: "medium",
+          use_gemini_web_search: "false",
+          default_workspace_dir: "",
+          default_agent_mode: "manual",
+        },
+        conversations: [],
+        tabs_state: null,
+        google_search_totals: { month: "2026-11", monthly: 0, all_time: 0 },
+        web_search_models: [],
+      },
+    })),
+    get_pending_events: __stage2Factory(async () => ({ ok: true, data: [], error: null })),
+    save_tabs_state: __stage2Factory(async () => ({ ok: true, data: { success: true }, error: null })),
+    select_workspace_folder: __stage2Factory(async () => ({
+      ok: true,
+      data: { success: true, cancelled: false, path: "C:\\Work\\my_repo" },
+      error: null,
+    })),
+    resolve_tool_approval: __stage2Factory(async (tabId, streamId, approvalId, decision) => {
+      window.__stage2ApprovalCalls.push({ tabId, streamId, approvalId, decision });
+      return { ok: true, data: { success: true, decision }, error: null };
+    }),
+    update_conversation_settings: __stage2Factory(async (convId, sysP, maxC, wsDir, mode) => {
+      window.__stage2ConvUpdates.push({ convId, wsDir, mode });
+      return { ok: true, data: { success: true }, error: null };
+    }),
+    save_settings: __stage2Factory(async (provs, settings, wsModels) => ({
+      ok: true,
+      data: { success: true, providers: provs, web_search_models: wsModels },
+      error: null,
+    })),
+  },
+};
+"""
+
+        stage2_check_js = r"""
+function assert(cond, msg) {
+  if (!cond) throw new Error(msg || "Assertion failed");
+}
+async function run() {
+  const results = [];
+  async function test(name, fn) {
+    try {
+      await fn();
+      results.push({ name, ok: true });
+    } catch (e) {
+      results.push({ name, ok: false, error: (e && e.stack) || String(e) });
+    }
+  }
+  const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+  for (let i = 0; i < 40 && !(window.ChatInt && window.ChatInt.state.tabs.length > 0); i++) {
+    await wait(25);
+  }
+  assert(window.ChatInt && window.ChatInt.state.tabs.length > 0, "App failed to boot initial tab");
+
+  await test("independent_toggles_and_workspace_picker", async () => {
+    const tab = window.ChatInt.state.tabs[0];
+    const wsBtn = document.getElementById(`web-search-btn-${tab.id}`);
+    const agBtn = document.getElementById(`agent-mode-btn-${tab.id}`);
+    const polBtn = document.getElementById(`agent-policy-btn-${tab.id}`);
+    const folderBtn = document.getElementById(`workspace-btn-${tab.id}`);
+    const folderLbl = document.getElementById(`workspace-label-${tab.id}`);
+    const clearBtn = document.getElementById(`workspace-clear-btn-${tab.id}`);
+    assert(wsBtn && agBtn && polBtn && folderBtn && folderLbl && clearBtn, "Missing Stage 2 toolbar buttons");
+    assert(polBtn.style.display === "none", "Manual/Auto pill should be hidden while Agent is OFF");
+    assert(folderLbl.textContent === "No Workspace", "Initial workspace label mismatch");
+
+    agBtn.click();
+    assert(tab.agentEnabled === true, "Agent click must turn Agent ON");
+    assert(tab.webSearchEnabled === false, "Agent toggle must NOT turn Web Search ON");
+    assert(polBtn.style.display !== "none" && polBtn.textContent.trim() === "Manual", "Policy pill should show Manual");
+
+    polBtn.click();
+    assert(tab.agentMode === "auto" && polBtn.textContent.trim() === "Auto", "Policy pill should toggle to Auto");
+    polBtn.click();
+    assert(tab.agentMode === "manual", "Policy pill should toggle back to Manual");
+
+    folderBtn.click();
+    await wait(30);
+    assert(tab.workspaceDir === "C:\\Work\\my_repo", "Workspace picker should set tab.workspaceDir");
+    assert(folderLbl.textContent === "my_repo", "Workspace label should show basename my_repo");
+    assert(clearBtn.style.display !== "none", "Clear button should appear when per-tab workspace set");
+
+    clearBtn.click();
+    assert(tab.workspaceDir === "", "Clear button should reset per-tab override");
+    assert(folderLbl.textContent === "No Workspace", "Workspace label should reset to No Workspace");
+  });
+
+  await test("settings_global_workspace_fallback", async () => {
+    document.getElementById("global-settings-btn").click();
+    await wait(20);
+    const browseBtn = document.getElementById("browse-default-workspace-btn");
+    const wsInput = document.getElementById("setting-default-workspace-dir");
+    const modeSel = document.getElementById("setting-default-agent-mode");
+    assert(browseBtn && wsInput && modeSel, "Settings -> General should render default workspace & mode controls");
+    browseBtn.click();
+    await wait(25);
+    assert(wsInput.value === "C:\\Work\\my_repo", "Browse should fill setting-default-workspace-dir");
+    document.getElementById("save-settings-btn").click();
+    await wait(25);
+    const tab = window.ChatInt.state.tabs[0];
+    const folderLbl = document.getElementById(`workspace-label-${tab.id}`);
+    assert(folderLbl.textContent === "my_repo", "Tabs without override should reflect updated Global Default Workspace");
+  });
+
+  await test("live_timeline_approval_card_rerender_and_done", async () => {
+    const tab = window.ChatInt.state.tabs[0];
+    const { onStreamEvent, renderActivePanes } = window.ChatInt;
+    onStreamEvent({ type: "start", tab_id: tab.id, stream_id: "s2_stream", provider_id: "openai", model_id: "gpt-5", thinking_level: "none" });
+    onStreamEvent({ type: "tool_status", tab_id: tab.id, stream_id: "s2_stream", call_id: "c1", tool: "read_file", status: "running", summary: "Reading src/app.py", args_preview: "src/app.py" });
+    onStreamEvent({ type: "tool_status", tab_id: tab.id, stream_id: "s2_stream", call_id: "c1", tool: "read_file", status: "done", summary: "Read src/app.py (1-20)", args_preview: "src/app.py", duration_ms: 45 });
+    onStreamEvent({
+      type: "tool_approval_required",
+      tab_id: tab.id,
+      stream_id: "s2_stream",
+      approval_id: "apr_1",
+      call_id: "c2",
+      tool: "edit_file",
+      path: "src/app.py",
+      summary: "Edit src/app.py",
+      diff: "--- a/src/app.py\n+++ b/src/app.py\n@@ -1 +1 @@\n-old\n+new",
+    });
+
+    // Trigger full pane re-render while awaiting approval; card and timeline must survive
+    renderActivePanes();
+    const timelineSlot = document.getElementById(`live-tool-timeline-${tab.id}`);
+    const approvalSlot = document.getElementById(`live-approval-slot-${tab.id}`);
+    assert(timelineSlot && timelineSlot.querySelector(".tool-timeline-step"), "Live timeline steps missing after renderActivePanes");
+    assert(approvalSlot && approvalSlot.querySelector(".tool-approval-card"), "Approval card missing after renderActivePanes");
+    assert(approvalSlot.querySelector(".diff-line.add")?.textContent === "+new", "Added diff line mismatch");
+    assert(approvalSlot.querySelector(".diff-line.del")?.textContent === "-old", "Deleted diff line mismatch");
+
+    const autoBtn = approvalSlot.querySelector(".approval-auto-btn");
+    assert(autoBtn, "Switch Tab to Auto button missing");
+    autoBtn.click();
+    await wait(25);
+    assert(window.__stage2ApprovalCalls.length === 1, "Approval RPC not sent");
+    assert(window.__stage2ApprovalCalls[0].decision === "allow_all_tab", "Expected allow_all_tab decision");
+
+    onStreamEvent({ type: "agent_mode_changed", tab_id: tab.id, stream_id: "s2_stream", agent_mode: "auto" });
+    assert(tab.agentMode === "auto", "Tab mode should promote to Auto on agent_mode_changed");
+    assert(document.getElementById(`agent-policy-btn-${tab.id}`).textContent.trim() === "Auto", "UI pill should show Auto");
+
+    onStreamEvent({ type: "content_chunk", tab_id: tab.id, stream_id: "s2_stream", chunk: "Updated file cleanly." });
+    onStreamEvent({
+      type: "done",
+      tab_id: tab.id,
+      stream_id: "s2_stream",
+      message: {
+        id: "msg_s2_1",
+        role: "assistant",
+        content: "Updated file cleanly.",
+        thinking_content: "",
+        provider_id: "openai",
+        model_id: "gpt-5",
+        thinking_level: "none",
+        prompt_tokens: 10,
+        completion_tokens: 4,
+        cached_tokens: 0,
+        duration_ms: 210,
+        tool_trace: [
+          { call_id: "c1", tool: "read_file", status: "done", summary: "Read src/app.py (1-20)", duration_ms: 45 },
+          { call_id: "c2", tool: "edit_file", status: "done", summary: "Edited src/app.py", diff: "-old\n+new", duration_ms: 15 },
+        ],
+      },
+    });
+
+    const msgRow = document.querySelector(`[data-msg-id="msg_s2_1"]`);
+    assert(msgRow, "Final message row not rendered");
+    const acc = msgRow.querySelector(".tool-timeline-accordion");
+    assert(acc && acc.classList.contains("collapsed"), "Final timeline should default to collapsed");
+    assert(acc.textContent.includes("Used 2 tools"), "Header summary should report Used 2 tools");
+    acc.querySelector(".tool-timeline-header").click();
+    assert(!acc.classList.contains("collapsed"), "Clicking timeline header should expand it");
+  });
+
+  await fetch("/__report", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ results }),
+  });
+}
+run().catch(async (err) => {
+  await fetch("/__report", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ boot_error: (err && err.stack) || String(err) }),
+  });
+});
+"""
+
+        raw_index = (UI_ROOT / "index.html").read_text(encoding="utf-8")
+        stage2_html = raw_index.replace(
+            '<script type="module" src="app.js"></script>',
+            '<script src="__s2_mock_api.js"></script>\n  <script type="module" src="app.js"></script>\n  <script type="module" src="__s2_check.js"></script>',
+        )
+        done_event = threading.Event()
+        received_payload = {}
+
+        class _Stage2Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, format, *args):
+                return
+
+            def do_POST(self):
+                if self.path == "/__report":
+                    length = int(self.headers.get("Content-Length", "0") or 0)
+                    body = self.rfile.read(length).decode("utf-8") if length > 0 else "{}"
+                    received_payload.update(json.loads(body))
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(b"{}")
+                    done_event.set()
+                    return
+                self.send_error(404)
+
+            def do_GET(self):
+                req_path = self.path.split("?", 1)[0].lstrip("/")
+                if req_path in ("", "__stage2.html"):
+                    data = stage2_html.encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/html; charset=utf-8")
+                    self.send_header("Content-Length", str(len(data)))
+                    self.end_headers()
+                    self.wfile.write(data)
+                    return
+                if req_path == "__s2_mock_api.js":
+                    data = stage2_mock_api_js.encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/javascript; charset=utf-8")
+                    self.send_header("Content-Length", str(len(data)))
+                    self.end_headers()
+                    self.wfile.write(data)
+                    return
+                if req_path == "__s2_check.js":
+                    data = stage2_check_js.encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/javascript; charset=utf-8")
+                    self.send_header("Content-Length", str(len(data)))
+                    self.end_headers()
+                    self.wfile.write(data)
+                    return
+
+                candidate = (UI_ROOT / req_path).resolve()
+                if not candidate.is_relative_to(UI_ROOT.resolve()) or not candidate.is_file():
+                    self.send_error(404)
+                    return
+                ext = candidate.suffix.lower()
+                ctype = {
+                    ".js": "application/javascript; charset=utf-8",
+                    ".css": "text/css; charset=utf-8",
+                    ".html": "text/html; charset=utf-8",
+                    ".woff2": "font/woff2",
+                    ".ttf": "font/ttf",
+                    ".png": "image/png",
+                }.get(ext, "application/octet-stream")
+                data = candidate.read_bytes()
+                self.send_response(200)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Stage2Handler)
+        port = server.server_address[1]
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        profile_dir = tempfile.TemporaryDirectory(prefix="chatint_s2_edge_")
+        proc = None
+        try:
+            proc = subprocess.Popen(
+                [
+                    edge_bin,
+                    "--headless=new",
+                    "--disable-gpu",
+                    "--no-first-run",
+                    "--no-default-browser-check",
+                    "--disable-extensions",
+                    f"--user-data-dir={profile_dir.name}",
+                    f"http://127.0.0.1:{port}/__stage2.html",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            finished = done_event.wait(timeout=20.0)
+            self.assertTrue(finished, "Timed out waiting for Stage 2 headless Edge runner")
+        finally:
+            if proc is not None:
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=3.0)
+                except Exception:
+                    try:
+                        proc.kill()
+                        proc.wait(timeout=2.0)
+                    except Exception:
+                        pass
+                for stream in (proc.stdout, proc.stderr):
+                    if stream:
+                        try:
+                            stream.close()
+                        except Exception:
+                            pass
+            server.shutdown()
+            server.server_close()
+            profile_dir.cleanup()
+
+        if "boot_error" in received_payload:
+            self.fail(f"Stage 2 UI test runner boot error:\n{received_payload['boot_error']}")
+        results = received_payload.get("results", [])
+        self.assertEqual(len(results), 3, f"Expected 3 Stage 2 UI tests, got {results}")
+        failures = [r for r in results if not r.get("ok")]
+        if failures:
+            self.fail("\n\n".join(f"[{f['name']}]\n{f.get('error')}" for f in failures))
 
 
 if __name__ == "__main__":

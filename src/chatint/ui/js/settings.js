@@ -26,6 +26,7 @@ import {
   resolveProviderDisplayName,
   state,
   stripModelPrefix,
+  uiHooks,
 } from "./state.js";
 
 let activeConfigModelRef = null;
@@ -417,6 +418,24 @@ export function renderSettingsContent(options = {}) {
         </select>
       </div>
 
+      <div class="settings-group" style="padding-top: 8px; border-top: 1px solid var(--border-subtle);">
+        <label class="settings-label" for="setting-default-workspace-dir">Default Agent Workspace Folder (Global)</label>
+        <div class="ws-path-picker-row">
+          <input type="text" class="settings-input" id="setting-default-workspace-dir" value="${escapeHtml(buf.settings.default_workspace_dir || "")}" placeholder="None (select per chat or browse here)" readonly>
+          <button type="button" class="btn-secondary" id="browse-default-workspace-btn">Browse...</button>
+          <button type="button" class="btn-secondary" id="clear-default-workspace-btn">Clear</button>
+        </div>
+        <span style="font-size: 11.5px; color: var(--text-muted);">Used automatically when Agent Mode is enabled on chats without a per-chat workspace override.</span>
+      </div>
+
+      <div class="settings-group">
+        <label class="settings-label" for="setting-default-agent-mode">Default Agent Approval Mode</label>
+        <select class="settings-input" id="setting-default-agent-mode">
+          <option value="manual" ${buf.settings.default_agent_mode !== "auto" ? "selected" : ""}>Manual — ask permission before writing or editing files</option>
+          <option value="auto" ${buf.settings.default_agent_mode === "auto" ? "selected" : ""}>Auto — allow all file reads and edits automatically</option>
+        </select>
+      </div>
+
       <div class="settings-group" style="padding-top: 6px; border-top: 1px solid var(--border-subtle);">
         <div style="display: flex; align-items: center; justify-content: space-between; gap: 12px;">
           <div style="display: flex; flex-direction: column; gap: 2px;">
@@ -464,26 +483,72 @@ export function renderSettingsContent(options = {}) {
         }
       };
     }
+
+    const wsInput = document.getElementById("setting-default-workspace-dir");
+    const wsBrowseBtn = document.getElementById("browse-default-workspace-btn");
+    const wsClearBtn = document.getElementById("clear-default-workspace-btn");
+    const agentModeSel = document.getElementById("setting-default-agent-mode");
+    if (wsBrowseBtn) {
+      wsBrowseBtn.onclick = async () => {
+        const res = await callApi("select_workspace_folder");
+        if (res && res.error) {
+          showNoticeDialog(res.error);
+          return;
+        }
+        if (res && !res.cancelled && res.path) {
+          buf.settings.default_workspace_dir = res.path;
+          if (wsInput) wsInput.value = res.path;
+        }
+      };
+    }
+    if (wsClearBtn) {
+      wsClearBtn.onclick = () => {
+        buf.settings.default_workspace_dir = "";
+        if (wsInput) wsInput.value = "";
+      };
+    }
+    if (agentModeSel) {
+      agentModeSel.onchange = () => {
+        buf.settings.default_agent_mode = agentModeSel.value === "auto" ? "auto" : "manual";
+      };
+    }
   } else if (buf.masterSettingsTab === "websearch") {
     buf.webSearchModels = normalizeWebSearchModelsClient(buf.webSearchModels);
     const geminiProv = buf.providers.find((p) => p.id === "gemini");
-    const { available: wsAvail, reason: wsReason } = getWebSearchAvailability(geminiProv, buf.webSearchModels);
-    const wsStatusLine = wsAvail
-      ? '<span style="color: #34a853; font-weight: 600;">Ready</span> · Using your Gemini provider API key.'
-      : `<span style="color: var(--danger-text); font-weight: 600;">Unavailable (${escapeHtml(wsReason)})</span> · Configure Gemini in Providers.`;
+    const useGeminiSearch = String(buf.settings.use_gemini_web_search || "false").trim().toLowerCase() === "true";
+    const { available: wsAvail, reason: wsReason } = getWebSearchAvailability(
+      geminiProv,
+      buf.webSearchModels,
+      buf.settings
+    );
+    const wsStatusLine = !useGeminiSearch
+      ? '<span style="color: #34a853; font-weight: 600;">Ready (DuckDuckGo)</span> · Works out of the box with any provider/model.'
+      : (wsAvail
+          ? '<span style="color: #34a853; font-weight: 600;">Ready (Gemini Google Search)</span> · Using your Gemini provider API key.'
+          : `<span style="color: var(--danger-text); font-weight: 600;">Unavailable (${escapeHtml(wsReason)})</span> · Configure Gemini in Providers.`);
 
     const wsModels = buf.webSearchModels;
     const totalWs = wsModels.length;
 
     el.settingsTabContent.innerHTML = `
       <div class="provider-detail-pane">
+        <div class="ws-toggle-card">
+          <label class="ws-toggle-row" for="setting-use-gemini-web-search">
+            <input type="checkbox" id="setting-use-gemini-web-search" ${useGeminiSearch ? "checked" : ""}>
+            <div class="ws-toggle-meta">
+              <span class="ws-toggle-title">Use Gemini Google Search</span>
+              <span class="ws-toggle-desc">Off (default): uses keyless DuckDuckGo metasearch for any model. On: routes search through Gemini-grounded Google Search using your Gemini API key.</span>
+            </div>
+          </label>
+        </div>
+
         <div class="websearch-info-banner">
           <div><strong>Status:</strong> ${wsStatusLine}</div>
         </div>
 
-        <div class="settings-group" style="margin-top: 4px;">
+        <div class="settings-group ws-gemini-section${useGeminiSearch ? "" : " dimmed"}" style="margin-top: 4px;">
           <div style="display: flex; align-items: center; justify-content: space-between;">
-            <label class="settings-label">Configured Search Models (Max 5 · Priority Order)</label>
+            <label class="settings-label">Gemini Search Models (Active when Gemini Search is On · Max 5)</label>
             <div style="display: flex; gap: 6px; align-items: center;">
               <button class="btn-secondary ws-auto-add-models-btn" style="padding: 2px 8px; font-size: 11px; display: flex; align-items: center; gap: 4px;" title="Fetch Gemini models, prune missing models, and auto-add available models up to 5 total">
                 <i data-lucide="plus-circle" style="width: 11px; height: 11px;"></i>
@@ -507,6 +572,14 @@ export function renderSettingsContent(options = {}) {
         </div>
       </div>
     `;
+
+    const useGeminiCheck = document.getElementById("setting-use-gemini-web-search");
+    if (useGeminiCheck) {
+      useGeminiCheck.onchange = () => {
+        buf.settings.use_gemini_web_search = useGeminiCheck.checked ? "true" : "false";
+        renderSettingsContent();
+      };
+    }
 
     el.settingsTabContent.querySelectorAll(".ws-model-config-btn").forEach((btn) => {
       btn.onclick = () => {
@@ -1089,6 +1162,27 @@ export function saveGeneralTabInputs() {
       buf.settings.theme = themeSelect.value;
       applyTheme(themeSelect.value, { persistState: false });
     }
+
+    const wsInput = document.getElementById("setting-default-workspace-dir");
+    if (wsInput) {
+      buf.settings.default_workspace_dir = wsInput.value.trim();
+    }
+
+    const modeSelect = document.getElementById("setting-default-agent-mode");
+    if (modeSelect) {
+      buf.settings.default_agent_mode = modeSelect.value === "auto" ? "auto" : "manual";
+    }
+  }
+}
+
+export function saveWebSearchTabInputs() {
+  if (!state.settingsBuffer) return;
+  const buf = state.settingsBuffer;
+  if (buf.masterSettingsTab === "websearch") {
+    const useGeminiCheck = document.getElementById("setting-use-gemini-web-search");
+    if (useGeminiCheck) {
+      buf.settings.use_gemini_web_search = useGeminiCheck.checked ? "true" : "false";
+    }
   }
 }
 
@@ -1139,6 +1233,7 @@ export function saveActiveProviderInputs() {
 export async function saveSettingsFromModal() {
   if (!state.settingsBuffer) return;
   saveGeneralTabInputs();
+  saveWebSearchTabInputs();
   saveActiveProviderInputs();
 
   const buf = state.settingsBuffer;
@@ -1207,6 +1302,7 @@ export async function saveSettingsFromModal() {
 
   syncAllPaneModelDropdowns();
   syncAllPaneWebSearchButtons();
+  uiHooks.syncAllPaneAgentControls?.();
   renderTabs();
   if (el.panesContainer) {
     el.panesContainer.querySelectorAll(".provider-tag[data-provider-id]").forEach((tagEl) => {

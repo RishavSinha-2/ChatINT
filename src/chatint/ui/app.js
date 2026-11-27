@@ -30,6 +30,9 @@ import {
   renderActivePanes,
   renderAllTabsPopover,
   renderTabs,
+  syncAllPaneAgentControls,
+  updateLiveApprovalCard,
+  updateLiveToolTimeline,
 } from "./js/panes.js";
 import {
   closeModelConfigModal,
@@ -40,6 +43,7 @@ import {
   saveActiveProviderInputs,
   saveGeneralTabInputs,
   saveSettingsFromModal,
+  saveWebSearchTabInputs,
   updateMasterTabsUI,
 } from "./js/settings.js";
 import {
@@ -119,6 +123,9 @@ uiHooks.saveGeneralTabInputs = saveGeneralTabInputs;
 uiHooks.saveActiveProviderInputs = saveActiveProviderInputs;
 uiHooks.renderSettingsContent = renderSettingsContent;
 uiHooks.refreshProviderAccessibility = refreshProviderAccessibility;
+uiHooks.syncAllPaneAgentControls = syncAllPaneAgentControls;
+uiHooks.updateLiveToolTimeline = updateLiveToolTimeline;
+uiHooks.updateLiveApprovalCard = updateLiveApprovalCard;
 
 window.ChatIntUI = { onStreamEvent };
 window.ChatInt = {
@@ -367,6 +374,16 @@ function setupEventListeners() {
       }
     }
 
+    const timelineHdr = e.target.closest(".tool-timeline-header");
+    if (timelineHdr) {
+      const acc = timelineHdr.closest(".tool-timeline-accordion");
+      if (acc) {
+        acc.classList.toggle("collapsed");
+        acc.dataset.userToggled = "1";
+        return;
+      }
+    }
+
     const blockedImgBtn = e.target.closest(".blocked-external-image");
     if (blockedImgBtn) {
       const rawSrc = (blockedImgBtn.getAttribute("data-external-src") || "").trim();
@@ -395,6 +412,7 @@ function setupEventListeners() {
   // Master Settings Tabs
   if (el.masterTabGeneral) {
     el.masterTabGeneral.onclick = () => {
+      saveWebSearchTabInputs();
       saveActiveProviderInputs();
       if (state.settingsBuffer) state.settingsBuffer.masterSettingsTab = "general";
       state.masterSettingsTab = "general";
@@ -406,6 +424,7 @@ function setupEventListeners() {
   if (el.masterTabProviders) {
     el.masterTabProviders.onclick = () => {
       saveGeneralTabInputs();
+      saveWebSearchTabInputs();
       if (state.settingsBuffer) state.settingsBuffer.masterSettingsTab = "providers";
       state.masterSettingsTab = "providers";
       updateMasterTabsUI();

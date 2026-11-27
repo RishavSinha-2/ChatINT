@@ -73,6 +73,9 @@ def stream_chat_completion(
     assistant_msg_id: Optional[str] = None,
     web_search_enabled: bool = False,
     stream_id: Optional[str] = None,
+    agent_enabled: bool = False,
+    workspace_dir: str = "",
+    agent_mode: str = "manual",
 ) -> None:
     stream_chat_completion_impl(
         bridge=bridge,
@@ -87,6 +90,9 @@ def stream_chat_completion(
         stream_id=stream_id,
         sdk_streamers=_SDK_STREAMERS,
         auto_naming_fn=_trigger_auto_naming,
+        agent_enabled=agent_enabled,
+        workspace_dir=workspace_dir,
+        agent_mode=agent_mode,
     )
 
 

@@ -102,6 +102,7 @@ class TestChatIntFeatures(unittest.TestCase):
             c.execute("DELETE FROM token_ledger")
             c.execute("DELETE FROM conversations")
             c.execute("DELETE FROM providers")
+            c.execute("DELETE FROM app_settings")
             conn.commit()
         if self.env_path.exists():
             self.env_path.unlink()
@@ -589,7 +590,10 @@ Gradient descent minimizes the loss function step by step.
         res = bridge.edit_message("tab1", conv["id"], "nonexistent_id", "hi", "openai", "gpt-4o", "none")
         self.assertIn("error", res)
 
-        # Web search model 404 must not overwrite gemini global sync_status
+        # Web search model 404 must not overwrite gemini global sync_status when Gemini search is opted in
+        from chatint.db import save_app_settings
+
+        save_app_settings({"use_gemini_web_search": "true"})
         set_api_key_in_env("Gemini", "AIza-test")
         BackgroundModelSyncer.set_sync_status("gemini", "ready", "")
 
@@ -2101,6 +2105,854 @@ Gradient descent minimizes the loss function step by step.
         finally:
             env_p.write_text(orig_env, encoding="utf-8")
 
+
+
+    def test_stage1_ddg_default_web_search_and_gemini_opt_in(self):
+        from chatint.db import get_app_settings, save_app_settings
+        from chatint.web_search_tool import execute_ddg_web_search, is_web_search_available
+
+        # 1. Default setting is off -> web search works out of the box without Gemini key
+        self.assertEqual(get_app_settings().get("use_gemini_web_search"), "false")
+        self.assertEqual(is_web_search_available(), (True, ""))
+
+        fake_ddgs_instance = MagicMock()
+        fake_ddgs_instance.text.return_value = [
+            {"title": "Python 3.14 Docs", "href": "https://docs.python.org/3.14/", "body": "Official documentation."},
+            {"title": "PEPs", "href": "https://peps.python.org/", "body": "Python Enhancement Proposals."},
+        ]
+        with patch("ddgs.DDGS", return_value=fake_ddgs_instance):
+            res = execute_web_search("python 3.14 docs")
+
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["provider_used"], "duckduckgo")
+        self.assertEqual(res["search_requests_used"], 0)
+        self.assertEqual(len(res["results"]), 2)
+        self.assertEqual(res["sources"][0]["url"], "https://docs.python.org/3.14/")
+
+        # Fallback to backend='auto' when restricted engine group yields no results
+        fake_ddgs_fallback = MagicMock()
+        fake_ddgs_fallback.text.side_effect = [
+            [],
+            [{"title": "Fallback Hit", "href": "https://example.org/", "body": "Recovered via auto."}],
+        ]
+        with patch("ddgs.DDGS", return_value=fake_ddgs_fallback):
+            fb_res = execute_ddg_web_search("fallback query")
+        self.assertTrue(fb_res["ok"])
+        self.assertEqual(fb_res["results"][0]["title"], "Fallback Hit")
+        self.assertEqual(fake_ddgs_fallback.text.call_count, 2)
+
+        # Empty query & exception fallback stay non-throwing
+        self.assertFalse(execute_ddg_web_search("   ")["ok"])
+        fake_ddgs_err = MagicMock()
+        fake_ddgs_err.text.side_effect = RuntimeError("rate limited")
+        with patch("ddgs.DDGS", return_value=fake_ddgs_err):
+            err_res = execute_ddg_web_search("rate limit test")
+        self.assertFalse(err_res["ok"])
+        self.assertIn("rate limited", err_res["error"])
+
+        # 2. Opting into Gemini Google Search restores Gemini key gating
+        save_app_settings({"use_gemini_web_search": "true"})
+        self.assertEqual(get_app_settings().get("use_gemini_web_search"), "true")
+        set_api_key_in_env("Gemini", "")
+        avail, reason = is_web_search_available()
+        self.assertFalse(avail)
+        self.assertEqual(reason, "NO API KEY")
+
+    def test_stage2_schema_v4_migration_and_clean_template_hygiene(self):
+        import contextlib
+        import importlib.util
+        import sqlite3
+        from chatint.db import SCHEMA_VERSION, get_app_settings, get_conversation, init_db, save_app_settings
+
+        build_rel_path = Path(__file__).resolve().parent.parent / "packaging" / "build_release.py"
+        spec = importlib.util.spec_from_file_location("build_release_mod", build_rel_path)
+        build_release_mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(build_release_mod)
+        prepare_clean_default_db = build_release_mod.prepare_clean_default_db
+
+        # 1. Verify v3 -> v4 upgrade creates .bak backup, new columns, and app_settings defaults
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_root = Path(tmp)
+            fake_data = tmp_root / "data"
+            fake_data.mkdir(parents=True, exist_ok=True)
+            v3_db = fake_data / "chatint.db"
+            with contextlib.closing(sqlite3.connect(v3_db)) as conn:
+                conn.executescript(
+                """
+                PRAGMA user_version = 3;
+                CREATE TABLE providers (
+                    id TEXT PRIMARY KEY, name TEXT NOT NULL, base_url TEXT NOT NULL,
+                    api_key TEXT NOT NULL DEFAULT '', is_enabled INTEGER NOT NULL DEFAULT 1,
+                    models_json TEXT NOT NULL DEFAULT '[]'
+                );
+                CREATE TABLE conversations (
+                    id TEXT PRIMARY KEY, title TEXT NOT NULL DEFAULT 'New Chat',
+                    system_prompt TEXT NOT NULL DEFAULT '', max_context_messages INTEGER NOT NULL DEFAULT 30,
+                    is_imported INTEGER NOT NULL DEFAULT 0, is_auto_named INTEGER NOT NULL DEFAULT 0,
+                    created_at REAL NOT NULL, updated_at REAL NOT NULL
+                );
+                CREATE TABLE messages (
+                    id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, role TEXT NOT NULL,
+                    content TEXT NOT NULL, thinking_content TEXT NOT NULL DEFAULT '',
+                    provider_id TEXT NOT NULL DEFAULT '', provider_name TEXT NOT NULL DEFAULT '',
+                    model_id TEXT NOT NULL DEFAULT '', thinking_level TEXT NOT NULL DEFAULT 'none',
+                    prompt_tokens INTEGER NOT NULL DEFAULT 0, completion_tokens INTEGER NOT NULL DEFAULT 0,
+                    cached_tokens INTEGER NOT NULL DEFAULT 0, duration_ms INTEGER NOT NULL DEFAULT 0,
+                    created_at REAL NOT NULL,
+                    FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
+                );
+                CREATE TABLE token_ledger (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, conversation_id TEXT NOT NULL,
+                    provider_id TEXT NOT NULL DEFAULT '', model_id TEXT NOT NULL DEFAULT '',
+                    prompt_tokens INTEGER NOT NULL DEFAULT 0, completion_tokens INTEGER NOT NULL DEFAULT 0,
+                    cached_tokens INTEGER NOT NULL DEFAULT 0, google_search_requests INTEGER NOT NULL DEFAULT 0,
+                    created_at REAL NOT NULL,
+                    FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
+                );
+                CREATE TABLE google_search_usage (
+                    month_key TEXT PRIMARY KEY, request_count INTEGER NOT NULL DEFAULT 0, updated_at REAL NOT NULL
+                );
+                CREATE TABLE app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                CREATE TABLE tab_sessions (id INTEGER PRIMARY KEY CHECK (id = 1), state_json TEXT NOT NULL, updated_at REAL NOT NULL);
+                INSERT INTO conversations (id, title, system_prompt, max_context_messages, is_imported, is_auto_named, created_at, updated_at)
+                VALUES ('c_v3', 'Legacy Chat', '', 30, 0, 1, 1.0, 2.0);
+                INSERT INTO messages (id, conversation_id, role, content, created_at)
+                VALUES ('m_v3', 'c_v3', 'assistant', 'Legacy answer', 1.5);
+                """
+                )
+                conn.commit()
+
+            orig_db_path = db_mod.DB_PATH
+            orig_proj_root = build_release_mod.PROJECT_ROOT
+            try:
+                db_mod.DB_PATH = v3_db
+                init_db()
+                bak_path = Path(str(v3_db) + ".bak")
+                self.assertTrue(bak_path.is_file(), "Migration v3 -> v4 should create pre-migration .bak backup")
+
+                with open_db() as migrated:
+                    self.assertEqual(migrated.execute("PRAGMA user_version").fetchone()[0], SCHEMA_VERSION)
+                    self.assertEqual(SCHEMA_VERSION, 5)
+                    msg_cols = {r["name"] for r in migrated.execute("PRAGMA table_info(messages)").fetchall()}
+                    self.assertIn("worked_ms", msg_cols)
+                    ledger_cols = {r["name"] for r in migrated.execute("PRAGMA table_info(token_ledger)").fetchall()}
+                    self.assertIn("ddg_search_requests", ledger_cols)
+                    self.assertIn("provider_name", ledger_cols)
+                    self.assertIn("cost_usd", ledger_cols)
+
+                conv = get_conversation("c_v3")
+                self.assertEqual(conv["workspace_dir"], "")
+                self.assertEqual(conv["agent_mode"], "manual")
+                self.assertEqual(conv["messages"][0]["tool_trace"], [])
+                app_cfg = get_app_settings()
+                self.assertIn("default_workspace_dir", app_cfg)
+                self.assertEqual(app_cfg["default_agent_mode"], "manual")
+
+                # 2. prepare_clean_default_db scrubs personal default_workspace_dir & resets default_agent_mode
+                save_app_settings({"default_workspace_dir": "C:/Users/private/secret_repo", "default_agent_mode": "auto"})
+                build_release_mod.PROJECT_ROOT = tmp_root
+                clean_template = prepare_clean_default_db()
+                self.assertIsNotNone(clean_template)
+                with contextlib.closing(sqlite3.connect(clean_template)) as clean_conn:
+                    clean_conn.row_factory = sqlite3.Row
+                    cfg_rows = {r["key"]: r["value"] for r in clean_conn.execute("SELECT key, value FROM app_settings")}
+                    self.assertEqual(cfg_rows["default_workspace_dir"], "")
+                    self.assertEqual(cfg_rows["default_agent_mode"], "manual")
+                    self.assertEqual(clean_conn.execute("SELECT COUNT(*) FROM conversations").fetchone()[0], 0)
+            finally:
+                build_release_mod.PROJECT_ROOT = orig_proj_root
+                db_mod.DB_PATH = orig_db_path
+
+    def test_stage2_workspace_sandbox_tools_and_fetch_url_ssrf(self):
+        from chatint.tools import (
+            fetch_url,
+            resolve_workspace_path,
+            tool_edit_file,
+            tool_list_dir,
+            tool_read_file,
+            tool_search_files,
+            tool_write_file,
+        )
+        from chatint.tools.workspace_tools import preview_edit_file, preview_write_file
+
+        with tempfile.TemporaryDirectory() as ws_tmp, tempfile.TemporaryDirectory() as outside_tmp:
+            ws = Path(ws_tmp)
+            outside = Path(outside_tmp)
+            outside_secret = outside / "outside_secret.txt"
+            outside_secret.write_text("TOP_SECRET", encoding="utf-8")
+
+            # Sandbox blocks traversal, UNC, and protected filenames
+            with self.assertRaises(PermissionError):
+                resolve_workspace_path(ws, "../escape.txt")
+            with self.assertRaises(PermissionError):
+                resolve_workspace_path(ws, r"\\server\share\secret.txt")
+            with self.assertRaises(PermissionError):
+                resolve_workspace_path(ws, "//host/share/file.txt")
+            with self.assertRaises(PermissionError):
+                resolve_workspace_path(ws, ".env")
+            with self.assertRaises(PermissionError):
+                resolve_workspace_path(ws, "data/logs/chatint.log")
+            with self.assertRaises(PermissionError):
+                resolve_workspace_path(ws, "chatint.db")
+
+            # Symlink escape check (works natively when OS allows symlinks, and via resolve check)
+            link_path = ws / "escape_link.txt"
+            try:
+                link_path.symlink_to(outside_secret)
+            except OSError:
+                with patch.object(Path, "resolve", side_effect=[ws, outside_secret]):
+                    with self.assertRaises(PermissionError):
+                        resolve_workspace_path(ws, "escape_link.txt")
+            else:
+                with self.assertRaises(PermissionError):
+                    resolve_workspace_path(ws, "escape_link.txt")
+
+            # Read/Write tool lifecycle
+            w_res = tool_write_file(ws, "src/app.py", "def greet():\n    return 'hi'\n", overwrite=True)
+            self.assertTrue(w_res["ok"])
+            self.assertTrue(w_res["created"])
+            self.assertIn("return 'hi'", w_res["diff"])
+
+            w_no_over = tool_write_file(ws, "src/app.py", "other", overwrite=False)
+            self.assertFalse(w_no_over["ok"])
+
+            (ws / "src" / "bin.dat").write_bytes(b"\x00\x01\x02\x03")
+            (ws / ".git").mkdir()
+            (ws / ".git" / "config").write_text("ignored", encoding="utf-8")
+            (ws / ".env").write_text("OPENAI_API_KEY=secret", encoding="utf-8")
+
+            l_res = tool_list_dir(ws, ".", max_depth=3)
+            self.assertTrue(l_res["ok"])
+            listed_paths = {e["path"] for e in l_res["entries"]}
+            self.assertIn("src/app.py", listed_paths)
+            self.assertNotIn(".git/", listed_paths)
+            self.assertNotIn(".env", listed_paths)
+
+            r_res = tool_read_file(ws, "src/app.py", start_line=1, end_line=10)
+            self.assertTrue(r_res["ok"])
+            self.assertIn("2:     return 'hi'", r_res["content"])
+            self.assertFalse(tool_read_file(ws, "src/bin.dat")["ok"])
+
+            tool_write_file(ws, "src/dup.txt", "alpha\nalpha\n", overwrite=True)
+            s_res = tool_search_files(ws, r"return\s+'hi'", path="src", glob_pattern="*.py", is_regex=True)
+            self.assertTrue(s_res["ok"])
+            self.assertEqual(s_res["count"], 1)
+            self.assertEqual(s_res["matches"][0]["path"], "src/app.py")
+
+            # Preview & edit_file ambiguity / success
+            prev_bad = preview_edit_file({"path": "src/dup.txt", "target": "alpha", "replacement": "beta"}, ws)
+            self.assertFalse(prev_bad["ok"])
+            self.assertIn("2 times", prev_bad["error"])
+
+            e_res = tool_edit_file(ws, "src/app.py", target="return 'hi'", replacement="return 'hello'")
+            self.assertTrue(e_res["ok"])
+            self.assertIn("-    return 'hi'", e_res["diff"])
+            self.assertIn("+    return 'hello'", e_res["diff"])
+            self.assertEqual((ws / "src" / "app.py").read_text(encoding="utf-8"), "def greet():\n    return 'hello'\n")
+            prev_write = preview_write_file({"path": "src/new.txt", "content": "abc\n"}, ws)
+            self.assertTrue(prev_write["ok"])
+
+            # Windows CRLF multi-line edit, null/string arg coercion, and unknown extra kwargs resilience
+            from chatint.tools import get_tool_spec
+            (ws / "src" / "win.txt").write_bytes(b"line_a\r\nline_b\r\nline_c\r\n")
+            crlf_res = tool_edit_file(ws, "src/win.txt", target="line_a\nline_b", replacement="line_a\nline_b_edited")
+            self.assertTrue(crlf_res["ok"])
+            self.assertEqual((ws / "src" / "win.txt").read_bytes(), b"line_a\r\nline_b_edited\r\nline_c\r\n")
+            extra_kw_res = get_tool_spec("read_file").handler(
+                workspace_dir=str(ws), path="src/win.txt", start_line="1", end_line="2", unexpected_llm_arg=True
+            )
+            self.assertTrue(extra_kw_res["ok"])
+            self.assertTrue(get_tool_spec("write_file").handler(workspace_dir=str(ws), path="src/null.txt", content=None)["ok"])
+
+            # fetch_url SSRF guard checks
+            self.assertFalse(fetch_url("file:///etc/passwd")["ok"])
+            self.assertFalse(fetch_url("http://127.0.0.1:8080/")["ok"])
+            self.assertFalse(fetch_url("http://localhost:5000/admin")["ok"])
+            self.assertFalse(fetch_url("http://169.254.169.254/latest/meta-data")["ok"])
+            with patch("chatint.tools.web_tools.socket.getaddrinfo", return_value=[(2, 1, 6, "", ("10.0.0.5", 80))]):
+                self.assertFalse(fetch_url("https://internal.corp.example/secret")["ok"])
+
+            # fetch_url public HTML extraction + redirect SSRF blocking
+            class _FakeStreamResp:
+                def __init__(self, status_code, headers, body=b""):
+                    self.status_code = status_code
+                    self.headers = headers
+                    self._body = body
+                    self.encoding = "utf-8"
+                def iter_bytes(self):
+                    yield self._body
+                def __enter__(self):
+                    return self
+                def __exit__(self, *args):
+                    return False
+
+            with patch("chatint.tools.web_tools.socket.getaddrinfo", return_value=[(2, 1, 6, "", ("93.184.216.34", 443))]):
+                fake_client = MagicMock()
+                fake_client.__enter__.return_value = fake_client
+                fake_client.stream.return_value = _FakeStreamResp(
+                    200,
+                    {"content-type": "text/html; charset=utf-8"},
+                    b"<html><head><title>Example Doc</title><style>body{}</style></head><body><h1>Hello World</h1><script>alert(1)</script><p>Readable body.</p></body></html>",
+                )
+                with patch("chatint.tools.web_tools.httpx.Client", return_value=fake_client):
+                    ok_fetch = fetch_url("https://example.com/page")
+                self.assertTrue(ok_fetch["ok"])
+                self.assertEqual(ok_fetch["title"], "Example Doc")
+                self.assertIn("Readable body.", ok_fetch["content"])
+                self.assertNotIn("alert(1)", ok_fetch["content"])
+
+                fake_redir = MagicMock()
+                fake_redir.__enter__.return_value = fake_redir
+                fake_redir.stream.return_value = _FakeStreamResp(302, {"location": "http://127.0.0.1:8000/"})
+                with patch("chatint.tools.web_tools.httpx.Client", return_value=fake_redir):
+                    bad_redir = fetch_url("https://example.com/redir")
+                self.assertFalse(bad_redir["ok"])
+                self.assertIn("127.0.0.1", bad_redir["error"])
+
+                fake_c = MagicMock()
+                fake_c.__enter__.return_value = fake_c
+                fake_c.stream.return_value = _FakeStreamResp(200, {"content-type": "text/plain"}, b"ok text")
+                with patch("chatint.tools.web_tools.httpx.Client", return_value=fake_c):
+                    self.assertTrue(fetch_url("https://example.com/txt", max_chars="not_an_int")["ok"])
+
+    def test_stage2_manual_approval_gate_context_summary_and_adapters(self):
+        import time
+        from chatint.db import add_message, create_conversation, duplicate_conversation, get_conversation
+        from chatint.providers.anthropic_adapter import AnthropicAdapter
+        from chatint.providers.base import _run_registered_tool_call
+        from chatint.providers.gemini_adapter import GeminiAdapter
+        from chatint.providers.openai_adapter import OpenAIAdapter
+        from chatint.services.stream_coordinator import StreamManager
+
+        with tempfile.TemporaryDirectory() as ws_tmp:
+            ws = Path(ws_tmp)
+            target_file = ws / "notes.txt"
+            target_file.write_text("before", encoding="utf-8")
+
+            conv = create_conversation("Agent Chat", workspace_dir=str(ws), agent_mode="manual")
+            conv_id = conv["id"]
+            bridge = MagicMock()
+            dispatched = []
+            bridge.push_event.side_effect = lambda ev: dispatched.append(ev)
+
+            # 1. Manual mode Deny leaves file untouched and records denied trace
+            abort_ev = threading.Event()
+            trace_deny = []
+            runtime_state = {"agent_mode": "manual"}
+            StreamManager.register_stream("tab_a", stream_id="sid_deny", conversation_id=conv_id)
+            try:
+                def _deny_worker():
+                    deadline = time.time() + 2.0
+                    while time.time() < deadline:
+                        ev = next((e for e in dispatched if e.get("type") == "tool_approval_required"), None)
+                        if ev:
+                            DesktopBridge().resolve_tool_approval("tab_a", "sid_deny", ev["approval_id"], "deny")
+                            return
+                        time.sleep(0.01)
+
+                t = threading.Thread(target=_deny_worker, daemon=True)
+                t.start()
+                res_deny = _run_registered_tool_call(
+                    bridge, "tab_a", conv_id, "write_file",
+                    {"path": "notes.txt", "content": "overwritten"}, abort_ev, stream_id="sid_deny",
+                    workspace_dir=str(ws), agent_mode="manual", runtime_state=runtime_state,
+                    tool_trace=trace_deny, web_search_enabled=False, agent_enabled=True,
+                )
+                t.join(timeout=2.0)
+                self.assertFalse(res_deny["ok"])
+                self.assertEqual(target_file.read_text(encoding="utf-8"), "before")
+                self.assertEqual(trace_deny[0]["status"], "denied")
+                apr_ev = next(e for e in dispatched if e.get("type") == "tool_approval_required")
+                self.assertIn("-before", apr_ev["diff"])
+                self.assertIn("+overwritten", apr_ev["diff"])
+            finally:
+                StreamManager.unregister_stream("tab_a", stream_id="sid_deny")
+
+            # 2. Manual mode allow_once writes file and keeps manual mode; allow_all_tab promotes to auto
+            dispatched.clear()
+            trace_allow = []
+            StreamManager.register_stream("tab_a", stream_id="sid_allow", conversation_id=conv_id)
+            try:
+                def _allow_worker():
+                    seen_ids = set()
+                    deadline = time.time() + 3.0
+                    while time.time() < deadline:
+                        for e in list(dispatched):
+                            if e.get("type") == "tool_approval_required" and e["approval_id"] not in seen_ids:
+                                seen_ids.add(e["approval_id"])
+                                dec = "allow_once" if len(seen_ids) == 1 else "allow_all_tab"
+                                StreamManager.resolve_approval("sid_allow", e["approval_id"], dec)
+                        if len(seen_ids) >= 2:
+                            return
+                        time.sleep(0.01)
+
+                t2 = threading.Thread(target=_allow_worker, daemon=True)
+                t2.start()
+                res_1 = _run_registered_tool_call(
+                    bridge, "tab_a", conv_id, "write_file",
+                    {"path": "notes.txt", "content": "after_once"}, abort_ev, stream_id="sid_allow",
+                    workspace_dir=str(ws), agent_mode="manual", runtime_state=runtime_state,
+                    tool_trace=trace_allow, web_search_enabled=False, agent_enabled=True,
+                )
+                self.assertTrue(res_1["ok"])
+                self.assertEqual(runtime_state["agent_mode"], "manual")
+                res_2 = _run_registered_tool_call(
+                    bridge, "tab_a", conv_id, "edit_file",
+                    {"path": "notes.txt", "target": "after_once", "replacement": "after_auto"}, abort_ev,
+                    stream_id="sid_allow", workspace_dir=str(ws), agent_mode="manual",
+                    runtime_state=runtime_state, tool_trace=trace_allow, web_search_enabled=False, agent_enabled=True,
+                )
+                t2.join(timeout=2.0)
+                self.assertTrue(res_2["ok"])
+                self.assertEqual(runtime_state["agent_mode"], "auto")
+                self.assertTrue(any(e.get("type") == "agent_mode_changed" and e.get("agent_mode") == "auto" for e in dispatched))
+                self.assertEqual(get_conversation(conv_id)["agent_mode"], "auto")
+
+                # Subsequent write skips approval automatically now that runtime_state is auto
+                dispatched.clear()
+                res_3 = _run_registered_tool_call(
+                    bridge, "tab_a", conv_id, "write_file",
+                    {"path": "second.txt", "content": "auto_ok"}, abort_ev,
+                    stream_id="sid_allow", workspace_dir=str(ws), agent_mode="manual",
+                    runtime_state=runtime_state, tool_trace=trace_allow, web_search_enabled=False, agent_enabled=True,
+                )
+                self.assertTrue(res_3["ok"])
+                self.assertFalse(any(e.get("type") == "tool_approval_required" for e in dispatched))
+            finally:
+                StreamManager.unregister_stream("tab_a", stream_id="sid_allow")
+
+            # 3. Abort unblocks waiting approval thread immediately
+            abort_gate = threading.Event()
+            StreamManager.register_stream("tab_a", stream_id="sid_abort", conversation_id=conv_id)
+            gate_out = []
+            gt = threading.Thread(
+                target=lambda: gate_out.append(StreamManager.request_approval("tab_a", "sid_abort", "apr_wait", abort_gate, timeout=10.0)),
+                daemon=True,
+            )
+            gt.start()
+            time.sleep(0.05)
+            StreamManager.abort_stream("tab_a", stream_id="sid_abort")
+            gt.join(timeout=1.5)
+            self.assertEqual(gate_out, ["deny"])
+            StreamManager.unregister_stream("tab_a", stream_id="sid_abort")
+
+            # 4. Persisted tool_trace -> compact context summary -> branch duplication
+            add_message(conv_id, "user", "Update notes")
+            add_message(conv_id, "assistant", "Updated notes file.", tool_trace=trace_allow)
+            conv_loaded = get_conversation(conv_id)
+            ctx_msgs = DesktopBridge._build_context_messages(conv_loaded)
+            self.assertIn("[Tools used:", ctx_msgs[-1]["content"])
+            self.assertIn("write_file(notes.txt)", ctx_msgs[-1]["content"])
+            branched = duplicate_conversation(conv_id)
+            self.assertEqual(branched["workspace_dir"], str(ws))
+            self.assertEqual(branched["agent_mode"], "auto")
+            self.assertEqual(len(branched["messages"][-1]["tool_trace"]), 3)
+
+            # 5. Multi-round agent tool dispatch across OpenAI, Anthropic, and Gemini adapters
+            from types import SimpleNamespace
+            (ws / "readme.txt").write_text("line1\nhello agent\n", encoding="utf-8")
+
+            # OpenAI
+            oai_r1 = [
+                SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(
+                    content=None,
+                    tool_calls=[SimpleNamespace(index=0, id="oai_tc_1", function=SimpleNamespace(name="read_file", arguments='{"path": "readme.txt"}'))],
+                    reasoning_content=None,
+                ))], usage=None),
+                SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content=None, tool_calls=None, reasoning_content=None))], usage=SimpleNamespace(prompt_tokens=10, completion_tokens=5, prompt_tokens_details=None)),
+            ]
+            oai_r2 = [
+                SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content="Read done.", tool_calls=None, reasoning_content=None))], usage=SimpleNamespace(prompt_tokens=12, completion_tokens=4, prompt_tokens_details=None)),
+            ]
+            oai_client = MagicMock()
+            oai_client.chat.completions.create.side_effect = [iter(oai_r1), iter(oai_r2)]
+            oai_trace = []
+            with patch("chatint.client_manager.ClientManager.get_client", return_value=(oai_client, None)), \
+                 patch("chatint.client_manager.ClientManager.get_provider", return_value={"id": "openai", "base_url": ""}):
+                c, _th, *_rest = OpenAIAdapter().stream_chat(
+                    bridge, "t1", conv_id, [{"role": "user", "content": "read readme"}],
+                    "openai", "gpt-5", "none", None, threading.Event(), "read readme",
+                    web_search_enabled=False, stream_id=None, agent_enabled=True,
+                    workspace_dir=str(ws), agent_mode="manual", tool_trace=oai_trace,
+                )
+            self.assertEqual("".join(c), "Read done.")
+            self.assertEqual(oai_trace[0]["tool"], "read_file")
+            self.assertIn("hello agent", oai_trace[0]["result_preview"])
+
+            # Anthropic
+            ant_r1 = [
+                SimpleNamespace(type="message_start", message=SimpleNamespace(usage=SimpleNamespace(input_tokens=10, cache_read_input_tokens=0))),
+                SimpleNamespace(type="content_block_start", index=0, content_block=SimpleNamespace(type="tool_use", id="ant_tc_1", name="list_dir", input={"path": "."})),
+                SimpleNamespace(type="content_block_stop", index=0),
+                SimpleNamespace(type="message_delta", usage=SimpleNamespace(output_tokens=5)),
+                SimpleNamespace(type="message_stop"),
+            ]
+            ant_r2 = [
+                SimpleNamespace(type="message_start", message=SimpleNamespace(usage=SimpleNamespace(input_tokens=14, cache_read_input_tokens=0))),
+                SimpleNamespace(type="content_block_start", index=0, content_block=SimpleNamespace(type="text")),
+                SimpleNamespace(type="content_block_delta", index=0, delta=SimpleNamespace(type="text_delta", text="Listed.")),
+                SimpleNamespace(type="content_block_stop", index=0),
+                SimpleNamespace(type="message_delta", usage=SimpleNamespace(output_tokens=3)),
+                SimpleNamespace(type="message_stop"),
+            ]
+            ant_client = MagicMock()
+            ant_client.messages.create.side_effect = [iter(ant_r1), iter(ant_r2)]
+            ant_trace = []
+            with patch("chatint.client_manager.ClientManager.get_anthropic_client", return_value=(ant_client, None)):
+                c2, *_r2 = AnthropicAdapter().stream_chat(
+                    bridge, "t1", conv_id, [{"role": "user", "content": "list dir"}],
+                    "anthropic", "claude-sonnet-4-5", "none", None, threading.Event(), "list dir",
+                    web_search_enabled=False, stream_id=None, agent_enabled=True,
+                    workspace_dir=str(ws), agent_mode="manual", tool_trace=ant_trace,
+                )
+            self.assertEqual("".join(c2), "Listed.")
+            self.assertEqual(ant_trace[0]["tool"], "list_dir")
+
+            # Gemini
+            gem_part_call = SimpleNamespace(
+                thought=False,
+                thought_signature=None,
+                text=None,
+                function_call=SimpleNamespace(id="gem_tc_1", name="search_files", args={"query": "hello agent"}),
+            )
+            gem_r1 = [
+                SimpleNamespace(
+                    candidates=[SimpleNamespace(content=SimpleNamespace(parts=[gem_part_call]))],
+                    usage_metadata=SimpleNamespace(prompt_token_count=10, candidates_token_count=5, cached_content_token_count=0),
+                )
+            ]
+            gem_r2 = [
+                SimpleNamespace(
+                    candidates=[SimpleNamespace(content=SimpleNamespace(parts=[SimpleNamespace(thought=False, thought_signature=None, text="Searched.", function_call=None)]))],
+                    usage_metadata=SimpleNamespace(prompt_token_count=12, candidates_token_count=4, cached_content_token_count=0),
+                )
+            ]
+            gem_client = MagicMock()
+            gem_client.models.generate_content_stream.side_effect = [iter(gem_r1), iter(gem_r2)]
+            gem_trace = []
+            with patch("chatint.client_manager.ClientManager.get_gemini_client", return_value=(gem_client, None)):
+                c3, *_r3 = GeminiAdapter().stream_chat(
+                    bridge, "t1", conv_id, [{"role": "user", "content": "search"}],
+                    "gemini", "gemini-2.5-flash", "none", None, threading.Event(), "search",
+                    web_search_enabled=False, stream_id=None, agent_enabled=True,
+                    workspace_dir=str(ws), agent_mode="manual", tool_trace=gem_trace,
+                )
+            self.assertEqual("".join(c3), "Searched.")
+            self.assertEqual(gem_trace[0]["tool"], "search_files")
+            self.assertIn("readme.txt:2", gem_trace[0]["result_preview"])
+
+    def test_v052c_model_ms_worked_ms_and_ddg_request_counting(self):
+        import time
+        from types import SimpleNamespace
+        from chatint.providers.anthropic_adapter import _stream_anthropic
+        from chatint.providers.gemini_adapter import _stream_gemini
+        from chatint.providers.openai_adapter import _stream_openai
+        from chatint.services.stream_coordinator import StreamManager
+        from chatint.web_search_tool import execute_ddg_web_search
+
+        with tempfile.TemporaryDirectory() as ws_tmp:
+            ws = Path(ws_tmp)
+            (ws / "note.txt").write_text("before", encoding="utf-8")
+
+            # 1. OpenAI multi-round manual approval: model_ms excludes 150ms approval wait & retry error, worked_ms includes all
+            conv = create_conversation("Timing Test", workspace_dir=str(ws), agent_mode="manual")
+            add_message(conv["id"], "user", "Update note")
+
+            class _SlowChunks:
+                def __init__(self, items, delay_s=0.0):
+                    self._items = list(items)
+                    self._delay_s = delay_s
+                def __iter__(self):
+                    for idx, item in enumerate(self._items):
+                        if idx > 0 and self._delay_s > 0:
+                            time.sleep(self._delay_s)
+                        yield item
+
+            oai_r1 = _SlowChunks([
+                SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(
+                    content=None,
+                    tool_calls=[SimpleNamespace(index=0, id="tc_w1", function=SimpleNamespace(name="write_file", arguments='{"path":"note.txt","content":"after"}'))],
+                    reasoning_content=None,
+                ))], usage=None),
+                SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content=None, tool_calls=None, reasoning_content=None))], usage=SimpleNamespace(prompt_tokens=20, completion_tokens=10, prompt_tokens_details=None)),
+            ], delay_s=0.025)
+            oai_r2 = _SlowChunks([
+                SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content="Done.", tool_calls=None, reasoning_content=None))], usage=SimpleNamespace(prompt_tokens=30, completion_tokens=15, prompt_tokens_details=None)),
+            ], delay_s=0.025)
+
+            import openai as oai_mod
+            req_mock = MagicMock()
+            bad_err = oai_mod.APIStatusError("unsupported param", response=MagicMock(status_code=400, headers={}), body=None)
+            oai_client = MagicMock()
+            oai_client.chat.completions.create.side_effect = [bad_err, oai_r1, oai_r2]
+
+            bridge = DesktopBridge()
+            orig_push = bridge.push_event
+            def _approve_slow(ev):
+                orig_push(ev)
+                if ev.get("type") == "tool_approval_required":
+                    def _delayed():
+                        time.sleep(0.18)
+                        StreamManager.resolve_approval(ev["stream_id"], ev["approval_id"], "allow_once")
+                    threading.Thread(target=_delayed, daemon=True).start()
+
+            with patch("chatint.client_manager.ClientManager.get_client", return_value=(oai_client, None)), \
+                 patch("chatint.client_manager.ClientManager.get_provider", return_value={"id": "openai", "name": "OpenAI", "base_url": ""}), \
+                 patch.object(bridge, "push_event", side_effect=_approve_slow):
+                stream_chat_completion(
+                    bridge=bridge,
+                    tab_id="t_time",
+                    conversation_id=conv["id"],
+                    messages=[{"role": "user", "content": "Update note"}],
+                    provider_id="openai",
+                    model_id="gpt-5",
+                    thinking_level="none",
+                    stream_id="sid_timing",
+                    agent_enabled=True,
+                    workspace_dir=str(ws),
+                    agent_mode="manual",
+                )
+
+            asst = get_conversation(conv["id"])["messages"][-1]
+            self.assertEqual(asst["content"], "Done.")
+            self.assertEqual(asst["completion_tokens"], 25)
+            self.assertGreater(asst["duration_ms"], 15)
+            self.assertLess(asst["duration_ms"], 130)
+            self.assertGreaterEqual(asst["worked_ms"], asst["duration_ms"] + 150)
+
+            # 2. Anthropic & Gemini direct timing_stats exclude tool execution time
+            def _slow_fetch_tool(*_a, **_kw):
+                time.sleep(0.14)
+                return {"ok": True, "url": "https://example.com", "title": "Ex", "content_type": "text/plain", "content": "ok", "truncated": False}
+
+            ant_r1 = [
+                SimpleNamespace(type="message_start", message=SimpleNamespace(usage=SimpleNamespace(input_tokens=10, cache_read_input_tokens=0))),
+                SimpleNamespace(type="content_block_start", index=0, content_block=SimpleNamespace(type="tool_use", id="a1", name="fetch_url", input={"url": "https://example.com"})),
+                SimpleNamespace(type="content_block_stop", index=0),
+                SimpleNamespace(type="message_delta", usage=SimpleNamespace(output_tokens=6)),
+            ]
+            ant_r2 = [
+                SimpleNamespace(type="message_start", message=SimpleNamespace(usage=SimpleNamespace(input_tokens=12, cache_read_input_tokens=0))),
+                SimpleNamespace(type="content_block_start", index=0, content_block=SimpleNamespace(type="text")),
+                SimpleNamespace(type="content_block_delta", index=0, delta=SimpleNamespace(type="text_delta", text="Fetched.")),
+                SimpleNamespace(type="message_delta", usage=SimpleNamespace(output_tokens=4)),
+            ]
+            ant_client = MagicMock()
+            ant_client.messages.create.side_effect = [iter(ant_r1), iter(ant_r2)]
+            ant_timing = {"model_ms": 0}
+            with patch("chatint.client_manager.ClientManager.get_anthropic_client", return_value=(ant_client, None)), \
+                 patch("chatint.tools.web_tools.fetch_url", side_effect=_slow_fetch_tool):
+                _stream_anthropic(
+                    bridge, "t1", conv["id"], [{"role": "user", "content": "fetch"}],
+                    "anthropic", "claude-sonnet-4-5", "none", None, threading.Event(), "fetch",
+                    agent_enabled=True, workspace_dir=str(ws), timing_stats=ant_timing,
+                )
+            self.assertLess(ant_timing["model_ms"], 100)
+
+            gem_part = SimpleNamespace(thought=False, thought_signature=None, text=None, function_call=SimpleNamespace(id="g1", name="fetch_url", args={"url": "https://example.com"}))
+            gem_r1 = [SimpleNamespace(candidates=[SimpleNamespace(content=SimpleNamespace(parts=[gem_part]))], usage_metadata=SimpleNamespace(prompt_token_count=10, candidates_token_count=5, cached_content_token_count=0))]
+            gem_r2 = [SimpleNamespace(candidates=[SimpleNamespace(content=SimpleNamespace(parts=[SimpleNamespace(thought=False, thought_signature=None, text="Gem ok.", function_call=None)]))], usage_metadata=SimpleNamespace(prompt_token_count=12, candidates_token_count=4, cached_content_token_count=0))]
+            gem_client = MagicMock()
+            gem_client.models.generate_content_stream.side_effect = [iter(gem_r1), iter(gem_r2)]
+            gem_timing = {"model_ms": 0}
+            with patch("chatint.client_manager.ClientManager.get_gemini_client", return_value=(gem_client, None)), \
+                 patch("chatint.tools.web_tools.fetch_url", side_effect=_slow_fetch_tool):
+                _stream_gemini(
+                    bridge, "t1", conv["id"], [{"role": "user", "content": "fetch"}],
+                    "gemini", "gemini-2.5-flash", "none", None, threading.Event(), "fetch",
+                    agent_enabled=True, workspace_dir=str(ws), timing_stats=gem_timing,
+                )
+            self.assertLess(gem_timing["model_ms"], 100)
+
+            # 3. DDG HTTP request counting tracks multi-engine requests inside DDGS without polluting per_model
+            conv_ddg = create_conversation("DDG Count Test")
+            from ddgs.ddgs import DDGS as RealDDGS
+            from ddgs.results import TextResult
+
+            class _FakeEngine:
+                def __init__(self, idx):
+                    self.provider = f"p{idx}"
+                    self.name = f"eng{idx}"
+                    self.priority = 1
+                    self.http_client = SimpleNamespace(request=lambda *a, **kw: idx)
+                def search(self, query, **_kw):
+                    self.http_client.request("GET", f"https://search.example/{self.name}")
+                    r = TextResult()
+                    r.title = f"Hit {self.name}"
+                    r.href = f"https://example.com/{self.name}"
+                    r.body = "Body"
+                    return [r]
+
+            class _FakeDDGS(RealDDGS):
+                def _get_engines(self, category, backend):
+                    return [_FakeEngine(1), _FakeEngine(2), _FakeEngine(3)]
+
+            with patch("ddgs.DDGS", _FakeDDGS):
+                ddg_res = execute_ddg_web_search("python 3.14", max_results=2, conversation_id=conv_ddg["id"])
+            self.assertTrue(ddg_res["ok"])
+            self.assertGreaterEqual(ddg_res["ddg_requests_used"], 2)
+            record_token_usage(conv_ddg["id"], "websearch", "gemini-3.1-flash-lite", 10, 5, 0, google_search_requests=2)
+            ddg_stats = get_token_stats(conv_ddg["id"])
+            self.assertEqual(ddg_stats["grand_total"]["ddg_search_requests"], ddg_res["ddg_requests_used"])
+            self.assertEqual(ddg_stats["grand_total"]["google_search_requests"], 2)
+            self.assertEqual(ddg_stats["grand_total"]["web_search_requests"], 2 + ddg_res["ddg_requests_used"])
+            self.assertNotIn("duckduckgo", [m["model_id"] for m in ddg_stats["per_model"]])
+
+    def test_v052c_full_export_import_roundtrip_settings_messages_and_ledger(self):
+        provs = get_providers()
+        provs.append({
+            "id": "provider_custom_exp",
+            "name": "AcmeCloud",
+            "base_url": "https://api.acme.example/v1",
+            "is_enabled": True,
+            "models": [{"id": "acme-pro", "name": "acme-pro", "input_price": 2.0, "cached_input_price": 0.5, "output_price": 10.0}],
+        })
+        save_providers(provs)
+
+        conv = create_conversation(
+            "Full Fidelity Chat",
+            system_prompt="Be exact.",
+            max_context=44,
+            workspace_dir="C:/Work/project_alpha",
+            agent_mode="auto",
+        )
+        add_message(conv["id"], "user", "Analyze repo")
+        trace = [{"call_id": "c1", "tool": "read_file", "status": "done", "summary": "Read app.py", "args_preview": "app.py", "result_preview": "1: print(1)", "diff": "", "duration_ms": 18}]
+        add_message(
+            conv["id"],
+            "assistant",
+            "Done analyzing.",
+            thinking_content="Checked files",
+            provider_id="provider_custom_exp",
+            provider_name="AcmeCloud",
+            model_id="acme-pro",
+            thinking_level="high",
+            prompt_tokens=1000,
+            completion_tokens=500,
+            cached_tokens=200,
+            duration_ms=4000,
+            worked_ms=12500,
+            tool_trace=trace,
+        )
+        # Extra regenerated spend + search requests recorded in token_ledger
+        record_token_usage(conv["id"], "provider_custom_exp", "acme-pro", 500, 100, 0, provider_name="AcmeCloud")
+        record_token_usage(conv["id"], "websearch", "", 0, 0, 0, google_search_requests=2, ddg_search_requests=3)
+
+        orig_stats = get_token_stats(conv["id"])
+        self.assertGreater(orig_stats["grand_total"]["total_cost"], 0.0)
+
+        bridge = DesktopBridge()
+        md_exp = bridge.export_conversation(conv["id"], "markdown")
+        json_exp = bridge.export_conversation(conv["id"], "json")
+
+        # Remove custom provider before importing to prove exact exported cost & provider_name survive without local pricing
+        save_providers([p for p in get_providers() if p["id"] != "provider_custom_exp"])
+
+        from chatint.db import get_google_search_request_totals
+        g_before = get_google_search_request_totals()["all_time"]
+
+        imp_json_res = bridge.import_conversation_content(json_exp["content"], "full.json")
+        imp_md_res = bridge.import_conversation_content(md_exp["content"], "full.md")
+        self.assertEqual(get_google_search_request_totals()["all_time"], g_before)
+
+        for imp_conv in (imp_json_res["conversation"], imp_md_res["conversation"]):
+            self.assertEqual(imp_conv["system_prompt"], "Be exact.")
+            self.assertEqual(imp_conv["max_context_messages"], 44)
+            self.assertEqual(imp_conv["workspace_dir"], "C:/Work/project_alpha")
+            self.assertEqual(imp_conv["agent_mode"], "auto")
+            asst_m = imp_conv["messages"][1]
+            self.assertEqual(asst_m["provider_name"], "AcmeCloud")
+            self.assertEqual(asst_m["duration_ms"], 4000)
+            self.assertEqual(asst_m["worked_ms"], 12500)
+            self.assertEqual(asst_m["tool_trace"], trace)
+            st = imp_conv["token_stats"]
+            self.assertEqual(st["per_model"][0]["provider_name"], "AcmeCloud")
+            self.assertAlmostEqual(st["grand_total"]["total_cost"], orig_stats["grand_total"]["total_cost"], places=8)
+            self.assertEqual(st["grand_total"]["total_tokens"], orig_stats["grand_total"]["total_tokens"])
+            self.assertEqual(st["grand_total"]["google_search_requests"], 2)
+            self.assertEqual(st["grand_total"]["ddg_search_requests"], 3)
+            self.assertEqual(st["grand_total"]["web_search_requests"], 5)
+            self.assertEqual(st["active_turn_tokens"]["total_tokens"], 1500)
+
+    def test_v052c_workspace_and_ssrf_loophole_fixes(self):
+        import subprocess
+        from types import SimpleNamespace
+        from chatint.tools import fetch_url, resolve_workspace_path, tool_list_dir, tool_search_files
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root_tmp = Path(tmp)
+            outside = root_tmp / "outside"
+            outside.mkdir()
+            (outside / "secret.txt").write_text("TOP_SECRET", encoding="utf-8")
+
+            ws = root_tmp / "ws"
+            ws.mkdir()
+            (ws / ".env").write_text("OPENAI_API_KEY=sk-hidden\n", encoding="utf-8")
+            (ws / ".env.prod").write_text("PROD_KEY=hidden-prod\n", encoding="utf-8")
+            (ws / "chatint.db").write_text("DB_DATA\n", encoding="utf-8")
+            (ws / "data" / "logs").mkdir(parents=True)
+            (ws / "data" / "logs" / "chatint.log").write_text("LOG_SECRET\n", encoding="utf-8")
+            (ws / "ok.txt").write_text("visible line\n", encoding="utf-8")
+
+            if sys.platform == "win32":
+                subprocess.run(["cmd", "/c", "mklink", "/J", str(ws / "junc_out"), str(outside)], check=True, capture_output=True)
+
+            # 1. search_files blocks direct & recursive protected files and junction traversal
+            self.assertFalse(tool_search_files(ws, ".*", path=".env", is_regex=True)["ok"])
+            self.assertFalse(tool_search_files(ws, ".*", path=".env.prod", is_regex=True)["ok"])
+            self.assertFalse(tool_search_files(ws, ".*", path="chatint.db", is_regex=True)["ok"])
+            self.assertFalse(tool_search_files(ws, ".*", path="data/logs/chatint.log", is_regex=True)["ok"])
+            rec_search = tool_search_files(ws, "hidden", path=".")
+            self.assertTrue(rec_search["ok"])
+            self.assertEqual(rec_search["count"], 0)
+            log_search = tool_search_files(ws, "LOG_SECRET", path=".")
+            self.assertEqual(log_search["count"], 0)
+
+            # 2. list_dir hides .env*, chatint.db*, data/logs, and NTFS junctions
+            listed = tool_list_dir(ws, ".", max_depth=4)
+            self.assertTrue(listed["ok"])
+            listed_paths = {e["path"] for e in listed["entries"]}
+            self.assertEqual(listed_paths, {"data/", "ok.txt"})
+            self.assertFalse(tool_list_dir(ws, "data/logs")["ok"])
+
+            # 3. resolve_workspace_path blocks ADS (:), DOS device names, trailing dots/spaces, drive-relative paths
+            for bad_rel in (
+                "note.txt:hidden",
+                ".env:my_stream",
+                "CON",
+                "con.txt",
+                "sub/NUL.md",
+                "chatint.db.",
+                ".env ",
+                "C:outside.txt",
+            ):
+                with self.assertRaises(PermissionError, msg=f"Expected block for {bad_rel!r}"):
+                    resolve_workspace_path(ws, bad_rel)
+
+            # 4. fetch_url blocks CGNAT and DNS-rebind peer IP
+            self.assertFalse(fetch_url("http://100.64.0.1/internal")["ok"])
+            self.assertFalse(fetch_url("http://[::ffff:100.64.0.1]/internal")["ok"])
+
+            class _FakeRebindResp:
+                status_code = 200
+                headers = {"content-type": "text/plain"}
+                encoding = "utf-8"
+                extensions = {"network_stream": SimpleNamespace(get_extra_info=lambda k: ("127.0.0.1", 80) if k == "peername" else None)}
+                def iter_bytes(self):
+                    yield b"local secret"
+                def __enter__(self):
+                    return self
+                def __exit__(self, *args):
+                    return False
+
+            with patch("chatint.tools.web_tools.socket.getaddrinfo", return_value=[(2, 1, 6, "", ("93.184.216.34", 80))]):
+                fake_c = MagicMock()
+                fake_c.__enter__.return_value = fake_c
+                fake_c.stream.return_value = _FakeRebindResp()
+                with patch("chatint.tools.web_tools.httpx.Client", return_value=fake_c):
+                    rebind_res = fetch_url("https://rebind.example/test")
+                self.assertFalse(rebind_res["ok"])
+                self.assertIn("127.0.0.1", rebind_res["error"])
 
 
 if __name__ == "__main__":
